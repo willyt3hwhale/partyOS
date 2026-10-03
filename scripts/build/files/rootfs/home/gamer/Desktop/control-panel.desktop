@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Control Panel
+Icon=preferences-system
+Exec=xfce4-settings-manager
+Terminal=false
+Categories=System;partyOS;

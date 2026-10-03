@@ -1,0 +1,106 @@
+# deploy.conf - the one file to edit when you prepare a partyOS build.
+#
+# It holds every server address the party needs. After you edit it, run
+# scripts/deploy/render.sh to regenerate the served boot script (boot/partyos.ipxe).
+# Write each address as host:port, with no scheme. The render adds the scheme.
+#
+# The whole boot chain uses HTTPS with the pinned CA. The render maps each HTTP
+# port to its HTTPS port (+363, for example 8080 -> 8443), as run-servers.sh does.
+#   * iPXE: the stick EFI carries the CA and chains boot/partyos.ipxe, which fetches
+#     the kernel and initramfs and posts the report_url= callbacks.
+#   * Initramfs: it pulls airootfs.sfs into RAM with curl --cacert and the CA
+#     bundled at /etc/partyos/ca.pem.
+#   * Runtime: the catalog, blobs, config hook, pacman mirror and portal use the CA
+#     baked into the rootfs, which is also in the system trust store.
+# Recovery: if a CA or cert problem breaks the chain, re-render the affected
+# fetches on plain http and re-serve. For the initramfs, also restore the .bak
+# initramfs. No re-flash is needed.
+#
+# In a single-box setup, point PXE, BLOB and MIRROR at the same machine. The render
+# then omits the redundant blob_url= and mirror_url= kernel params. To split roles
+# onto separate machines, give them different addresses here, and start the roles
+# on each host with scripts/deploy/run-servers.sh.
+
+# --- PXE / netboot server -----------------------------------------------------
+# Serves the kernel, initramfs, squashfs, boot scripts, and the /report callback.
+# This is the address every client learns at boot (report_url=). One address only.
+# A DNS name (default partyos.lan) or an IP, host[:port]. With a DNS name the LAN
+# DNS server must resolve it: the name is baked into the stick EFI, the kernel
+# cmdline, the torrent tracker URL, and the portal/mirror/blob URLs.
+PXE_SERVER={{PXE_SERVER}}
+
+# --- Game-blob server(s) ------------------------------------------------------
+# BLOB_SERVERS is an ordered, comma-separated failover list of host:port blob
+# servers, with no scheme. Clients try each server in order for the catalog and
+# for every blob. The first server that answers wins, so a dead server is skipped.
+# Serve the catalog and the blobs from each listed host.
+# In a single-box setup, point it at the PXE box. The render then serves all from
+# one process and adds no extra kernel params.
+# Examples:
+#   BLOB_SERVERS=192.168.0.10:8080                       # single box (= PXE)
+#   BLOB_SERVERS=192.168.0.50:8080,192.168.0.51:8080     # two dedicated blob hosts
+#   BLOB_SERVERS=192.168.0.10:8091,192.168.0.10:8092     # same host, two ports
+BLOB_SERVERS={{BLOB_SERVERS}}
+# BLOB_SERVER (singular) is the legacy key. If BLOB_SERVERS is unset, the render
+# uses BLOB_SERVER, then PXE_SERVER. Prefer BLOB_SERVERS.
+BLOB_SERVER={{BLOB_SERVER}}
+
+# --- Arch pacman mirror -------------------------------------------------------
+# The LAN [partyos] repo (browser, hexchat, extra tools installed on demand).
+# Usually the same box as PXE.
+MIRROR_SERVER={{MIRROR_SERVER}}
+
+# --- IRC server (NYET Messenger) ----------------------------------------------
+# host:port of the LAN IRC server the chat client connects to.
+IRC_SERVER={{IRC_SERVER}}
+
+# --- Party name ---------------------------------------------------------------
+# The name of this event. scripts/deploy/announce.sh puts it in every broadcast.
+# setup.sh --party-name=NAME and the wizard scripts/deploy/prepare-event.sh both
+# write it. An empty or missing value falls back to "partyOS".
+PARTY_NAME={{PARTY_NAME}}
+
+# --- Portal / homepage --------------------------------------------------------
+# Path on the PXE server serving the portal bundle (index.html + FAQ + LAN links).
+# Clients download it once at boot and the browser opens the local copy offline.
+PORTAL_PATH=/portal
+
+# --- Operator boot-config hook -----------------------------------------------
+# A script that every client fetches and runs as root on each boot, before the
+# desktop. Edit it on the server to push announcements or config without an image
+# rebuild. setup.sh points this at server/boot-config.sh on the main server.
+# The fetch uses HTTPS with the pinned CA. A failure is logged and the boot goes
+# on: the fetch is bounded to 15 s and the run to 60 s.
+# host:port[/path], no scheme. Leave it empty to disable the hook. A hand-edited
+# value, also an empty one, survives a setup.sh re-run.
+BOOT_CONFIG_URL={{BOOT_CONFIG_URL}}
+
+# --- USB blob cache budget ---------------------------------------------------
+# When the USB stick caches downloaded game blobs, keep at least this many GB
+# free on the stick. After a download, the client evicts the least recently used
+# cached blobs (by atime) until the reserve is met. Mounted blobs are never
+# evicted. Set BLOB_CACHE_RESERVE_GB to 0 to disable the free-space floor.
+BLOB_CACHE_RESERVE_GB=8
+# Optional hard cap on total cached-blob size (GB). 0 = no cap (only the reserve
+# floor applies). When >0, the cache is also trimmed LRU to stay under this size.
+BLOB_CACHE_MAX_GB=0
+
+# --- P2P blob seeding (torrents) ----------------------------------------------
+# Blobs are distributed only over BitTorrent (aria2, one torrent per blob, the LAN
+# tracker). BLOB_SEEDING=on makes a client seed each cached blob until the blob is
+# evicted. BLOB_SEEDING=off turns seeding off. partyos-seeder.service seeds the
+# cached blobs from boot.
+BLOB_SEEDING=on
+# Upload cap per client while seeding, so seeding does not fill the uplink of the
+# client. aria2 rate: 0 = unlimited, or for example 20M or 500K.
+BLOB_SEED_UP_LIMIT=0
+# Partition labels of the player stick: an ordered comma list per partition. The
+# client uses the first label in the list that is on a partition. The venue label
+# is first and the legacy label is second, so venue sticks and legacy sticks both
+# work. render.sh passes the lists on the kernel cmdline (usb_home_labels=,
+# usb_share_labels=). Empty = the defaults baked into the image (the values below).
+# A label has 1 to 16 characters from A-Z a-z 0-9 _ -.
+#   USB_HOME_LABELS   the ext4 home partition (home, blob cache, sync state).
+#   USB_SHARE_LABELS  the exFAT share partition (internyet.env, certificates).
+USB_HOME_LABELS=PARTYOSHOME,LANPARTY_HOME
+USB_SHARE_LABELS=PARTYDATA,PARTYSHARE

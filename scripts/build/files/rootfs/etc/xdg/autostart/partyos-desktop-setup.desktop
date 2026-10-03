@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=partyOS desktop setup
+Exec=/usr/local/bin/partyos-desktop-setup
+X-XFCE-Autostart-enabled=true
+OnlyShowIn=XFCE;

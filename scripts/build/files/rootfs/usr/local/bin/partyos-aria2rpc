@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""partyos-aria2rpc - talk to the one client aria2c (partyos-seeder.service).
+
+The client runs ONE aria2c with JSON-RPC on loopback. It seeds every cached
+blob and does every catalog download. This tool is the only way the other
+scripts touch it. The secret comes from /run/partyos/aria2.secret (root only).
+
+Commands:
+  ping                      exit 0 if the RPC answers
+  wait SECS                 wait up to SECS for the RPC, exit 0 when it answers
+  add TORRENT DIR seed      seed a complete blob, no hash check; print the GID
+  add TORRENT DIR download  download a blob (resume from .aria2); print the GID
+  find NAME DIR             print the GID that holds DIR/NAME.squashfs
+  remove NAME DIR           stop every entry for DIR/NAME.squashfs, wait, forget
+  adopt NAME DIR INFOHASH   keep one live, not finished download of DIR/NAME.squashfs
+                            with this info hash and print its GID (exit 0); remove
+                            every other entry for the file (exit 1 if none is kept)
+  forget GID                forget one stopped entry (removeDownloadResult)
+  status GID                print key=value lines (status, completed, total,
+                            speed, connections, seeders, code, message)
+  list                      print one line per entry (debug)
+
+Environment:
+  PARTYOS_ARIA2_RPC_URL     default http://127.0.0.1:6800/jsonrpc
+  PARTYOS_ARIA2_SECRET_FILE default /run/partyos/aria2.secret
+  PARTYOS_ARIA2_RPC_TIMEOUT default 10 (seconds for one call)
+
+A call that times out fails with "RPC unreachable". aria2c writes to disk in
+its event loop, so a slow USB stick can hold up an answer. Callers retry that.
+"""
+import base64
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+URL = os.environ.get("PARTYOS_ARIA2_RPC_URL", "http://127.0.0.1:6800/jsonrpc")
+SECRET_FILE = os.environ.get("PARTYOS_ARIA2_SECRET_FILE", "/run/partyos/aria2.secret")
+TIMEOUT = float(os.environ.get("PARTYOS_ARIA2_RPC_TIMEOUT", "10"))
+KEYS = ["gid", "status", "completedLength", "totalLength", "downloadSpeed",
+        "uploadSpeed", "connections", "numSeeders", "seeder", "errorCode",
+        "errorMessage", "infoHash", "files"]
+
+
+class RpcError(Exception):
+    pass
+
+
+def token():
+    try:
+        with open(SECRET_FILE) as f:
+            return "token:" + f.read().strip()
+    except OSError as e:
+        raise RpcError("no RPC secret (%s): %s" % (SECRET_FILE, e.strerror))
+
+
+def call(method, *params, timeout=None):
+    timeout = TIMEOUT if timeout is None else timeout
+    body = json.dumps({"jsonrpc": "2.0", "id": "p", "method": method,
+                       "params": [token()] + list(params)}).encode()
+    req = urllib.request.Request(URL, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            reply = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # aria2 answers an RPC fault with HTTP 400 and a JSON error body.
+        try:
+            reply = json.loads(e.read().decode())
+        except ValueError:
+            raise RpcError("HTTP %s" % e.code)
+    except (OSError, ValueError) as e:
+        raise RpcError("RPC unreachable at %s: %s" % (URL, e))
+    if "error" in reply:
+        raise RpcError(reply["error"].get("message", "RPC error"))
+    return reply["result"]
+
+
+def entries():
+    """Every entry aria2 knows: active, waiting and stopped."""
+    out = []
+    out += call("aria2.tellActive", KEYS)
+    out += call("aria2.tellWaiting", 0, 10000, KEYS)
+    out += call("aria2.tellStopped", 0, 10000, KEYS)
+    return out
+
+
+def blob_path(name, cdir):
+    return os.path.join(cdir, name + ".squashfs")
+
+
+def matching(name, cdir):
+    want = os.path.normpath(blob_path(name, cdir))
+    hits = []
+    for e in entries():
+        for f in e.get("files", []):
+            if os.path.normpath(f.get("path", "")) == want:
+                hits.append(e)
+                break
+    return hits
+
+
+def cmd_add(torrent, cdir, mode):
+    with open(torrent, "rb") as f:
+        payload = base64.b64encode(f.read()).decode()
+    # Per-download options. aria2 accepts these on addTorrent (input-file options).
+    opts = {"dir": cdir, "check-integrity": "false"}
+    if mode == "seed":
+        # The blob passed a sha256 check at install time. Seed it at once.
+        # A re-hash at start saturates a USB 2.0 stick when many blobs start together.
+        opts["bt-seed-unverified"] = "true"
+        return call("aria2.addTorrent", payload, [], opts)
+    if mode == "download":
+        # A .aria2 control file next to the partial makes aria2 resume from it.
+        # Position 0 puts the download before any queued entry.
+        opts["bt-seed-unverified"] = "false"
+        return call("aria2.addTorrent", payload, [], opts, 0)
+    raise RpcError("bad mode %r (seed|download)" % mode)
+
+
+def remove_entries(hits):
+    for e in hits:
+        if e["status"] in ("active", "waiting", "paused"):
+            try:
+                call("aria2.forceRemove", e["gid"])
+            except RpcError:
+                pass
+    # Wait until aria2 closed the file: a stopped entry has status removed/complete/error.
+    deadline = time.time() + 20
+    for e in hits:
+        while time.time() < deadline:
+            try:
+                st = call("aria2.tellStatus", e["gid"], ["status"])["status"]
+            except RpcError:
+                break
+            if st in ("removed", "complete", "error"):
+                break
+            time.sleep(0.2)
+        try:
+            call("aria2.removeDownloadResult", e["gid"])
+        except RpcError:
+            pass
+
+
+def cmd_remove(name, cdir):
+    hits = matching(name, cdir)
+    remove_entries(hits)
+    return len(hits)
+
+
+def cmd_adopt(name, cdir, infohash):
+    """A retry must not remove a download that still runs. forceRemove is async:
+    on a blocked stick aria2c keeps the info hash for minutes, and the next add
+    then fails with error 12."""
+    keep, drop = None, []
+    for e in matching(name, cdir):
+        live = e["status"] in ("active", "waiting", "paused")
+        same = e.get("infoHash", "").lower() == infohash.lower()
+        if keep is None and live and same and e.get("seeder") != "true":
+            keep = e
+        else:
+            drop.append(e)
+    remove_entries(drop)
+    if keep is None:
+        return 1
+    print(keep["gid"])
+    return 0
+
+
+def cmd_status(gid):
+    s = call("aria2.tellStatus", gid, KEYS)
+    print("status=%s" % s.get("status", ""))
+    print("completed=%s" % s.get("completedLength", "0"))
+    print("total=%s" % s.get("totalLength", "0"))
+    print("speed=%s" % s.get("downloadSpeed", "0"))
+    print("connections=%s" % s.get("connections", "0"))
+    print("seeders=%s" % s.get("numSeeders", "0"))
+    print("seeder=%s" % s.get("seeder", "false"))
+    print("code=%s" % s.get("errorCode", ""))
+    # One line only: the shell reads key=value pairs.
+    print("message=%s" % " ".join(s.get("errorMessage", "").split()))
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "ping":
+            call("aria2.getVersion", timeout=3)
+        elif cmd == "wait":
+            deadline = time.time() + float(args[0] if args else 30)
+            while True:
+                try:
+                    call("aria2.getVersion", timeout=2)
+                    break
+                except RpcError:
+                    if time.time() >= deadline:
+                        raise
+                    time.sleep(0.5)
+        elif cmd == "add" and len(args) == 3:
+            print(cmd_add(*args))
+        elif cmd == "find" and len(args) == 2:
+            hits = [e for e in matching(*args) if e["status"] in ("active", "waiting", "paused")]
+            if not hits:
+                return 1
+            print(hits[0]["gid"])
+        elif cmd == "remove" and len(args) == 2:
+            cmd_remove(*args)
+        elif cmd == "adopt" and len(args) == 3:
+            return cmd_adopt(*args)
+        elif cmd == "forget" and len(args) == 1:
+            call("aria2.removeDownloadResult", args[0])
+        elif cmd == "status" and len(args) == 1:
+            cmd_status(args[0])
+        elif cmd == "list":
+            for e in entries():
+                path = e.get("files", [{}])[0].get("path", "")
+                print("%s %s %s/%s up=%s seeder=%s %s" % (
+                    e["gid"], e["status"], e.get("completedLength"), e.get("totalLength"),
+                    e.get("uploadSpeed"), e.get("seeder", ""), path))
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except RpcError as e:
+        print("partyos-aria2rpc: %s" % e, file=sys.stderr)
+        return 3
+    except OSError as e:
+        print("partyos-aria2rpc: %s" % e, file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

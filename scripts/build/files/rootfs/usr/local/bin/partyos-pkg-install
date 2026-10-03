@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Install packages from the partyOS LAN mirror, safely under concurrency.
+set -u
+PKGS=("$@")
+[ "${#PKGS[@]}" -gt 0 ] || { echo "usage: partyos-pkg-install <pkg>..." >&2; exit 2; }
+# need root; gamer has passwordless wheel -> re-exec via sudo
+[ "$(id -u)" -eq 0 ] || exec sudo -n "$0" "${PKGS[@]}"
+# serialize all partyOS installs so concurrent callers queue instead of colliding
+exec 9>/run/partyos-pkg.lock
+flock -w 600 9 || { echo "partyos-pkg-install: timed out waiting for install lock" >&2; exit 1; }
+# The baked mirror files carry no server. Make sure partyos-mirror-setup has run first.
+# A oneshot that is already active returns at once; a failed one runs again.
+if ! systemctl start partyos-mirror.service; then
+  echo "PARTYOS-PKG-INSTALL-NO-MIRROR: partyos-mirror.service failed, no LAN mirror is set" >&2
+  logger -t partyos -p user.err "PARTYOS-PKG-INSTALL-NO-MIRROR" 2>/dev/null || true
+  exit 1
+fi
+# Refresh the sync db right before each install (-Sy), so packages added to the LAN
+# mirror after boot are found. Never -u: the mirror and the image pin the same
+# SNAPSHOT, so the refresh adds new packages only (see partyos-mirror-setup).
+rc=1
+for a in 1 2 3 4 5; do
+  # wait out any OTHER pacman holding the db lock (up to ~2min)
+  for _ in $(seq 1 60); do [ -e /var/lib/pacman/db.lck ] || break; sleep 2; done
+  if pacman -Sy --noconfirm --needed "${PKGS[@]}"; then rc=0; break; fi
+  echo "partyos-pkg-install: attempt $a failed - retrying in $((a*3))s" >&2
+  sleep $((a*3))
+done
+exit $rc

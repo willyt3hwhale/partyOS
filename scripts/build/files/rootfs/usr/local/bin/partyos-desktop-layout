@@ -1,0 +1,144 @@
+#!/bin/bash
+# Force the partyOS desktop icon order by rewriting xfdesktop's position yaml.
+DESKDIR="${HOME}/Desktop"
+YAML="${HOME}/.config/xfce4/desktop/icons.screen0.yaml"
+SENT="${HOME}/.config/xfce4/desktop/.partyos-layout-done"
+[ -e "${SENT}" ] && exit 0            # player owns the layout after the first arrange
+[ -n "${DISPLAY}" ] || export DISPLAY=:0
+
+# Wait for xfdesktop to have written a yaml AND for the async app-store refresh to
+# have dropped the core launchers (Apps/browser/messenger come from gen-launchers).
+need=(my-computer.desktop "Apps.desktop" partyos-app-browser.desktop partyos-app-messenger.desktop)
+all_ready=0
+for _ in $(seq 1 30); do
+  if [ -f "${YAML}" ]; then
+    ok=1; for f in "${need[@]}"; do [ -f "${DESKDIR}/${f}" ] || ok=0; done
+    [ "${ok}" = 1 ] && { all_ready=1; break; }
+  fi
+  sleep 2
+done
+[ -f "${YAML}" ] || exit 0            # no yaml yet -> no sentinel, retry next boot
+
+# Desired Win95 order. col0 top->down; Recycle Bin top of col1 (right of My Computer).
+# ROBUST: back up the live yaml, patch into a TEMP file, validate it, and only then
+# swap it in. Any failure (python error, empty/garbled output, lost monitor id or
+# icons) -> keep the ORIGINAL untouched. xfdesktop never sees a half-written file.
+BAK="${YAML}.partyos.bak"; TMP="${YAML}.partyos.tmp"
+cp -f "${YAML}" "${BAK}" 2>/dev/null || true
+rm -f "${TMP}" 2>/dev/null || true
+applied=0
+# Stop xfdesktop BEFORE touching the yaml: it only reads positions at startup AND
+# rewrites the file on exit, so patching while it runs (then --quit) gets clobbered.
+# Kill the process (--quit needs a dbus env we may not have); we ALWAYS relaunch it
+# below. pkill matches this session's own xfdesktop.
+pkill -x xfdesktop 2>/dev/null || xfdesktop --quit 2>/dev/null || true
+sleep 1
+if python3 - "${YAML}" "${DESKDIR}" "${TMP}" <<'PY'
+import sys, os
+yaml_path, deskdir, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+# basename -> (row, col)
+LAYOUT = {
+    "my-computer.desktop":            (0, 0),
+    "cmd.exe.desktop":                (1, 0),
+    "control-panel.desktop":          (2, 0),
+    "partyos-app-browser.desktop":    (3, 0),   # Internyet Explorer
+    "partyos-app-messenger.desktop":  (4, 0),   # NYET Messenger
+    "Apps.desktop":                   (5, 0),
+    "faq.desktop":                    (6, 0),
+    # Load-from-URL is no longer a bare-desktop tile - it now lives inside the
+    # Apps & Games folder (.apps/Games), so it gets no top-level grid slot here.
+    "Recycle Bin.desktop":            (0, 1),
+}
+# only place icons whose file actually exists on disk
+managed = {os.path.join(deskdir, b): rc for b, rc in LAYOUT.items()
+           if os.path.isfile(os.path.join(deskdir, b))}
+
+lines = open(yaml_path).read().splitlines()
+out, i, n = [], 0, len(lines)
+saw_icons = 0
+
+def indent(s): return len(s) - len(s.lstrip(" "))
+
+while i < n:
+    line = lines[i]
+    s = line.strip()
+    if s == "icons:":
+        saw_icons += 1
+        ind = indent(line)
+        ent_ind = ind + 2           # "    \"/path\":"
+        kv_ind  = ind + 4           # "      row: N"
+        out.append(line); i += 1
+        # collect existing entries (path -> [row, col]) preserving order
+        order, ent = [], {}
+        while i < n and (lines[i].strip() == "" or indent(lines[i]) >= ent_ind):
+            l = lines[i]
+            if indent(l) == ent_ind and l.strip().endswith(":"):
+                path = l.strip()[:-1]
+                if (path.startswith('"') and path.endswith('"')) or \
+                   (path.startswith("'") and path.endswith("'")):
+                    path = path[1:-1]
+                row = col = None
+                j = i + 1
+                while j < n and indent(lines[j]) > ent_ind:
+                    t = lines[j].strip()
+                    if t.startswith("row:"): row = t.split(":", 1)[1].strip()
+                    elif t.startswith("col:"): col = t.split(":", 1)[1].strip()
+                    j += 1
+                if path not in ent: order.append(path)
+                ent[path] = [row, col]
+                i = j
+            else:
+                i += 1
+        # overlay our managed positions; add any missing managed icon
+        for path, (r, c) in managed.items():
+            if path not in ent: order.append(path)
+            ent[path] = [str(r), str(c)]
+        # re-emit the icons block, dropping orphans (entries whose .desktop file no
+        # longer exists - e.g. the old per-category / intranet launchers gen-launchers
+        # removed). xfdesktop ignores them anyway; pruning avoids position collisions.
+        for path in order:
+            if not os.path.isfile(path):
+                continue
+            r, c = ent[path]
+            out.append(" " * ent_ind + '"%s":' % path)
+            if r is not None: out.append(" " * kv_ind + "row: %s" % r)
+            if c is not None: out.append(" " * kv_ind + "col: %s" % c)
+        continue
+    out.append(line); i += 1
+
+# refuse to emit if the source had an icons block we failed to re-emit, or if we
+# placed nothing - a non-zero exit makes bash keep the original yaml.
+if saw_icons == 0 or not managed:
+    sys.exit(2)
+open(out_path, "w").write("\n".join(out) + "\n")
+PY
+then
+  # Validate the patched temp before swapping: non-empty, keeps the top-level
+  # structure (configs:/monitors:/id:), and contains at least every managed icon we
+  # expected to place (pruning orphans means it can be SHORTER than the original, so
+  # a line-count floor no longer applies - count managed entries instead).
+  want=0
+  for f in my-computer.desktop cmd.exe.desktop control-panel.desktop \
+           partyos-app-browser.desktop partyos-app-messenger.desktop \
+           Apps.desktop faq.desktop "Recycle Bin.desktop"; do
+    [ -f "${DESKDIR}/${f}" ] && want=$((want+1))
+  done
+  got="$(grep -c '\.desktop":' "${TMP}" 2>/dev/null || echo 0)"
+  if [ -s "${TMP}" ] \
+     && grep -q '^configs:' "${TMP}" \
+     && grep -q 'monitors:' "${TMP}" \
+     && grep -q 'id:' "${TMP}" \
+     && [ "${got}" -ge "${want}" ]; then
+    mv -f "${TMP}" "${YAML}" && applied=1
+  fi
+fi
+rm -f "${TMP}" 2>/dev/null || true
+
+# We stopped xfdesktop above -> ALWAYS bring it back: with the patched yaml if the
+# swap succeeded, else the untouched original (restore the backup if it went missing).
+[ -f "${YAML}" ] || cp -f "${BAK}" "${YAML}" 2>/dev/null || true
+setsid xfdesktop >/dev/null 2>&1 &
+# Seal only once the patch applied AND every managed icon was present, so a slow first
+# boot finishes the order next time instead of locking in a half-applied layout.
+[ "${applied}" = 1 ] && [ "${all_ready}" = 1 ] && : > "${SENT}"
+exit 0

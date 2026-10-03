@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=partyOS default audio output
+Exec=/usr/local/bin/partyos-default-sink
+X-XFCE-Autostart-enabled=true
+OnlyShowIn=XFCE;

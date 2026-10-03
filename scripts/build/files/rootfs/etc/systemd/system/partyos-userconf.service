@@ -1,0 +1,14 @@
+[Unit]
+Description=partyOS - parse USB user.conf into sanitized /run/partyos-* values
+DefaultDependencies=no
+After=local-fs.target partyos-usbhome.service partyos-identity.service
+Wants=partyos-identity.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/partyos-userconf-setup
+
+[Install]
+WantedBy=multi-user.target

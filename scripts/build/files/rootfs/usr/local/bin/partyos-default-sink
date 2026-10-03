@@ -1,0 +1,68 @@
+#!/bin/bash
+# Prefer a real output (onboard analog > USB headset > HDMI) over the ALSA HDMI default.
+# No-op if wpctl/pipewire isn't up yet or no sink is found. Never fails the session.
+
+# pick_sink: read a `wpctl status` dump on stdin, echo the chosen sink node id (or
+# nothing). Pure text - no wpctl call - so it is unit-testable against synthetic dumps.
+# $1 (optional) = AUDIO_SINK override substring (case-insensitive).
+pick_sink() {
+  local override="${1:-}"
+  # Sinks block only (between "Sinks:" and "Sources:"). Each row carries a node id like
+  # "  *   54. Name ...". Strip wpctl's tree glyphs + the "*" default marker, then split
+  # each row into "<id>\t<name>" so we can score by NAME, not by line order.
+  local rows
+  rows="$(sed -n '/Sinks:/,/Sources:/p' \
+    | grep -oE '[0-9]+\. .*' \
+    | sed -E 's/[[:space:]]*\[vol:.*$//')"
+  [ -n "${rows}" ] || return 0
+
+  # HDMI/DP detector - any sink name that is a monitor/digital output.
+  local HDMI_RE='hdmi|displayport|\bdp\b|digital stereo'
+
+  # id_for REGEX [EXCLUDE_RE] -> first sink id whose NAME matches REGEX
+  # (case-insensitive) AND does NOT match EXCLUDE_RE, else empty. The exclude guard
+  # stops a tier-1/2 word that also appears in an HDMI row from grabbing that HDMI row.
+  id_for() {
+    local want="$1" skip="${2:-}"
+    printf '%s\n' "${rows}" | while IFS= read -r r; do
+      local id="${r%%.*}" name="${r#*. }"
+      printf '%s' "${name}" | grep -qiE "${want}" || continue
+      [ -n "${skip}" ] && printf '%s' "${name}" | grep -qiE "${skip}" && continue
+      printf '%s\n' "${id}"; break
+    done
+  }
+
+  local id=""
+  # 0) explicit user.conf override wins outright (matched as a literal substring).
+  if [ -n "${override}" ]; then
+    local esc; esc="$(printf '%s' "${override}" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
+    id="$(id_for "${esc}")"
+    [ -n "${id}" ] && { printf '%s\n' "${id}"; return 0; }
+  fi
+  # 1) onboard analog (covers Intel sof-hda AND Realtek/ALC naming),
+  #    explicitly NOT an HDMI/DP row.
+  id="$(id_for 'analog|analog-stereo|sof.?hda|realtek|alc[0-9]|speaker|head[ -]?phone' "${HDMI_RE}")"
+  # 2) USB DAC / headset (also not HDMI/DP).
+  [ -n "${id}" ] || id="$(id_for 'usb|head[ -]?set' "${HDMI_RE}")"
+  # 3) HDMI / DisplayPort - last resort (HDMI-only rig).
+  [ -n "${id}" ] || id="$(id_for "${HDMI_RE}")"
+  printf '%s\n' "${id}"
+}
+
+# --- runtime: only when invoked as the script, not when sourced for testing ----------
+[ "${BASH_SOURCE[0]}" = "${0}" ] || return 0
+command -v wpctl >/dev/null 2>&1 || exit 0
+# give pipewire-pulse/wireplumber a moment to enumerate the cards + AT LEAST ONE sink
+# after login (audio stack may not be fully up when this autostart fires).
+status=""
+for _ in $(seq 1 15); do
+  status="$(wpctl status 2>/dev/null)"
+  printf '%s' "${status}" | sed -n '/Sinks:/,/Sources:/p' | grep -qE '[0-9]+\. ' && break
+  sleep 1
+done
+[ -n "${status}" ] || exit 0
+# optional override from the USB user.conf (AUDIO_SINK=<substr>), best-effort.
+AUDIO_SINK="$(grep -E '^AUDIO_SINK=' /mnt/usbhome/user.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+sink_id="$(printf '%s' "${status}" | pick_sink "${AUDIO_SINK}")"
+[ -n "${sink_id}" ] || exit 0
+wpctl set-default "${sink_id}" 2>/dev/null || true

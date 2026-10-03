@@ -1,0 +1,16 @@
+[Unit]
+Description=partyOS - set the client clock from the LAN server Date header (isolated LAN, no NTP)
+After=network-online.target partyos-usbhome.service
+Wants=network-online.target
+Before=partyos-home-pull.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=45s
+# `-` prefix: a non-zero exit / crash of the sync is NOT a unit failure. The clock
+# sync is belt-and-suspenders (the CA is clock-independent), so it must never fail
+# the boot or block partyos-home-pull.service, which this unit is ordered Before=.
+ExecStart=-/usr/local/bin/partyos-timesync
+
+[Install]
+WantedBy=multi-user.target

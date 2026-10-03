@@ -1,0 +1,12 @@
+# The home partition of the player stick: a partition whose label is in the home
+# label list (usb_home_labels= on the kernel cmdline, else the baked default).
+# partyos-usb-labels.sh decides. It exits 0 when the label is in the list.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="?*", \
+    PROGRAM="/usr/bin/bash /usr/local/lib/partyos-usb-labels.sh is home %E{ID_FS_LABEL}", \
+    ENV{PARTYOS_USBHOME}="1", \
+    RUN+="/usr/bin/systemctl --no-block start partyos-usb-reinserted.service"
+# The remove handler gets the MAJ:MIN of the removed partition (%M:%m). It unmounts
+# only if that device is behind /mnt/usbhome, so a second stick with a home label
+# does not unmount the home stick.
+ACTION=="remove", SUBSYSTEM=="block", ENV{PARTYOS_USBHOME}=="1", \
+    RUN+="/usr/bin/systemctl --no-block start partyos-usb-removed@%M:%m.service"

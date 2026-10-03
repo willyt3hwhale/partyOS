@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# partyos-report - in-session player INBOX. Unprivileged GUI front door.
+set -u
+
+TITLE="partyOS - Report an Issue"
+PARTYOS_CA="/etc/partyos/ca.pem"
+
+# --- server base: report_url= on the cmdline, exactly like every other script --
+# (cat, not $(<f) - the 2>/dev/null breaks bash's $(<f) fast-path; see server_base
+# in partyos-app.) If no server is set, log PARTYOS-REPORT-NO-SERVER and queue the report.
+report_base() {
+    [ -n "${PARTYOS_SERVER:-}" ] && { printf '%s' "${PARTYOS_SERVER}"; return; }
+    if [ -r /etc/partyos/appstore.conf ]; then
+        local b; b="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+        [ -n "${b}" ] && { printf '%s' "${b}"; return; }
+    fi
+    local rb=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+    [ -n "${rb}" ] && { printf '%s' "${rb}"; return; }
+    # No server parameter: fail loudly. Never dial a guessed address.
+    local m="PARTYOS-REPORT-NO-SERVER: no report_url= on /proc/cmdline and no SERVER_BASE= in /etc/partyos/appstore.conf"
+    echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    return 1
+}
+
+# --- CA pinning: --cacert ONLY for an https base (curl ignores it for http, so this
+# is transition-safe - a still-HTTP report_url leaves the curl unchanged). Prints the
+# flags or nothing; callers splice it in unquoted.
+cacert_args() {
+    case "$1" in
+        https://*) [ -r "${PARTYOS_CA}" ] && printf '%s' "--cacert ${PARTYOS_CA}";;
+    esac
+}
+
+# --- current/last game: newest live overlay mount under /run/partyos-games -----
+# partyos-app overlay-mounts each running game at ~/games/<name> with its lowerdir
+# under /run/partyos-games/<name>. The most-recently-mounted such dir is the
+# current/last game; empty if none has run this session.
+current_game() {
+    local base="/run/partyos-games" newest="" d
+    [ -d "${base}" ] || return 0
+    # newest by mtime; ls -1t is good enough (these are mount-point dirs, few).
+    for d in $(ls -1t "${base}" 2>/dev/null); do
+        [ -d "${base}/${d}" ] && { newest="${d}"; break; }
+    done
+    printf '%s' "${newest}"
+}
+
+# --- player_nick: who is reporting. ALWAYS attached (even a plain message needs a
+# from). Cheap and not sensitive - it is the player's chosen nick, not the hostname.
+player_nick() {
+    local nick
+    nick="$(tr -d '[:space:]' < /run/partyos-nick 2>/dev/null || true)"
+    [ -n "${nick}" ] || nick="$(tr -d '[:space:]' < /run/partyos-username 2>/dev/null || true)"
+    [ -n "${nick}" ] || nick="partygoer"
+    printf '%s' "${nick}"
+}
+
+# --- collect_context: the actionable, BOUNDED system info attached ONLY when the
+# player opts in (the bug checkbox). Emits KEY=VALUE lines (one per line, values
+# single-line). Kept side-effect-free and dependency-light so the unit test can
+# source + run it on a dev host. The journal/dmesg tail is BOUNDED (last 50 lines,
+# newlines flattened) so a report stays small and never dumps the whole log. Core
+# is build_id + log_tail; game + mem_free ride along (cheap, useful for a bug).
+collect_context() {
+    local build game memfree logtail
+    build="$(grep -E '^BUILD_ID=' /etc/partyos-build-id 2>/dev/null | head -1 | cut -d= -f2- )"
+    [ -n "${build}" ] || build="$(cat /etc/partyos-build-id 2>/dev/null | head -1)"
+    [ -n "${build}" ] || build="unknown"
+    game="$(current_game)"; [ -n "${game}" ] || game="(none)"
+    # free RAM in MB from /proc/meminfo (no `free` dependency).
+    memfree="$(awk '/^MemAvailable:/{printf "%d MB", $2/1024; f=1} END{if(!f)print "unknown"}' /proc/meminfo 2>/dev/null || echo unknown)"
+    # last 50 log lines, newest-relevant, flattened to one field (RS-separated).
+    logtail="$(journalctl -b --no-pager -n 50 2>/dev/null | tr '\n' '\036' | tr -s '\036')"
+    [ -n "${logtail}" ] || logtail="$(dmesg 2>/dev/null | tail -n 50 | tr '\n' '\036' | tr -s '\036')"
+    [ -n "${logtail}" ] || logtail="(no log access)"
+    printf 'build_id=%s\n' "${build}"
+    printf 'game=%s\n'     "${game}"
+    printf 'mem_free=%s\n' "${memfree}"
+    printf 'log_tail=%s\n' "${logtail}"
+}
+
+# When sourced by the unit test, STOP here - only the helpers are wanted, not the GUI.
+[ -n "${PARTYOS_REPORT_LIB:-}" ] && return 0 2>/dev/null
+
+# --- 1. gather the message + the bug opt-in -----------------------------------
+# Scriptable path (tests/automation): PARTYOS_REPORT_MESSAGE set => no GUI.
+if [ -n "${PARTYOS_REPORT_MESSAGE:-}" ]; then
+    message="${PARTYOS_REPORT_MESSAGE}"
+    case "${PARTYOS_REPORT_BUG:-0}" in 1|true|TRUE|yes) is_bug=1;; *) is_bug=0;; esac
+else
+    # zenity --forms: one free-text message entry + one bug checkbox. The two values
+    # come back tab-separated on one line; split on the tab.
+    form="$(zenity --forms --width=520 --title="${TITLE}" \
+        --text="Tell the organizer what's up - a complaint, a bug, an idea, a request." \
+        --add-entry="Your message" \
+        --add-checkbox="This is a bug - attach system info (build + recent log)" \
+        --separator=$'\t' 2>/dev/null)" || exit 0
+    message="$(printf '%s' "${form}" | cut -f1 | tr -d '\r')"
+    bugflag="$(printf '%s' "${form}" | cut -f2)"
+    case "${bugflag}" in TRUE|true|1) is_bug=1;; *) is_bug=0;; esac
+fi
+[ -n "${message}" ] || message="(no message given)"
+
+nick="$(player_nick)"
+
+# --- 2. opt-in context: ONLY when the bug box was ticked ----------------------
+build="(not attached)"; game="(not attached)"; memfree="(not attached)"; logtail=""
+if [ "${is_bug}" = 1 ]; then
+    ctx="$(collect_context)"
+    ctx_get() { printf '%s\n' "${ctx}" | grep -E "^$1=" | head -1 | cut -d= -f2-; }
+    build="$(ctx_get build_id)"; game="$(ctx_get game)"
+    memfree="$(ctx_get mem_free)"; logtail="$(ctx_get log_tail)"
+fi
+
+# --- 3. final "send?" confirm. The checkbox already stated system info is attached,
+# so this is a light confirm (no heavy privacy dialog on a plain message). Skipped
+# entirely on the scriptable path. ----------------------------------------------
+if [ -z "${PARTYOS_REPORT_MESSAGE:-}" ]; then
+    if [ "${is_bug}" = 1 ]; then
+        logpreview="$(printf '%s' "${logtail}" | tr '\036' '\n')"
+        preview="Send this BUG report to the party organizer?
+
+From    : ${nick}
+Message :
+${message}
+
+--- system info (you ticked the bug box) ---
+Build    : ${build}
+Game     : ${game}
+Free RAM : ${memfree}
+
+Recent system log (last 50 lines):
+${logpreview}"
+    else
+        preview="Send this message to the party organizer?
+
+From    : ${nick}
+Message :
+${message}
+
+(No system info is attached - just your message.)"
+    fi
+    printf '%s' "${preview}" | zenity --text-info --width=640 --height=480 --title="${TITLE} - Confirm" \
+        --ok-label="Send" --cancel-label="Cancel" 2>/dev/null || exit 0
+fi
+
+# --- 4. build the JSON payload + POST (or queue if the server is down) ---------
+# The payload shape VARIES: a plain message carries only schema/submitted_at/nick/
+# message/is_bug; a bug report ALSO carries build_id/game/mem_free/log_tail.
+json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null \
+    || printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  ')"; }
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# core fields - always present.
+payload="{
+  \"schema\": \"partyos-report-2\",
+  \"submitted_at\": $(json_escape "${ts}"),
+  \"nick\": $(json_escape "${nick}"),
+  \"message\": $(json_escape "${message}"),
+  \"is_bug\": $([ "${is_bug}" = 1 ] && echo true || echo false)"
+# opt-in system info - ONLY when the bug box was ticked.
+if [ "${is_bug}" = 1 ]; then
+    payload="${payload},
+  \"build_id\": $(json_escape "${build}"),
+  \"game\": $(json_escape "${game}"),
+  \"mem_free\": $(json_escape "${memfree}"),
+  \"log_tail\": $(json_escape "$(printf '%s' "${logtail}" | tr '\036' '\n')")"
+fi
+payload="${payload}
+}"
+
+base="$(report_base)"
+queue_dir="/mnt/usbhome/.partyos-reports"
+
+queue_report() {
+    # offline fallback: drop the JSON on the USB stick for the flush unit to drain.
+    mkdir -p "${queue_dir}" 2>/dev/null || true
+    if [ -d "${queue_dir}" ] && [ -w "${queue_dir}" ]; then
+        local qf; qf="${queue_dir}/$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+        printf '%s\n' "${payload}" > "${qf}" 2>/dev/null \
+            && { sync 2>/dev/null || true; printf '%s' "${qf}"; return 0; }
+    fi
+    return 1
+}
+
+# bounded POST; --fail so an HTTP error is a non-zero rc (-> queue path). Pin the CA
+# for an https report_url (no-op for http).
+if curl -fsS $(cacert_args "${base}") --max-time 10 -X POST \
+        -H 'Content-Type: application/json' \
+        --data-binary "${payload}" \
+        "${base}/feedback" >/dev/null 2>&1; then
+    [ -n "${PARTYOS_REPORT_MESSAGE:-}" ] && { echo "partyos-report: sent"; exit 0; }
+    zenity --info --width=420 --title="${TITLE}" \
+        --text="Thanks! Your report was sent to the party organizer." 2>/dev/null || true
+else
+    if qf="$(queue_report)"; then
+        [ -n "${PARTYOS_REPORT_MESSAGE:-}" ] && { echo "partyos-report: queued ${qf}"; exit 0; }
+        zenity --warning --width=460 --title="${TITLE}" \
+            --text="The party server is not reachable right now.\n\nYour report was SAVED on your USB stick and will be sent automatically as soon as the server is back.\n\n(${qf})" 2>/dev/null || true
+    else
+        [ -n "${PARTYOS_REPORT_MESSAGE:-}" ] && { echo "partyos-report: send and queue both failed" >&2; exit 1; }
+        zenity --error --width=460 --title="${TITLE}" \
+            --text="Could not reach the server and could not save the report to your USB stick.\n\nPlease tell an organizer directly." 2>/dev/null || true
+    fi
+fi

@@ -1,0 +1,37 @@
+#!ipxe
+# partyOS blob-metadata boot script (TEMPLATE) - blob metadata.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1-9 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-9 (server/images/custom/, which has
+# the 'gamer' user + curl), with the SAME kernel/initramfs Step 2 RAM-boots. The
+# only difference is the fetched automated-script: metadata-script.sh, which
+# installs the client-side metadata helper, fetches the catalog, reads each blob's
+# metadata (ram_min/ram_max/size/version/category/id) from the catalog AND from
+# the blob's own embedded game.meta, and reasons about RAM fit.
+
+echo ================================================
+echo partyOS - Blob Metadata
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=metadata&status=boot&ip=${ip} rm || echo callback-skipped
+imgfree rm || echo continuing
+
+echo Loading custom desktop image into RAM (blob metadata)...
+# archiso_http_srv -> the custom image dir (arch/x86_64/airootfs.sfs); copytoram
+# pulls the whole sfs into RAM. console=ttyS0 mirrors to the serial line the
+# harness scrapes. no_timer_check: QEMU q35+TCG timer-routing quirk. report_url=
+# is read by metadata-script.sh for its catalog fetch + HTTP callback (no hardcoded IP).
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/metadata-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (blob metadata)...
+boot || goto failed
+
+:failed
+echo partyOS blob metadata boot failed

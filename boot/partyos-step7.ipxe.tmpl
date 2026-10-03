@@ -1,0 +1,36 @@
+#!ipxe
+# partyOS Step 7 boot script (TEMPLATE) - game blob distribution.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1-6 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-6 (server/images/custom/, which has
+# the 'gamer' user + curl), with the SAME kernel/initramfs Step 2 RAM-boots. The
+# only difference from Step 6 is the fetched automated-script: step7-script.sh,
+# which fetches the game catalog, downloads compressed game blobs, mounts them via
+# squashfs+overlayfs to /home/gamer/games/<name>, and runs the dummy games.
+
+echo ================================================
+echo partyOS Step 7 - Game Blob Distribution
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=7&status=boot&ip=${ip} r7 || echo callback-skipped
+imgfree r7 || echo continuing
+
+echo Loading custom desktop image into RAM (Step 7 game blobs)...
+# archiso_http_srv -> the custom image dir (arch/x86_64/airootfs.sfs); copytoram
+# pulls the whole sfs into RAM. console=ttyS0 mirrors to the serial line the
+# harness scrapes. no_timer_check: QEMU q35+TCG timer-routing quirk. report_url=
+# is read by step7-script.sh for its catalog fetch + HTTP callback (no hardcoded IP).
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step7-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (game blob distribution)...
+boot || goto failed
+
+:failed
+echo partyOS Step 7 boot failed

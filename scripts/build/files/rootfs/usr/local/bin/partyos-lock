@@ -1,0 +1,32 @@
+#!/bin/bash
+# Manual + Win+L lock SUPERVISOR. CRITICAL delay: when launched from a keyboard shortcut
+# the WM (xfsettingsd) still holds the Super+L keyboard grab; the locker racing to grab it
+# gets AlreadyGrabbed, the auth dialog cancels, and input WEDGES (frozen screen, no
+# unlock). Waiting for the keys to release first avoids the race. The locker's own grab
+# retry loop is the belt-and-braces; this sleep papers over the FIRST try. Harmless (~0.6s)
+# on the Start-menu path where there is no competing grab.
+sleep 0.6
+# Passwordless kiosk -> saver only, NEVER the locker (must never be able to lock itself
+# out). A non-empty .partyos-passwd is the gate; passwordless falls through to xscreensaver.
+if [ ! -s /mnt/usbhome/.partyos-passwd ]; then
+  exec xscreensaver-command -activate
+fi
+# Resolve the auth target (unix login) + the friendly display nick. The locker
+# authenticates the USERNAME against PAM; the nick is only what the dialog shows.
+LUSER="$(cat /run/partyos-username 2>/dev/null || id -un)"
+LNICK="$(cat /run/partyos-nick 2>/dev/null)"; [ -n "${LNICK}" ] || LNICK="${LUSER}"
+# SUPERVISOR respawn loop: a genuine PAM unlock exits 0 and we stop; ANY other exit (a
+# crash, a SIGKILL-induced non-zero, or our explicit DENY codes) means the screen must
+# stay guarded, so we relaunch. Fail-closed default = relaunch. A single instance only:
+# if a locker is already running (it's a `python3 .../partyos-lock-screen` cmdline, so
+# match the full path, not comm), this invocation no-ops instead of stacking a 2nd grab.
+if pgrep -u "$(id -u)" -f '/usr/local/bin/partyos-lock-screen' >/dev/null 2>&1; then exit 0; fi
+while :; do
+  /usr/local/bin/partyos-lock-screen "${LUSER}" "${LNICK}"
+  rc=$?
+  [ "${rc}" -eq 0 ] && break    # 0 == genuine PAM unlock -> release the lock
+  # any other exit (crash / kill / internal deny) -> re-cover immediately. Tiny sleep
+  # avoids a busy-spin if the app dies instantly (e.g. missing typelib -> still fails CLOSED).
+  sleep 0.2
+done
+exit 0

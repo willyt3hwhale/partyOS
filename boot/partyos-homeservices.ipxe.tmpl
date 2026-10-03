@@ -1,0 +1,36 @@
+#!ipxe
+# partyOS HOME-SERVICES boot script (TEMPLATE) - start a participant's own
+# services from their HOME folder on boot. Rendered at serve time by
+# scripts/vm/render-ipxe.sh ({{SERVER_URL}} -> harness SERVER_URL; the
+# {{HOMESVC_*}} placeholders carry the test mode). Reached automatically via the
+# DHCP boot filename, same as Steps 1-9 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-9 (server/images/custom/), with the
+# SAME kernel/initramfs Step 2 RAM-boots, with the LANPARTY_HOME USB stick
+# attached. The fetched automated-script is homeservices-script.sh: it brings the
+# home up, runs the BAKED partyos-home-services per-user boot hook (discovers
+# ~/.partyos/services/ and starts them as the user), and emits the proof.
+#
+# homesvc_expect=service|none tells the verifier which assertion to make; the
+# service case also passes the seeded service name + port.
+
+echo ================================================
+echo partyOS HOME-SERVICES - start services from home
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=homeservices&status=boot&ip=${ip} ri || echo callback-skipped
+imgfree ri || echo continuing
+
+echo Loading custom desktop image into RAM (home-services)...
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/homeservices-script.sh report_url={{SERVER_URL}} homesvc_expect={{HOMESVC_EXPECT}} homesvc_name={{HOMESVC_NAME}} homesvc_port={{HOMESVC_PORT}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (home-services)...
+boot || goto failed
+
+:failed
+echo partyOS home-services boot failed

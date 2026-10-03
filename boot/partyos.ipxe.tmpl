@@ -1,0 +1,79 @@
+#!ipxe
+# partyOS main boot script (TEMPLATE).
+# Rendered at serve time by scripts/vm/render-ipxe.sh, which substitutes
+# {{SERVER_URL}} with the harness's SERVER_URL (the QEMU user-mode host on
+# SLIRP).
+#
+# This script is reached AUTOMATICALLY: QEMU's iPXE option ROM receives the
+# script URL as the DHCP boot filename (DHCP option 67 / SLIRP bootfile) and
+# chains it with no typed command. On a real LAN dnsmasq's dhcp-boot does the
+# same. See scripts/vm/run-client.sh.
+
+echo ================================================
+echo partyOS Network Boot
+echo ================================================
+echo
+echo Network Status:
+echo IP Address: ${ip}
+echo Gateway: ${gateway}
+echo DNS Server: ${dns}
+echo Server URL: {{SERVER_URL}}
+echo
+
+# --- Network boot success: we DHCP'd, chained this script over HTTP, and can reach
+# the server. Emit the serial marker the harness greps for, then fire an HTTP
+# callback the server logs (the autonomous "watch the screen" channel).
+echo PARTYOS-NETBOOT-OK
+echo Network boot complete
+# Callback the server logs (autonomous "watch the screen" channel). The /report
+# endpoint returns 200, so this normally succeeds; stay best-effort regardless.
+imgfetch {{SERVER_URL}}/report?step=1&status=ok&ip=${ip} report1 || echo callback-skipped
+imgfree report1 || echo continuing
+
+echo
+echo Loading the RAM-based Linux boot...
+echo Downloading Arch Linux kernel...
+# Canonical archiso HTTP boot cmdline (matches loader/syslinux archiso_pxe http
+# entry): archisobasedir=arch + archiso_http_srv pointing at the server ROOT
+# (the dir that holds arch/x86_64/airootfs.sfs). HTTP boot in archiso always
+# forces copytoram, so the root fs ends up entirely in RAM - we pass copytoram
+# explicitly too. console=ttyS0 mirrors the console to the serial line the
+# harness captures; console=tty0 keeps the tty1 autologin (which runs the
+# automated script) working. cow_spacesize gives the overlay room.
+# script= is archiso's automated-script hook: it fetches and runs our in-guest
+# verifier; report_url= tells that script where to POST the callback.
+#
+# NOTE: cms_verify is intentionally NOT passed. airootfs.sfs.cms.sig is signed
+# with archiso's short-lived codesigning cert, which expires a few months after
+# the ISO build - so on a staged 2025.09 image cms_verify=y aborts the boot with
+# "certificate has expired" and drops to an emergency shell. Signature checking
+# guards an UNTRUSTED transport; on our own LAN/SLIRP it is optional. Integrity
+# could instead be enforced with checksum=y (airootfs.sha512) if ever wanted.
+#
+# no_timer_check: skips the kernel's IO-APIC<->8254 timer routing sanity check.
+# Under QEMU q35 + TCG emulation that check intermittently mis-fires and panics
+# ("IO-APIC + timer doesn't work! Boot with apic=debug"). The flag is benign on
+# real hardware (it only disables a self-test) and makes the emulated boot
+# deterministic.
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/ ip=dhcp copytoram cow_spacesize=2G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step2-script.sh report_url={{SERVER_URL}} || goto kernel_failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto initrd_failed
+
+echo Starting Arch Linux...
+boot || goto boot_failed
+
+:kernel_failed
+echo Failed to download kernel (stage the boot images under server/images/)
+goto done
+
+:initrd_failed
+echo Failed to download initramfs (stage the boot images under server/images/)
+goto done
+
+:boot_failed
+echo Boot failed - check kernel parameters
+goto done
+
+:done
+echo partyOS boot script finished

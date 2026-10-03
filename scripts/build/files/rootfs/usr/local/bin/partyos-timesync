@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# partyos-timesync - set the client clock from the LAN server's HTTP Date header.
+# Isolated LAN, no NTP: the server is the time source. Best-effort, never fatal.
+set -u
+
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[timesync] $*" > "${SER}" 2>/dev/null; echo "[timesync] $*"; }
+
+PARTYOS_CA="/etc/partyos/ca.pem"
+
+# --- server base: same resolution order every other partyOS script uses --------
+# PARTYOS_SERVER env -> SERVER_BASE= in appstore.conf -> report_url= on the cmdline
+# -> none (log PARTYOS-TIMESYNC-NO-SERVER and exit 1). `cat`, not $(<f): the 2>/dev/null breaks bash's $(<f)
+# fast-path. Copied verbatim from partyos-report-flush.
+server_base() {
+    [ -n "${PARTYOS_SERVER:-}" ] && { printf '%s' "${PARTYOS_SERVER}"; return; }
+    if [ -r /etc/partyos/appstore.conf ]; then
+        local b; b="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+        [ -n "${b}" ] && { printf '%s' "${b}"; return; }
+    fi
+    local rb=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+    [ -n "${rb}" ] && { printf '%s' "${rb}"; return; }
+    # No server parameter: fail loudly. Never dial a guessed address.
+    local m="PARTYOS-TIMESYNC-NO-SERVER: no report_url= on /proc/cmdline and no SERVER_BASE= in /etc/partyos/appstore.conf"
+    echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    return 1
+}
+# --cacert ONLY for an https base (curl ignores it for http - transition-safe).
+cacert_args() {
+    case "$1" in
+        https://*) [ -r "${PARTYOS_CA}" ] && printf '%s' "--cacert ${PARTYOS_CA}";;
+    esac
+}
+BASE="$(server_base)" || exit 1
+CA="$(cacert_args "${BASE}")"
+
+# --- fetch the server Date header: 3 bounded tries, brief sleep between --------
+# curl -sSI = HEAD; sed pulls the RFC1123 value off the Date: line (spaces intact),
+# tr drops the CR. Empty (server down/no header) -> retry, then give up quietly.
+fetch_date() {
+    local i d
+    for i in 1 2 3; do
+        d="$(curl -sSI ${CA} --max-time 5 "${BASE}/" 2>/dev/null \
+                | sed -n 's/^[Dd]ate:[[:space:]]*//p' | tr -d '\r' | head -1)"
+        [ -n "${d}" ] && { printf '%s' "${d}"; return 0; }
+        sleep 2
+    done
+    return 1
+}
+
+# --- --check: self-test / diagnostic probe (never touches the clock) -----------
+# Exercises the exact fetch+parse path the real run uses but STOPS before `date -s`,
+# so it is safe to run anywhere (tests, a remote --check probe, a boot smoke check).
+# Exits 0 iff the server is reachable AND its Date header parses to a valid epoch;
+# non-zero + a reason otherwise. This is the ONLY non-fail-safe exit in the script and
+# it is deliberate - it is a diagnostic, NOT the boot path (the boot path below always
+# exits 0). It must never be wired as a boot dependency.
+if [ "${1:-}" = "--check" ]; then
+    d="$(fetch_date)" || { log "CHECK fail (server ${BASE} unreachable / no Date header)"; exit 1; }
+    e="$(date -d "${d}" +%s 2>/dev/null)" || e=""
+    case "${e}" in
+        ''|*[!0-9]*) log "CHECK fail (unparseable Date '${d}' from ${BASE})"; exit 1;;
+    esac
+    log "CHECK ok (server ${BASE} Date '${d}' -> epoch ${e}; clock NOT modified)"
+    exit 0
+fi
+
+# --- boot/apply path: FAIL-SAFE by construction --------------------------------
+# The CA is clock-independent now (wide validity window), so this clock sync is
+# belt-and-suspenders, NOT a boot gate. Every failure branch below LOGS and `exit 0`s
+# so a dead/slow/garbage time source can never wedge or fail the boot; the unit's
+# ExecStart is also `-`-prefixed so even an unforeseen crash cannot fail the unit.
+rfc1123="$(fetch_date)" || { log "PARTYOS-TIMESYNC skip (server ${BASE} unreachable)"; exit 0; }
+
+# GUARD: only apply if the Date parses to a valid epoch (coreutils `date -d`).
+new_epoch="$(date -d "${rfc1123}" +%s 2>/dev/null)" || new_epoch=""
+case "${new_epoch}" in
+    ''|*[!0-9]*) log "PARTYOS-TIMESYNC skip (unparseable Date '${rfc1123}')"; exit 0;;
+esac
+
+old_epoch="$(date +%s)"
+old_str="$(date -d "@${old_epoch}" 2>/dev/null || date)"
+date -s "@${new_epoch}" >/dev/null 2>&1 || { log "PARTYOS-TIMESYNC skip (date -s failed)"; exit 0; }
+new_str="$(date -d "@${new_epoch}" 2>/dev/null || date)"
+delta=$((new_epoch - old_epoch))
+
+# Persist to the RTC if writable (best-effort; ignore failure on RTC-less/emulated HW)
+# so the corrected time survives across the session.
+hwclock -w 2>/dev/null || true
+
+log "PARTYOS-TIMESYNC set ${old_str} -> ${new_str} (delta ${delta}s)"

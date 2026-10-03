@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# partyos-notify-poll - poll the LAN server's operator-broadcast feed and show
+# new notices to the player: "info" as a transient desktop toast (notify-send -u
+# normal), "alert" as a STICKY critical toast (notify-send -u critical, which the
+# daemon keeps on screen until dismissed) plus an optional short sound cue. Both
+# levels are non-focus-stealing OSD overlays - never a managed/focus-grabbing
+# window - so a notice can NEVER tab a player out of a fullscreen game.
+#
+# Runs for the whole XFCE session as an /etc/xdg/autostart loop (DISPLAY + the
+# session DBUS are already in the environment here, which notify-send needs).
+# Polls <BASE>/server/notices.json over pinned-CA HTTPS every ~20s.
+#
+# BASELINE: on a fresh boot the seen-state file (under XDG_RUNTIME_DIR, tmpfs)
+# is absent; the first successful poll SEEDS it to the feed's current max ts and
+# shows NOTHING, so the existing backlog does not replay at every boot. Only
+# notices with ts > seen on LATER polls are shown.
+#
+# We key off the server-stamped TS (a high-watermark), NOT the id. ids restart at 1
+# after an operator `announce --clear`, so an id-keyed watermark would silently swallow
+# every post-clear broadcast (new id <= seen id). ts is strictly monotonic on the server
+# (always >= now and > the feed's max ts), so a post-clear push still orders ahead and
+# gets shown.
+set -u
+
+PARTYOS_CA="/etc/partyos/ca.pem"
+# seen-state lives in the SESSION user's runtime dir (XDG_RUNTIME_DIR, /run/user/<uid>):
+# the poller runs as the session user, and bare /run is 0755 root:root - a write there
+# fails (silently, under || true) and the baseline-seed branch would loop forever. The
+# runtime dir is user-owned + tmpfs, so the fresh-boot re-seed behaviour is preserved.
+# NOTE: a NEW filename (.seents) vs the old id-keyed .seen - a stale .seen value would be
+# misread as a ts (off by orders of magnitude) and is simply ignored by switching files.
+SEEN_FILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/partyos-notify.seents"
+
+# SERVER_BASE / cacert idiom - copied verbatim from partyos-report-flush.
+server_base() {
+    if [ -r /etc/partyos/appstore.conf ]; then
+        local b; b="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+        [ -n "${b}" ] && { printf '%s' "${b}"; return; }
+    fi
+    local rb=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+    [ -n "${rb}" ] && { printf '%s' "${rb}"; return; }
+    # No server parameter: fail loudly. Never dial a guessed address.
+    local m="PARTYOS-NOTIFY-POLL-NO-SERVER: no report_url= on /proc/cmdline and no SERVER_BASE= in /etc/partyos/appstore.conf"
+    echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    return 1
+}
+# --cacert ONLY for an https base (curl ignores it for http - transition-safe).
+cacert_args() {
+    case "$1" in
+        https://*) [ -r "${PARTYOS_CA}" ] && printf '%s' "--cacert ${PARTYOS_CA}";;
+    esac
+}
+BASE="$(server_base)" || exit 1
+CA="$(cacert_args "${BASE}")"
+
+# Defensive: autostart usually has DISPLAY, but never hardcode the DBUS address.
+export DISPLAY="${DISPLAY:-:0}"
+
+# parse_feed FEEDFILE LASTSEEN NOW
+#   Prints, on stdout:
+#     line 1            : MAX <maxts>            (largest ts in the feed, or LASTSEEN)
+#     subsequent lines  : <ts>\t<id>\t<level>\t<title>\t<message>   (one per NEW, not-
+#                         expired notice with ts>LASTSEEN, sorted ascending by ts)
+#   We key off the server-stamped ts (strictly monotonic), NOT the id, so a post-clear
+#   push (id back to 1) still delivers. The id is still emitted per row, for logging.
+#   title/message have tabs+newlines flattened to spaces so the TSV stays one line
+#   each. A missing / empty / corrupt feed yields just "MAX <LASTSEEN>" and no rows.
+parse_feed() {
+    FEED="$1" LASTSEEN="$2" NOW="$3" python3 - <<'PYEOF'
+import json, os, sys
+
+feed = os.environ.get("FEED", "")
+try:
+    lastseen = int(os.environ.get("LASTSEEN", "0"))
+except ValueError:
+    lastseen = 0
+try:
+    now = int(os.environ.get("NOW", "0"))
+except ValueError:
+    now = 0
+
+def flat(s):
+    # collapse any tab/newline/CR so the TSV row stays a single line
+    return str(s).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+notices = []
+try:
+    with open(feed, "r") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        data = []
+except Exception:
+    data = []
+
+maxts = lastseen
+shown = []
+for n in data:
+    if not isinstance(n, dict):
+        continue
+    try:
+        ts = int(n.get("ts"))
+    except (TypeError, ValueError):
+        continue
+    if ts > maxts:
+        maxts = ts
+    try:
+        nid = int(n.get("id", 0))
+    except (TypeError, ValueError):
+        nid = 0
+    try:
+        exp = int(n.get("expires", 0))
+    except (TypeError, ValueError):
+        exp = 0
+    expired = (exp != 0 and exp <= now)
+    if ts > lastseen and not expired:
+        level = flat(n.get("level", "info")) or "info"
+        if level not in ("info", "alert"):
+            level = "info"
+        shown.append((ts, nid, level, flat(n.get("title", "")), flat(n.get("message", ""))))
+
+shown.sort(key=lambda r: r[0])
+out = ["MAX %d" % maxts]
+for ts, nid, level, title, msg in shown:
+    out.append("%d\t%d\t%s\t%s\t%s" % (ts, nid, level, title, msg))
+sys.stdout.write("\n".join(out) + "\n")
+PYEOF
+}
+
+# Give X / the notification daemon a moment before the first poll.
+sleep 5
+
+while true; do
+    feed="$(mktemp 2>/dev/null || echo /tmp/partyos-notify.$$.json)"
+    if ! curl -fsS ${CA} --max-time 8 -o "${feed}" "${BASE}/server/notices.json" 2>/dev/null; then
+        # server unreachable / transient: stay silent, retry next tick.
+        rm -f "${feed}" 2>/dev/null || true
+        sleep 20
+        continue
+    fi
+
+    lastseen=0
+    [ -r "${SEEN_FILE}" ] && lastseen="$(tr -dc '0-9' < "${SEEN_FILE}" 2>/dev/null)"
+    [ -n "${lastseen}" ] || lastseen=0
+    now="$(date +%s 2>/dev/null || echo 0)"
+
+    parsed="$(parse_feed "${feed}" "${lastseen}" "${now}" 2>/dev/null)"
+    rm -f "${feed}" 2>/dev/null || true
+
+    # first line is "MAX <n>" (largest ts in the feed); the rest are notice rows.
+    maxts="$(printf '%s\n' "${parsed}" | head -1 | awk '{print $2}')"
+    [ -n "${maxts}" ] || maxts="${lastseen}"
+
+    # FIRST-RUN BASELINE: no seen file yet -> record max ts, show nothing.
+    if [ ! -e "${SEEN_FILE}" ]; then
+        printf '%s' "${maxts}" > "${SEEN_FILE}" 2>/dev/null || true
+        logger -t partyos-notify "PARTYOS-NOTIFY baseline seeded maxts=${maxts}" 2>/dev/null || true
+        echo "PARTYOS-NOTIFY baseline seeded maxts=${maxts}"
+        sleep 20
+        continue
+    fi
+
+    highest="${lastseen}"
+    # rows after line 1; IFS=tab so titles/messages keep their spaces.
+    while IFS=$'\t' read -r ts nid level title message; do
+        [ -n "${ts}" ] || continue
+        case "${level}" in
+            alert)
+                # alert = a CRITICAL-urgency toast. The daemon keeps a critical
+                # notification on screen until it is dismissed (it does not auto-
+                # expire), so an alert is "unmissable" WITHOUT any focus-stealing
+                # window. NEVER pop a managed dialog here: that would grab focus
+                # and tab a player out of a fullscreen game.
+                notify-send -u critical "${title}" "${message}" 2>/dev/null || true
+                # Optional short sound cue so an alert is noticeable even if the
+                # player is looking away. Fully best-effort and backgrounded: it
+                # must never block the poll loop, and a sound steals no focus. Try
+                # a couple of common system chimes; do nothing if none / no paplay.
+                if command -v paplay >/dev/null 2>&1; then
+                    for snd in \
+                        /usr/share/sounds/freedesktop/stereo/dialog-warning.oga \
+                        /usr/share/sounds/freedesktop/stereo/complete.oga \
+                        /usr/share/sounds/freedesktop/stereo/bell.oga; do
+                        if [ -r "${snd}" ]; then
+                            paplay "${snd}" >/dev/null 2>&1 &
+                            break
+                        fi
+                    done
+                fi
+                ;;
+            *)
+                # info = a transient toast that auto-expires.
+                notify-send -u normal "${title}" "${message}" 2>/dev/null || true
+                ;;
+        esac
+        logger -t partyos-notify "PARTYOS-NOTIFY shown ts=${ts} id=${nid} level=${level}" 2>/dev/null || true
+        echo "PARTYOS-NOTIFY shown ts=${ts} id=${nid} level=${level}"
+        highest="${ts}"
+    done < <(printf '%s\n' "${parsed}" | tail -n +2)
+
+    # advance the watermark to the highest ts we processed this tick (rows are
+    # ts-ascending, so this is the last row's ts). A notice is shown exactly once.
+    if [ "${highest}" -gt "${lastseen}" ] 2>/dev/null; then
+        printf '%s' "${highest}" > "${SEEN_FILE}" 2>/dev/null || true
+    fi
+
+    sleep 20
+done

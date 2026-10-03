@@ -1,0 +1,23 @@
+[Unit]
+Description=partyOS - one aria2c that seeds the cached game blobs and downloads new ones (P2P)
+After=network-online.target partyos-usbhome.service partyos-userconf.service partyos-lpd-route.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/partyos-aria2d
+# Add every cached blob over RPC once aria2c answers. No re-hash.
+# The "-" prefix: a failure of seed-cached does not stop aria2c. seed-cached can
+# fetch one .torrent per cached blob from a slow server, so do not time it out.
+ExecStartPost=-/usr/local/bin/partyos-seed-cached
+TimeoutStartSec=infinity
+Restart=on-failure
+RestartSec=2
+# aria2c saves the .aria2 control files on SIGTERM. Do not wait on a stuck USB stick.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+SendSIGKILL=yes
+
+[Install]
+WantedBy=multi-user.target

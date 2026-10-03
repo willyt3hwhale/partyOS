@@ -1,0 +1,11 @@
+[Unit]
+Description=partyOS - re-sync the client clock from the server to trim drift
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=20min
+AccuracySec=30s
+Unit=partyos-timesync.service
+
+[Install]
+WantedBy=timers.target

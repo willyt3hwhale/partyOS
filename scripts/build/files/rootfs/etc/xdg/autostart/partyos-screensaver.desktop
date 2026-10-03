@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=partyOS screensaver + lock
+Comment=Start the xscreensaver classics saver + xss-lock idle bridge to the Win95 PAM locker
+Exec=/usr/local/bin/partyos-lock-setup
+X-XFCE-Autostart-enabled=true
+OnlyShowIn=XFCE;

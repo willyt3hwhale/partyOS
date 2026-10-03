@@ -1,0 +1,40 @@
+#!ipxe
+# Embedded autoboot for the physical smoke test: server IP baked in so the stick
+# auto-chains to partyOS with no typed command and no DHCP option 67 on the LAN.
+#
+# In an embedded EFI script, a failed command without a trailing `||` aborts the
+# script back to UEFI.
+# `dhcp --timeout 30000` outlasts a switch spanning-tree (STP) forwarding delay.
+echo partyOS autoboot (embedded, baked server)...
+# A cold power-on needs time to negotiate link before the first dhcp.
+ifopen net0 || echo   ifopen net0 failed - continuing
+sleep 3 ||
+# DHCP retry loop: each step is on its own line. Only `iseq` carries a trailing `||`.
+set idx:int32 0
+:retry
+dhcp --timeout 30000 net0 && goto neton
+inc idx
+iseq ${idx} 15 && goto giveup ||
+echo   DHCP failed (attempt ${idx}/15) - link up, switch STP converging, retrying...
+sleep 2
+goto retry
+
+:neton
+echo Got lease: ${net0/ip} via ${net0/gateway} mac=${net0/mac}
+chain http://partyos.lan:8080/boot/partyos.ipxe || goto failed
+
+# A headless client has no keyboard, so reboot on failure instead of `shell`.
+# A reboot re-runs this script. `shell ||` runs only if the firmware cannot reboot.
+:failed
+echo chain to partyos.lan:8080 failed - rebooting to retry in 5s...
+sleep 5 ||
+reboot ||
+echo reboot unsupported by firmware - dropping to iPXE shell
+shell ||
+
+:giveup
+echo DHCP never succeeded after 15 attempts - rebooting to retry in 5s...
+sleep 5 ||
+reboot ||
+echo reboot unsupported by firmware - dropping to iPXE shell
+shell ||

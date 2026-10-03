@@ -1,0 +1,30 @@
+#!ipxe
+# partyOS Step 5 PERSISTENCE boot script (TEMPLATE) - reboot/persistence check.
+# Identical to partyos-step5.ipxe.tmpl except it passes persist_token=, which
+# puts step5-script.sh into PERSISTENCE-CHECK mode: it mounts the SAME USB home
+# stick (reused across the reboot), seeds /home/gamer from it, and asserts the
+# token a previous boot synced is still present after the reboot.
+#
+# {{SERVER_URL}} is substituted by render-ipxe.sh; {{PERSIST_TOKEN}} is then
+# substituted by test-step5.sh with the token captured from the first boot.
+
+echo ================================================
+echo partyOS Step 5 - Home Sync PERSISTENCE check
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=5&status=persistboot&ip=${ip} r5p || echo callback-skipped
+imgfree r5p || echo continuing
+
+echo Loading custom desktop image into RAM (Step 5 persistence)...
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step5-script.sh report_url={{SERVER_URL}} persist_token={{PERSIST_TOKEN}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (persistence check)...
+boot || goto failed
+
+:failed
+echo partyOS Step 5 persistence boot failed

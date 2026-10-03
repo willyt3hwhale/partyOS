@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# partyos-launch <app> [args...] - resolve from the catalog and run it.
+set -u
+
+APP="${1:-}"; shift || true
+[ -n "${APP}" ] || { echo "usage: partyos-launch <app> [args...]" >&2; exit 2; }
+
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+
+# zenity helpers - all best-effort (a slim image might lack zenity; never block on it)
+zinfo()  { zenity --info     --title="partyOS" --width=360 --text="$1" 2>/dev/null || true; }
+zerr()   { zenity --error    --title="partyOS" --width=360 --text="$1" 2>/dev/null || true; }
+
+# --- ONE long-lived launch-progress dialog ------------------------------------
+# The instant the shortcut is pressed the player must see "Starting <TITLE>..." and
+# then watch the launch walk through its stages in the SAME dialog. We back a single
+# zenity --progress with a FIFO: prog_open spawns zenity reading the FIFO, and every
+# stage writes "# <text>" / a percentage to it. The dialog stays up until prog_close
+# (called right before exec, or on any error). Determinate bar throughout so the real
+# download % shows; indeterminate stages just park the bar and update the text.
+# All best-effort: no zenity / no fifo -> the helpers degrade to no-ops, launch still
+# works. An EXIT trap guarantees the dialog never orphans, whatever path we exit on.
+PROG_FIFO=""; PROG_PID=""; PROG_CANCELLED=0
+prog_open() {  # prog_open <title-text>
+    command -v zenity >/dev/null 2>&1 || return 0
+    PROG_FIFO="$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/partyos-launch-prog.XXXXXX")" 2>/dev/null \
+        || PROG_FIFO="/tmp/partyos-launch-prog.$$"
+    mkfifo "${PROG_FIFO}" 2>/dev/null || { PROG_FIFO=""; return 0; }
+    # Hold the FIFO open for writing on fd 9 so a slow first stage can't EOF zenity.
+    exec 9<>"${PROG_FIFO}"
+    zenity --progress --title="${TITLE}" --width=440 --auto-close \
+        --percentage=0 --text="$1" <"${PROG_FIFO}" >/dev/null 2>&1 &
+    PROG_PID=$!
+}
+prog() {  # prog [<pct>] <text...> - update the live dialog (pct optional)
+    [ -n "${PROG_FIFO}" ] || return 0
+    case "$1" in ''|*[!0-9]*) ;; *) printf '%s\n' "$1" >&9 2>/dev/null; shift;; esac
+    [ -n "${1:-}" ] && printf '# %s\n' "$*" >&9 2>/dev/null || true
+}
+prog_close() {  # tear the dialog down cleanly (idempotent)
+    [ -n "${PROG_FIFO}" ] || return 0
+    # Push 100 then CLOSE the write fd: --auto-close makes zenity render the final
+    # stage and exit on EOF on its own, so the last "Launching" line isn't truncated.
+    # Give it a brief grace, then hard-kill as a fallback (e.g. if it was a Cancel and
+    # zenity is already gone, the kill is a harmless no-op).
+    printf '100\n' >&9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+    if [ -n "${PROG_PID}" ]; then
+        for _ in 1 2 3 4 5; do kill -0 "${PROG_PID}" 2>/dev/null || break; sleep 0.1; done
+        kill "${PROG_PID}" 2>/dev/null || true
+        wait "${PROG_PID}" 2>/dev/null || true
+    fi
+    rm -f "${PROG_FIFO}" 2>/dev/null || true
+    PROG_FIFO=""; PROG_PID=""
+}
+# Whatever happens (error exit, success exit before exec, a kill), never orphan the
+# dialog. exec replaces the process and clears the trap, so a real game launch is fine.
+trap 'prog_close' EXIT
+
+# Single-instance per app for the download/install phase. A double-click (or a click
+# racing an in-flight launch) must not kick off a second download+install pipeline for
+# the same app. Hold a per-app lock for this process's lifetime; if it's already held,
+# the app is already starting -> tell the player and exit cleanly. (run.sh holds its
+# own per-game lock across the prefix copy; this is the upstream half.)
+exec 8>"${XDG_RUNTIME_DIR:-/tmp}/partyos-launch-${APP}.lock" 2>/dev/null || exec 8>"/tmp/partyos-launch-${APP}.lock"
+if command -v flock >/dev/null 2>&1 && ! flock -n 8; then
+    say "PARTYOS-LAUNCH-BUSY app=${APP} (already starting)"
+    zinfo "${APP} is already starting.\nGive it a moment."
+    exit 0
+fi
+
+# --- resolve the server base (the LAN) - same precedence as partyos-app --------
+server_base() {
+    [ -n "${PARTYOS_SERVER:-}" ] && { printf '%s' "${PARTYOS_SERVER}"; return; }
+    if [ -r /etc/partyos/appstore.conf ]; then
+        local b; b="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+        [ -n "${b}" ] && { printf '%s' "${b}"; return; }
+    fi
+    local rb=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+    [ -n "${rb}" ] && { printf '%s' "${rb}"; return; }
+    # No server parameter: fail loudly. Never dial a guessed address.
+    local m="PARTYOS-LAUNCH-NO-SERVER: no report_url= on /proc/cmdline and no SERVER_BASE= in /etc/partyos/appstore.conf"
+    echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    return 1
+}
+SERVER_BASE="$(server_base)"
+# Pin the partyOS CA on https blob bases (see partyos-app's copy).
+PARTYOS_CA=/etc/partyos/ca.pem
+cacert_args() {
+    case "$1" in
+        https://*) [ -r "${PARTYOS_CA}" ] && printf '%s' "--cacert ${PARTYOS_CA}";;
+    esac
+}
+# Same blob split-deploy resolution as partyos-app: an ORDERED failover list of blob
+# bases (blob_urls= CSV -> legacy blob_url= as a 1-element list -> report/PXE server).
+# Single-element list = today's behaviour (one base, no failover). The heavy install
+# (get_blob) runs in partyos-app; here we only need the catalog, but it too honours
+# the list so a dead first blob server can't block resolving the app object.
+blob_bases() {
+    local urls="" one=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in
+        blob_urls=*) urls="${p#*=}";;
+        blob_url=*)  one="${p#*=}";;
+    esac; done
+    [ -n "${urls}" ] && { printf '%s' "${urls}"; return; }
+    [ -n "${one}" ]  && { printf '%s' "${one}";  return; }
+    printf '%s' "${SERVER_BASE}"
+}
+IFS=',' read -r -a BLOB_BASES <<< "$(blob_bases)"
+BLOB_BASE="${BLOB_BASES[0]:-${SERVER_BASE}}"
+CATALOG_URL="${BLOB_BASE}/server/games/catalog.json"
+CATALOG="${XDG_RUNTIME_DIR:-/tmp}/partyos-launch-catalog.json"
+
+# blob_fetch REL OUT [curl-args...] -> try each blob base in order; first that answers
+# wins. The report channel is NOT routed through here. Single-element list = one curl.
+blob_fetch() {
+    local rel="$1" out="$2"; shift 2
+    local base
+    for base in "${BLOB_BASES[@]}"; do
+        [ -n "${base}" ] || continue
+        # Pin the partyOS CA when this base is https; curl ignores it for http.
+        curl -fsS $(cacert_args "${base}") "$@" -o "${out}" "${base}/${rel}" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Always refresh the catalog (~20KB); atomic replace; keep a stale copy ONLY when the
+# server is unreachable. A stale cached catalog carries an old blob sha and would reject
+# a re-deployed blob forever (the "download keeps failing" trap) - same fix as partyos-app.
+if blob_fetch "server/games/catalog.json" "${CATALOG}.new" --max-time 15 && [ -s "${CATALOG}.new" ]; then
+    mv -f "${CATALOG}.new" "${CATALOG}"
+fi
+rm -f "${CATALOG}.new" 2>/dev/null || true
+if [ ! -s "${CATALOG}" ]; then
+    say "PARTYOS-LAUNCH ERROR catalog unavailable (${CATALOG_URL})"
+    zerr "Can't reach the party server.\nIs the network up?"; exit 1
+fi
+
+# Re-extract the SINGLE catalog object for <app> (sidesteps parallel-array
+# raggedness - we read fields from one brace-balanced object, never by index).
+# Char-by-char scan with string/escape awareness so same-line braces and quoted
+# braces don't fool the depth counter; the game rows live at brace depth 1 of the
+# "games": [ ... ] slice (the preamble's _skipped objects are excluded so a stray
+# "name":"python" there can't be matched).
+GSLICE="$(awk '/"games"[[:space:]]*:/{f=1} f' "${CATALOG}")"
+OBJ="$(awk -v want="${APP}" '
+BEGIN{ depth=0; instr=0; esc=0; buf=""; capturing=0 }
+{
+  line=$0; n=length(line)
+  for(i=1;i<=n;i++){
+    c=substr(line,i,1)
+    if(capturing) buf=buf c
+    if(instr){
+      if(esc){esc=0}
+      else if(c=="\\"){esc=1}
+      else if(c=="\""){instr=0}
+      continue
+    }
+    if(c=="\""){instr=1; continue}
+    if(c=="{"){
+      depth++
+      if(depth==1 && !capturing){ capturing=1; buf="{" }
+    } else if(c=="}"){
+      if(depth==1 && capturing){
+        if(buf ~ ("\"name\"[ \t]*:[ \t]*\"" want "\"")){ print buf; exit }
+        capturing=0; buf=""
+      }
+      depth--
+    }
+  }
+  if(capturing) buf=buf "\n"
+}
+' <<<"${GSLICE}")"
+
+if [ -z "${OBJ}" ]; then
+    say "PARTYOS-LAUNCH ERROR unknown app '${APP}'"
+    zerr "Unknown app: ${APP}"; exit 2
+fi
+
+# pull a "key":"value" string field from the single object
+field() { printf '%s' "${OBJ}" | grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed -E "s/.*:[[:space:]]*\"([^\"]*)\".*/\1/"; }
+# numeric field (e.g. "size": 12345 - no quotes; used for the download progress %)
+field_num() { printf '%s' "${OBJ}" | grep -oE "\"$1\"[[:space:]]*:[[:space:]]*[0-9]+" | head -1 | grep -oE "[0-9]+$"; }
+
+SRC="$(field source)"; [ -n "${SRC}" ] || SRC="blob"
+NAME="$(field name)";  [ -n "${NAME}" ] || NAME="${APP}"
+TITLE="$(field title)"; [ -n "${TITLE}" ] || TITLE="${NAME}"
+say "PARTYOS-LAUNCH app=${NAME} src=${SRC}"
+
+# INSTANT feedback: the moment the shortcut is pressed (we now know the title) put up
+# the launch dialog with "Starting <TITLE>...", before any seed_config / availability
+# HEAD / download. Every stage below updates THIS one dialog; it's closed right before
+# the app execs (or by the EXIT trap on any error). For an already-cached game this
+# flashes "Starting -> Launching" so a click always gives feedback, however brief.
+prog_open "Starting ${TITLE}..."
+prog 2 "Starting ${TITLE}..."
+
+# One launch log per launch: start it empty here. The config seed and the
+# install both append to it.
+LAUNCH_LOG="/tmp/partyos-launch-${NAME}.log"
+: > "${LAUNCH_LOG}" 2>/dev/null || true
+
+# --- config seeding (first-run-only) ------------------------------------------
+# If the catalog row carries config_dir/config_template/config_out, render the
+# server template into ~/.config once (the shared partyos-seed-config owns the
+# never-clobber gate + the @KEY@ substitution from sanitized /run values). The
+# template path is relative to the server root (e.g. config/hexchat/...). Mumble
+# additionally needs its MUMBLE_SERVER host:port split into separate keys.
+seed_config() {
+    local cdir ctmpl cout extras=()
+    cdir="$(field config_dir)"; ctmpl="$(field config_template)"; cout="$(field config_out)"
+    [ -n "${cdir}" ] && [ -n "${ctmpl}" ] && [ -n "${cout}" ] || return 0
+    # HexChat (NYET Messenger) owns its own seeding via partyos-messenger-config,
+    # which does the host:port -> host/port S= normalization the generic seeder
+    # can't. Skip it here so the messenger wrapper renders the servlist correctly.
+    [ "${cdir}" = "hexchat" ] && return 0
+    # Mumble: derive MUMBLE_SERVER_HOST/_PORT from the sanitized /run value.
+    if [ -r /run/partyos-user.conf ]; then
+        local ms; ms="$(grep -E '^MUMBLE_SERVER=' /run/partyos-user.conf 2>/dev/null | tail -1 | cut -d= -f2-)"
+        if [ -n "${ms}" ]; then
+            local mh="${ms%:*}" mp="${ms##*:}"; [ "${mp}" = "${mh}" ] && mp=64738
+            extras+=("MUMBLE_SERVER_HOST=${mh}" "MUMBLE_SERVER_PORT=${mp}")
+        fi
+    fi
+    # config_template/config_out can be space-separated lists (one template per out
+    # file). Every template path gets the server prefix.
+    local t turls=""
+    for t in ${ctmpl}; do turls="${turls:+${turls} }${SERVER_BASE}/server/${t}"; done
+    # A failed seed does not stop the launch, but it must be visible: put the seeder
+    # output and a SEED-FAILED line in the launch log and on the serial console.
+    local sout src
+    sout="$(partyos-seed-config "${cdir}" "${turls}" "${cout}" "${extras[@]}" 2>&1)"; src=$?
+    [ -n "${sout}" ] && printf '%s\n' "${sout}" >> "${LAUNCH_LOG}" 2>/dev/null
+    if [ "${src}" -ne 0 ]; then
+        say "PARTYOS-LAUNCH SEED-FAILED app=${NAME} rc=${src} template=${turls}"
+        echo "PARTYOS-LAUNCH SEED-FAILED app=${NAME} rc=${src} template=${turls}" >> "${LAUNCH_LOG}" 2>/dev/null
+    fi
+    return 0
+}
+
+case "${SRC}" in
+  pkg)
+    PKG="$(field pkg)"; PKGS_EXTRA="$(field pkgs)"; EXEC="$(field exec)"
+    # build the install list: primary pkg + any space-separated extras
+    INSTALL=()
+    [ -n "${PKG}" ] && INSTALL+=("${PKG}")
+    if [ -n "${PKGS_EXTRA}" ]; then for p in ${PKGS_EXTRA}; do INSTALL+=("${p}"); done; fi
+    if [ "${#INSTALL[@]}" -gt 0 ]; then
+        # Install only if a target PACKAGE is missing. NB: check the package(s),
+        # NOT EXEC - EXEC is often a baked wrapper (e.g. partyos-browser) that is
+        # ALWAYS present, so testing it would skip the install and the wrapper would
+        # then fail "command not found" on the real binary it execs.
+        need=0
+        for _p in "${INSTALL[@]}"; do pacman -Qq "${_p}" >/dev/null 2>&1 || { need=1; break; }; done
+        if [ "${need}" -eq 1 ]; then
+            # Feed the ONE launch dialog (already showing "Starting"): park the bar and
+            # show "Downloading from the LAN" while pacman installs (no easy per-pkg %).
+            prog 10 "Downloading ${TITLE} from the LAN..."
+            partyos-pkg-install "${INSTALL[@]}" >>"${LAUNCH_LOG}" 2>&1 &
+            INST=$!
+            while kill -0 "${INST}" 2>/dev/null; do prog "Downloading ${TITLE} from the LAN..."; sleep 1; done
+            wait "${INST}"; rc=$?
+            if [ "${rc}" -ne 0 ]; then
+                say "PARTYOS-LAUNCH ERROR install ${NAME} failed (rc=${rc})"
+                prog_close
+                zerr "Couldn't install ${TITLE} from the LAN mirror.\nIs the server reachable?"
+                exit 1
+            fi
+        fi
+    fi
+    # seed the app's config once (first-run-only) before launching
+    prog 95 "Launching ${TITLE}..."
+    seed_config
+    # exec the app: a wrapper path (/usr/local/bin/...) or a bare binary name. exec
+    # replaces this process (clearing the EXIT trap) so the dialog is torn down here
+    # first - the game window then takes over.
+    if [ -n "${EXEC}" ]; then
+        say "PARTYOS-LAUNCH-EXEC app=${NAME} exec=${EXEC}"
+        prog_close
+        exec ${EXEC} "$@"
+    fi
+    say "PARTYOS-LAUNCH ERROR ${NAME} has no exec"; prog_close; zerr "${TITLE} has no launch command."; exit 1
+    ;;
+
+  blob)
+    BLOB="$(field blob)"
+    # Graceful degrade: if the blob isn't served yet (its build is pending),
+    # don't crash - tell the player it's coming and exit 0. If it's already
+    # mounted/cached, partyos-app handles the HIT, so only gate when not installed.
+    # The "Starting" dialog is ALREADY up, so the 15s availability HEAD below is not
+    # dead air any more - relabel it "Checking availability" so the player sees why.
+    if ! partyos-app installed 2>/dev/null | grep -qxF "${NAME}"; then
+        prog 5 "Checking availability..."
+        # Mirror blob_fetch: pin the partyOS CA on https bases ($(cacert_args)) and probe
+        # EVERY base in the failover list, not just BLOB_BASES[0]. The old HEAD passed no
+        # --cacert and tried only the first base, so on the real (arm64-built) image -
+        # where update-ca-trust of the private CA is skipped under emulation - the TLS
+        # verify failed and marked EVERY uncached game "isn't available yet" even though
+        # the actual download path (which DOES pass the CA + iterates bases) works; it
+        # also defeated blob-server failover.
+        avail=0
+        if [ -n "${BLOB}" ]; then
+            for base in "${BLOB_BASES[@]}"; do
+                [ -n "${base}" ] || continue
+                if curl -fsI $(cacert_args "${base}") --max-time 15 "${base}/${BLOB}" >/dev/null 2>&1; then
+                    avail=1; break
+                fi
+            done
+        fi
+        if [ "${avail}" -eq 0 ]; then
+            say "PARTYOS-LAUNCH-UNAVAILABLE app=${NAME} (blob not served yet)"
+            prog_close
+            zinfo "${TITLE} isn't on the server."
+            exit 0
+        fi
+    fi
+    # seed in-game config (NICK -> player name) once before launching
+    seed_config
+    # If the blob isn't local yet, DOWNLOAD it - the SAME launch dialog now walks the
+    # download % live (replacing the old separate per-download dialog). Cached blobs
+    # skip this whole block and fall straight through to "Launching" below, so a cached
+    # click still flashes Starting -> Launching from the dialog already on screen.
+    if ! partyos-app installed 2>/dev/null | grep -qxF "${NAME}"; then
+        say "PARTYOS-LAUNCH-BLOB app=${NAME} install (download+mount)"
+        # Real progress: get_blob downloads (aria2) straight to
+        # ${cache}/<name>.squashfs, so monitor THAT file's size against the catalog 'size'.
+        # Unknown size -> just show "Downloading from the LAN" (bar parked).
+        BSIZE="$(field_num size)"; case "${BSIZE}" in ''|*[!0-9]*) BSIZE=0;; esac
+        # Predict where ROOT (the actual downloader) will write so the progress bar
+        # watches the right file. partyos-app runs as root and its cache_dir() picks the
+        # USB stick whenever /mnt/usbhome is a writable mountpoint - which it always is
+        # for root when home is mounted rw. We (gamer) must mirror that choice by the
+        # MOUNTPOINT, NOT by a gamer -w test on the root-owned subdir (gamer fails it and
+        # would watch /var/cache forever while root downloads to the stick -> dead bar).
+        CDIR=/var/cache/partyos/games
+        mountpoint -q /mnt/usbhome 2>/dev/null && CDIR=/mnt/usbhome/.partyos-cache/games
+        DLF="${CDIR}/${NAME}.squashfs"
+        prog 5 "Downloading ${TITLE} from the LAN..."
+        partyos-app install "${NAME}" >>"${LAUNCH_LOG}" 2>&1 &
+        INST=$!
+        # Drive the live dialog from THIS loop (not a piped subshell): we update the
+        # ONE dialog via prog. Cancel detection: the dialog has a Cancel button, so if
+        # zenity (PROG_PID) dies while the installer still runs, the player cancelled.
+        cancelled=0
+        while kill -0 "${INST}" 2>/dev/null; do
+            if [ -n "${PROG_PID}" ] && ! kill -0 "${PROG_PID}" 2>/dev/null; then
+                cancelled=1; break
+            fi
+            if [ "${BSIZE}" -gt 0 ] && [ -f "${DLF}" ]; then
+              # actual downloaded bytes = allocated 512-byte blocks. Tracks out-of-order
+              # peer pieces (aria2 --file-allocation=none does not preallocate, so this
+              # rises 0 -> full).
+              cur=$(( $(stat -c %b "${DLF}" 2>/dev/null || echo 0) * 512 ))
+              # Once the bytes are all here (or within ~1%), the installer is still alive
+              # but it's now sha-verifying + squashfs-mounting a multi-GB blob - which can
+              # take a while. Park the bar at 99 but relabel so it's obviously working,
+              # not hung at "Downloading 99%".
+              if [ "${cur}" -ge "${BSIZE}" ] || [ "$(( cur * 100 / BSIZE ))" -ge 99 ]; then
+                prog 99 "Verifying and mounting ${TITLE}..."
+              else
+                pct=$(( cur * 100 / BSIZE ))
+                prog "${pct}" "Downloading ${TITLE}  (${pct}%)"
+              fi
+            else
+              prog "Downloading ${TITLE} from the LAN..."
+            fi
+            sleep 0.5
+        done
+        if [ "${cancelled}" != 0 ]; then
+            # Cancel pressed -> stop the download + drop the partial blob. The download
+            # runs as ROOT (partyos-app install self-elevates), so kill it + the aria2/
+            # curl child via sudo, then remove the partial blob + its aria2 control file.
+            say "PARTYOS-LAUNCH-CANCELLED app=${NAME}"
+            prog_close
+            # Cancel can land in the sub-second window AFTER the blob already mounted
+            # (the installer finished while the player's click was in flight). If it's
+            # installed NOW, the blob is a LIVE loop mount - the rm below would unlink the
+            # very file the mount reads (mounted-but-deleted: works this session, gone next
+            # boot, RAM pinned, never launched). So re-check: already installed -> honour it
+            # and launch instead of destroying it. The download/RAM are already spent.
+            if partyos-app installed 2>/dev/null | grep -qxF "${NAME}"; then
+                say "PARTYOS-LAUNCH-CANCEL-LATE app=${NAME} (already installed; launching instead of deleting)"
+                partyos-app launch "${NAME}" 2>/dev/null || true
+                exit 0
+            fi
+            kill "${INST}" 2>/dev/null || true
+            sudo -n pkill -TERM -f "partyos-app install ${NAME}\b" 2>/dev/null || true
+            # Anchor NAME to a path boundary ([ /]) so a short name (e.g. "ra") can't
+            # substring-match a longer blob's download (".../openra.squashfs") and kill
+            # the wrong client's aria2/curl. The download writes ${CDIR}/${NAME}.squashfs,
+            # so the char before NAME in the cmdline is always '/'.
+            sudo -n pkill -TERM -f "(aria2c|curl).*[ /]${NAME}\.squashfs" 2>/dev/null || true
+            # The catalog download runs in the one client aria2c: take it out over RPC,
+            # else it goes on in the background after the cancel.
+            sudo -n /usr/local/bin/partyos-aria2rpc remove "${NAME}" "$(dirname "${DLF}")" >/dev/null 2>&1 || true
+            sudo -n rm -f "${DLF}" "${DLF}.aria2" 2>/dev/null || true
+            exit 0
+        fi
+        wait "${INST}"; rc=$?
+        if [ "${rc}" -eq 3 ]; then
+            # RAM refusal (partyos-app cmd_install returns 3). Show the HONEST free-vs-needed
+            # numbers the RAM gate logged, not the misleading "couldn't download". The gate
+            # already picked the honest overlay projection (working set + headroom).
+            say "PARTYOS-LAUNCH RAM-REFUSED ${NAME}"
+            prog_close
+            _rl="$(grep -F 'PARTYOS-APP-RAM-REFUSED' "${LAUNCH_LOG}" 2>/dev/null | tail -1)"
+            _rq="$(printf '%s' "${_rl}" | grep -oE 'required=[0-9]+' | cut -d= -f2)"
+            _fr="$(printf '%s' "${_rl}" | grep -oE 'free=[0-9]+' | cut -d= -f2)"
+            case "${_rq}" in ''|*[!0-9]*) _rq=0;; esac
+            case "${_fr}" in ''|*[!0-9]*) _fr=0;; esac
+            _rg="$(awk "BEGIN{printf \"%.1f\", ${_rq}/1024}")"
+            _fg="$(awk "BEGIN{printf \"%.1f\", ${_fr}/1024}")"
+            zerr "Not enough RAM to launch ${TITLE}.\n\nNeeds ~${_rg} GB, only ~${_fg} GB free.\nClose other games or apps and try again."
+            exit 1
+        elif [ "${rc}" -eq 4 ]; then
+            # Blob mounted-but-corrupt (sha passed, fs damage). cmd_install already dropped the
+            # bad cache; tell the player the copy was corrupt (a retry re-downloads fresh).
+            say "PARTYOS-LAUNCH MOUNT-FAILED ${NAME}"
+            prog_close
+            zerr "${TITLE} couldn't be opened - the downloaded copy looks corrupt.\n\nIt was cleared; please try launching it again."
+            exit 1
+        elif [ "${rc}" -ne 0 ]; then
+            say "PARTYOS-LAUNCH ERROR ${NAME} install failed (rc=${rc})"
+            prog_close
+            zerr "Couldn't download ${TITLE}.\nIs the server reachable?"
+            exit 1
+        fi
+    fi
+    say "PARTYOS-LAUNCH-BLOB app=${NAME} launch"
+    prog 100 "Launching ${TITLE}..."
+    if ! partyos-app launch "${NAME}"; then
+        say "PARTYOS-LAUNCH ERROR ${NAME} launch failed"
+        prog_close
+        zerr "Couldn't start ${TITLE}.\nThe launch failed."
+        exit 1
+    fi
+    prog_close
+    exit 0
+    ;;
+
+  *)
+    say "PARTYOS-LAUNCH ERROR ${NAME} unknown source '${SRC}'"
+    prog_close
+    zerr "${TITLE} has an unknown delivery type."; exit 1
+    ;;
+esac

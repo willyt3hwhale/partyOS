@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+build() {
+    add_runscript
+}
+help() {
+    cat <<HELPEOF
+  partyOS: add the DHCP classless static routes (option 121) from the iPXE lease.
+HELPEOF
+}

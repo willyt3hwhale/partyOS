@@ -1,0 +1,10 @@
+[Unit]
+Description=partyOS - cache the LAN portal/homepage locally
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/partyos-portal-fetch
+[Install]
+WantedBy=multi-user.target

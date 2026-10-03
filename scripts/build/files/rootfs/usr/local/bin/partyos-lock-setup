@@ -1,0 +1,125 @@
+#!/bin/bash
+set -u
+RC="${HOME}/.xscreensaver"
+# Classic Win95 vibe: exactly 3 GL hacks - 3D pipes, the gltext banner, and maze3d
+# (the Win95 "3D Maze" recreation). mesa/llvmpipe covers the no-accel efifb path.
+{
+  # timeout 0 disables the idle timer of xscreensaver. The only idle timer is
+  # `xset s 600` (set below), which xss-lock watches.
+  printf 'timeout:\t0\n'
+  printf 'cycle:\t\t0:03:00\n'
+  printf 'splash:\t\tFalse\n'
+  printf 'lock:\t\tFalse\n'
+  printf 'lockTimeout:\t0:00:00\n'
+  printf 'dpmsEnabled:\tTrue\n'
+  printf 'dpmsStandby:\t0:12:00\n'
+  printf 'dpmsSuspend:\t0:12:00\n'
+  printf 'dpmsOff:\t0:15:00\n'
+  # NO-INTERNET OS: never let an image hack grab the web / desktop / random images.
+  printf 'grabDesktopImages:\tFalse\n'
+  printf 'grabRootImages:\t\tFalse\n'
+  printf 'chooseRandomImages:\tFalse\n'
+  printf 'mode:\t\trandom\n'
+  printf 'selected:\t-1\n'
+  printf 'programs:\t\\\n'
+  printf '\tpipes -root \\n\\\n'
+  printf '\tgltext -text partyOS -root \\n\\\n'
+  printf '\tmaze3d -root\n'
+} > "${RC}" 2>/dev/null || true
+# Route the XFCE lock through partyos-lock and bind Super+L. The xfconf settings below are
+# per-user; overwriting the /etc/xdg defaults breaks the session.
+xfconf-query -c xfce4-session -p /general/LockCommand -n -t string -s /usr/local/bin/partyos-lock 2>/dev/null \
+  || xfconf-query -c xfce4-session -p /general/LockCommand -s /usr/local/bin/partyos-lock 2>/dev/null || true
+xfconf-query -c xfce4-keyboard-shortcuts -p '/commands/custom/<Super>l' -s xflock4 2>/dev/null || true
+# Turn off xfce4-notifyd "do not disturb", so operator broadcasts show in a fullscreen game.
+xfconf-query -c xfce4-notifyd -p /do-not-disturb -n -t bool -s false 2>/dev/null \
+  || xfconf-query -c xfce4-notifyd -p /do-not-disturb -s false 2>/dev/null || true
+# Add the volume (pulseaudio) panel plugin. A persisted home can carry an older
+# xfce4-panel.xml without it.
+# idempotency: no-op if any plugin already has value "pulseaudio".
+have_vol=no
+for p in $(xfconf-query -c xfce4-panel -p /plugins -l 2>/dev/null | sed -n 's#^\(/plugins/plugin-[0-9]\+\)$#\1#p'); do
+  [ "$(xfconf-query -c xfce4-panel -p "$p" 2>/dev/null)" = pulseaudio ] && { have_vol=yes; break; }
+done
+if [ "$have_vol" = no ]; then
+  # pick an unused plugin id N = max(existing /plugins/plugin-N) + 1 (>=1).
+  maxid=0
+  for p in $(xfconf-query -c xfce4-panel -p /plugins -l 2>/dev/null | sed -n 's#^/plugins/plugin-\([0-9]\+\)$#\1#p'); do
+    [ "$p" -gt "$maxid" ] && maxid="$p"
+  done
+  N=$((maxid + 1))
+  # create the plugin + its props.
+  xfconf-query -c xfce4-panel -p "/plugins/plugin-${N}" -n -t string -s pulseaudio 2>/dev/null || true
+  xfconf-query -c xfce4-panel -p "/plugins/plugin-${N}/enable-keyboard-shortcuts" -n -t bool -s true 2>/dev/null || true
+  xfconf-query -c xfce4-panel -p "/plugins/plugin-${N}/show-notifications" -n -t bool -s true 2>/dev/null || true
+  xfconf-query -c xfce4-panel -p "/plugins/plugin-${N}/mixer-command" -n -t string -s pavucontrol 2>/dev/null || true
+  # find the panel that hosts the systray/clock (so the volume icon lands by them); fall
+  # back to panel-1. Then append N to that panel's plugin-ids int array and write it back.
+  TARGET=panel-1
+  for pn in $(xfconf-query -c xfce4-panel -p /panels -l 2>/dev/null | sed -n 's#^/panels/\(panel-[0-9]\+\)/plugin-ids$#\1#p'); do
+    ids="$(xfconf-query -c xfce4-panel -p "/panels/${pn}/plugin-ids" 2>/dev/null | grep -E '^[0-9]+$')"
+    for id in $ids; do
+      kind="$(xfconf-query -c xfce4-panel -p "/plugins/plugin-${id}" 2>/dev/null)"
+      if [ "$kind" = systray ] || [ "$kind" = clock ]; then TARGET="$pn"; break; fi
+    done
+    [ "$TARGET" = "$pn" ] && break
+  done
+  # rebuild the int array = existing ids + N. xfconf needs one -t int -s per element, plus
+  # --force-array so a (possibly single-element) result is still written as an array.
+  set -- --force-array
+  for id in $(xfconf-query -c xfce4-panel -p "/panels/${TARGET}/plugin-ids" 2>/dev/null | grep -E '^[0-9]+$'); do
+    set -- "$@" -t int -s "$id"
+  done
+  set -- "$@" -t int -s "${N}"
+  xfconf-query -c xfce4-panel -p "/panels/${TARGET}/plugin-ids" "$@" 2>/dev/null || true
+  # reload the panel so the new plugin shows immediately - but ONLY if the panel's dbus
+  # name is already owned on the session bus. A blind `xfce4-panel -r` at autostart races
+  # session-bus name registration and dbus-ACTIVATES org.xfce.Panel, popping the "Failed
+  # to restart the panel ... GDBus...ServiceUnknown: The name ... not activatable" GTK
+  # dialog (which the >/dev/null does NOT suppress - it is a window, not stderr). Guarding
+  # on NameHasOwner never triggers activation, so no dialog can ever appear.
+  if command -v gdbus >/dev/null 2>&1 && gdbus call --session \
+        --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner org.xfce.Panel 2>/dev/null \
+        | grep -q true; then
+    xfce4-panel -r >/dev/null 2>&1 || true
+  fi
+fi
+# start the saver daemon, or RELOAD it if already running. Best-effort; harmless no-op
+# on the headless Xvfb path. (lock:False + timeout:0 always - this is the saver, not the
+# locker, and it no longer self-triggers on idle: xss-lock drives it.)
+if pgrep -u "$(id -u)" -x xscreensaver >/dev/null 2>&1; then
+  xscreensaver-command -restart >/dev/null 2>&1 &
+else
+  xscreensaver -no-splash >/dev/null 2>&1 &
+fi
+# One authoritative idle timer. xscreensaver disables the X-server screensaver timer
+# (`xset s off`) on startup, so we RE-ARM it here to a single fixed 10-minute timeout that
+# xss-lock keys off. `noblank` = the X server only emits the idle event (xss-lock catches
+# it), it does not itself blank the screen. This is now the SOLE idle schedule that decides
+# the lock - xscreensaver's own timer is 0 (off), so there is no second, competing daemon.
+# Result: a single deterministic lock timeout of 600s (10 minutes). Best-effort on headless.
+xset s 600 600 >/dev/null 2>&1 || true
+xset s noblank >/dev/null 2>&1 || true
+# Power-save, always. A user with no password never gets a lock, but the screen still
+# blanks and DPMS-sleeps, so a passwordless kiosk never stays on. xscreensaver
+# runs with timeout:0 (it is the saver, not an idle daemon) so it does NOT drive an idle
+# blank; arm DPMS directly at the X-server level here for EVERY session, passworded or not.
+# Only the LOCK below is gated on a password. standby/suspend 12m, off 15m - mirrors the
+# ~/.xscreensaver dpms* intent so blank/DPMS is identical whether or not a lock is armed.
+xset +dpms >/dev/null 2>&1 || true
+xset dpms 720 720 900 >/dev/null 2>&1 || true
+# IDLE auto-lock via xss-lock, gated on the password file. xss-lock watches the SINGLE X
+# screensaver idle timer armed above and, at the 10-minute mark, runs our locker. A
+# passwordless user never gets a lock (there is no password to
+# unlock with - locking would strand them), so we do NOT start xss-lock there; the screen
+# still blanks/DPMS-sleeps via the arm above, it just never locks. Only a passworded rig
+# arms xss-lock. Single instance.
+if [ -s /mnt/usbhome/.partyos-passwd ]; then
+  pgrep -u "$(id -u)" -x xss-lock >/dev/null 2>&1 \
+    || { xss-lock -- /usr/local/bin/partyos-lock >/dev/null 2>&1 & }
+else
+  # password was cleared mid-session -> make sure no stale xss-lock keeps auto-locking.
+  pkill -u "$(id -u)" -x xss-lock >/dev/null 2>&1 || true
+fi
+exit 0

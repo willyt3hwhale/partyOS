@@ -1,0 +1,40 @@
+#!ipxe
+# partyOS Step 8 boot script (TEMPLATE) - game blob caching.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1-7 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-7 (server/images/custom/, which has
+# the 'gamer' user + curl), with the SAME kernel/initramfs Step 2 RAM-boots. The
+# only difference from Step 7 is the fetched automated-script: step8-script.sh,
+# which mounts the LANPARTY_HOME USB stick rw, uses it as a persistent blob CACHE
+# (check cache before download, write downloads to cache, size-limit LRU cleanup),
+# and mounts each game's squashfs from the CACHED copy. cache_boot= labels the
+# cold (first) vs warm (second) boot for the harness; the script logic is the same.
+
+echo ================================================
+echo partyOS Step 8 - Game Blob Caching
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=8&status=boot&ip=${ip} r8 || echo callback-skipped
+imgfree r8 || echo continuing
+
+echo Loading custom desktop image into RAM (Step 8 game blob caching)...
+# archiso_http_srv -> the custom image dir (arch/x86_64/airootfs.sfs); copytoram
+# pulls the whole sfs into RAM. console=ttyS0 mirrors to the serial line the
+# harness scrapes. no_timer_check: QEMU q35+TCG timer-routing quirk. report_url=
+# is read by step8-script.sh for catalog fetch + HTTP callback (no hardcoded IP).
+# cache_boot= tells the script (and the markers/callback) whether this is the
+# first (cold-cache) or second (warm-cache) boot.
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step8-script.sh report_url={{SERVER_URL}} cache_boot={{CACHE_BOOT}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (game blob caching)...
+boot || goto failed
+
+:failed
+echo partyOS Step 8 boot failed

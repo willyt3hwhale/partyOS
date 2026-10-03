@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# partyos-gpu-env - print the GPU environment for a game launch, one KEY=VALUE per line.
+#
+# partyos-app and partyos-proton-env pass these lines to the blob run.sh. The run.sh
+# bwrap does not use --clearenv, so the values reach the game.
+#
+# A hybrid laptop has an Intel or AMD iGPU that drives the X screen, and an nvidia GPU.
+# X loads the nvidia GPU only as a GPU screen (provider "NVIDIA-G0"). A blob run.sh
+# selects the nvidia GLX vendor when /dev/nvidia0 exists. Without PRIME render offload
+# the NV-GLX request then fails with BadValue, and the game exits at start.
+#
+# Output:
+#   1. If X has an NVIDIA-G* provider and /dev/nvidia0 exists, print
+#      __NV_PRIME_RENDER_OFFLOAD=1 and __VK_LAYER_NV_optimus=NVIDIA_only.
+#   2. If the nvidia GPU is not usable for offload, print DRI_PRIME for the display
+#      iGPU. Mesa otherwise can open the nvidia render node and fall back to llvmpipe.
+#   3. On a box with one GPU, or if X gives no answer, print nothing.
+#
+# Set DISPLAY and XAUTHORITY before the call. PARTYOS_GPU_DRM and PARTYOS_GPU_NVDEV
+# change the probed paths for the tests.
+set -u
+DRM="${PARTYOS_GPU_DRM:-/sys/class/drm}"
+NVDEV="${PARTYOS_GPU_NVDEV:-/dev/nvidia0}"
+
+igpu=""; nvnode=0
+for r in "${DRM}"/renderD*; do
+    [ -e "${r}/device" ] || continue
+    drv="$(basename "$(readlink -f "${r}/device/driver" 2>/dev/null)" 2>/dev/null)"
+    case "${drv}" in
+        i915|xe|amdgpu|radeon)
+            [ -n "${igpu}" ] || igpu="$(basename "$(readlink -f "${r}/device")")" ;;
+        nvidia) nvnode=1 ;;
+    esac
+done
+# No iGPU: this is not a hybrid box.
+[ -n "${igpu}" ] || exit 0
+
+providers="$(timeout 5 xrandr --listproviders 2>/dev/null)" || providers=""
+[ -n "${providers}" ] || exit 0
+# The first provider drives the X screen. If it is nvidia, the old path is correct.
+case "$(printf '%s\n' "${providers}" | awk '/^Provider 0:/{sub(/.*name:/, ""); print; exit}')" in
+    NVIDIA*) exit 0 ;;
+esac
+case "${providers}" in
+    *name:NVIDIA-G*)
+        if [ -e "${NVDEV}" ]; then
+            echo "__NV_PRIME_RENDER_OFFLOAD=1"
+            echo "__VK_LAYER_NV_optimus=NVIDIA_only"
+            exit 0
+        fi ;;
+esac
+if [ "${nvnode}" = 1 ]; then
+    echo "DRI_PRIME=pci-$(printf '%s' "${igpu}" | tr ':.' '__')"
+fi
+exit 0

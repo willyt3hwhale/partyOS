@@ -1,0 +1,8 @@
+# Seed skeleton for this player's home.
+#
+# Anything under users/<name>/home/ is rsync'd into the stick's LANPARTY_HOME home/
+# subdir at flash time (which backs the RAM /home/<user>). Drop dotfiles, saved
+# configs, wallpapers, etc. here to pre-seed a player's desktop. Empty is fine - the
+# image's first-boot seed guard then populates a fresh home from the baked skeleton.
+#
+# This .keep exists only so the (otherwise empty) example home/ is tracked in git.

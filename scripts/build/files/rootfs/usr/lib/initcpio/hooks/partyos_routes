@@ -1,0 +1,79 @@
+#!/usr/bin/ash
+# partyOS: add the DHCP classless static routes (option 121) of the iPXE lease.
+# The static ip= handoff carries only one gateway (option 3). iPXE passes the raw
+# option 121 as partyos_routes= in the iPXE hex format (for example
+# 18:0a:0d:24:0a:0d:25:65). RFC 3442 says: if option 121 is present, ignore option 3.
+# This hook runs after archiso_pxe_common, because a router is only reachable after
+# ipconfig has set the address. An empty or bad value never stops the boot.
+
+# partyos_decode_routes HEX - write one "DEST/WIDTH ROUTER" line for each route.
+# Return 1 and write nothing if the value is malformed.
+partyos_decode_routes() {
+    local _in _b _n _out _w _sig _i _d _r _oifs
+    _in="$1"
+    [ -n "${_in}" ] || return 0
+    case "${_in}" in *[!0-9a-fA-F:]*) return 1;; esac
+    _oifs="${IFS}"; IFS=:
+    # shellcheck disable=SC2086
+    set -- ${_in}
+    IFS="${_oifs}"
+    for _b in "$@"; do
+        case "${_b}" in ''|???*) return 1;; esac
+    done
+    _out=""
+    while [ "$#" -gt 0 ]; do
+        _w=$((0x$1)); shift
+        [ "${_w}" -le 32 ] || return 1
+        _sig=$(( (_w + 7) / 8 ))
+        [ "$#" -ge $((_sig + 4)) ] || return 1
+        _d=""; _i=0
+        while [ "${_i}" -lt 4 ]; do
+            if [ "${_i}" -lt "${_sig}" ]; then _n=$((0x$1)); shift; else _n=0; fi
+            _d="${_d}${_d:+.}${_n}"
+            _i=$((_i + 1))
+        done
+        _r="$((0x$1)).$((0x$2)).$((0x$3)).$((0x$4))"; shift 4
+        _out="${_out}${_d}/${_w} ${_r}
+"
+    done
+    printf '%s' "${_out}"
+}
+
+run_hook() {
+    local _routes _line _dst _gw
+    [ -n "${ip:-}" ] || return 0
+    [ -n "${partyos_routes:-}" ] || return 0
+    if ! _routes="$(partyos_decode_routes "${partyos_routes}")" || [ -z "${_routes}" ]; then
+        msg ":: partyOS: WARN bad partyos_routes=${partyos_routes} - no routes added"
+        return 0
+    fi
+    # RFC 3442: option 121 replaces option 3, so drop the default route from ip=.
+    ip route del default 2>/dev/null
+    printf '%s\n' "${_routes}" | while read -r _dst _gw; do
+        [ -n "${_dst}" ] || continue
+        [ "${_dst}" = "0.0.0.0/0" ] && _dst=default
+        if [ "${_gw}" = "0.0.0.0" ]; then
+            ip route replace "${_dst}" dev "$(partyos_route_dev)" 2>/dev/null
+        else
+            ip route replace "${_dst}" via "${_gw}" 2>/dev/null
+        fi
+        if [ "$?" -eq 0 ]; then
+            msg ":: partyOS: route ${_dst} via ${_gw} (DHCP option 121)"
+        else
+            msg ":: partyOS: WARN could not add route ${_dst} via ${_gw}"
+        fi
+    done
+    return 0
+}
+
+# partyos_route_dev - the interface that holds the default ip= address.
+# archiso_pxe_common sets bootif_dev (global) from BOOTIF=. The ip= of the cmdline then
+# has no device field.
+partyos_route_dev() {
+    local _dev
+    _dev="${bootif_dev:-}"
+    [ -n "${_dev}" ] || _dev="$(echo "${ip}" | cut -d: -f6)"
+    [ -n "${_dev}" ] || _dev=eth0
+    echo "${_dev}"
+}
+# vim: set ft=sh:

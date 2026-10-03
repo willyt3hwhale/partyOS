@@ -1,0 +1,36 @@
+#!ipxe
+# partyOS Step 4 boot script (TEMPLATE) - USB home directory reading.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1/2/3 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Step 3 (server/images/custom/, which has
+# the 'gamer' user), with the SAME kernel/initramfs Step 2 RAM-boots. The only
+# difference from Step 3 is the fetched automated-script: step4-script.sh, which
+# installs+starts the systemd service that mounts the LANPARTY_HOME USB stick
+# and copies its contents into /home/gamer.
+
+echo ================================================
+echo partyOS Step 4 - USB Home Directory Reading
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=4&status=boot&ip=${ip} r4 || echo callback-skipped
+imgfree r4 || echo continuing
+
+echo Loading custom desktop image into RAM (Step 4 USB-home)...
+# archiso_http_srv -> the custom image dir (arch/x86_64/airootfs.sfs); copytoram
+# pulls the whole sfs into RAM. console=ttyS0 mirrors to the serial line the
+# harness scrapes. no_timer_check: QEMU q35+TCG timer-routing quirk. report_url=
+# is read by step4-script.sh for its HTTP callback (no hardcoded IP).
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step4-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (USB home read)...
+boot || goto failed
+
+:failed
+echo partyOS Step 4 boot failed

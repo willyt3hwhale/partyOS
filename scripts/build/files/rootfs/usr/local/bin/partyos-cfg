@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# partyos-cfg - parse a single KEY out of a partyOS `.partyos` config file.
+#
+# Usage:   partyos-cfg KEY [FILE]            (FILE defaults to /mnt/usbhome/.partyos)
+# Source:  source /usr/local/bin/partyos-cfg ; val="$(partyos_cfg USERNAME "$f")"
+#
+# The file is PARSED, never sourced - a stray/hostile line must never execute as
+# code. Format: plain `KEY=value` lines; '#' comments and blank lines ignored;
+# the LAST occurrence of a key wins; surrounding whitespace is stripped. This is
+# the one place key-reading lives; every key reuses it (USERNAME, HOSTNAME).
+partyos_cfg() {
+    local key="$1" file="${2:-/mnt/usbhome/.partyos}"
+    [ -n "${key}" ] || return 1
+    [ -r "${file}" ] || return 0
+    # grep the matching KEY= lines, take the last, strip the KEY=, trim space.
+    grep -E "^[[:space:]]*${key}=" "${file}" 2>/dev/null \
+        | grep -v '^[[:space:]]*#' \
+        | tail -1 \
+        | cut -d= -f2- \
+        | tr -d '[:space:]'
+}
+# When executed (not sourced), act as a CLI: partyos-cfg KEY [FILE].
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    partyos_cfg "$@"
+fi

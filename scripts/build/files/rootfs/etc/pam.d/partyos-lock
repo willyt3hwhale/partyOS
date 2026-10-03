@@ -1,0 +1,7 @@
+# partyOS Win95 locker - authenticate the resolved desktop user against /etc/shadow via
+# PAM (pam_unix). NO nullok: an empty/passwordless account cannot satisfy this stack, and
+# the locker is only ever launched for a passworded rig anyway (gated in partyos-lock).
+auth     include  system-login
+account  include  system-login
+password include  system-login
+session  include  system-login

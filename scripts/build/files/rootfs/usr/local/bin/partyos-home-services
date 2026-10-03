@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# partyos-home-services - discover + start a participant's own services from
+# their HOME folder, running AS THE USER. Idempotent: a service already running
+# (live pid in .run/<name>.pid) is left alone, so re-running does not double-start.
+#
+# Convention (all under the user's home, so it travels with the USB stick):
+#   ~/.partyos-services/<name>.sh        executable launcher, run as the user
+#   ~/.partyos-services/<name>.service   systemd USER unit (best-effort)
+#   ~/.partyos-services/disabled/...     ignored (opt-out)
+#
+# State (in the home, USB-synced -> survives reboot):
+#   ~/.partyos-services/.run/<name>.pid  pid of the launched service
+#   ~/.partyos-services/.run/<name>.log  its stdout/stderr
+#
+# The target user is the dynamic account resolved by partyos-identity (read from
+# /run/partyos-username, fallback gamer). With NO services declared this is a
+# clean no-op (nothing breaks).
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[home-services] $*" > "${SER}" 2>/dev/null; echo "[home-services] $*"; }
+
+USER_NAME="gamer"
+[ -r /run/partyos-username ] && USER_NAME="$(tr -d '[:space:]' < /run/partyos-username)"
+[ -n "${USER_NAME}" ] || USER_NAME="gamer"
+id "${USER_NAME}" >/dev/null 2>&1 || { log "user ${USER_NAME} missing - nothing to do"; exit 0; }
+
+HOME_DIR="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
+[ -n "${HOME_DIR}" ] || HOME_DIR="/home/${USER_NAME}"
+SVC_DIR="${HOME_DIR}/.partyos-services"
+RUN_DIR="${SVC_DIR}/.run"
+
+if [ ! -d "${SVC_DIR}" ]; then
+    log "no ${SVC_DIR} -> no home services (clean no-op)"
+    echo "PARTYOS-HOMESVC-NONE user=${USER_NAME}" > "${SER}" 2>/dev/null
+    exit 0
+fi
+
+install -d "${RUN_DIR}"
+chown "${USER_NAME}:${USER_NAME}" "${RUN_DIR}" 2>/dev/null || true
+
+# runas: execute a command as the target user with a proper environment + home.
+runas() {
+    runuser -l "${USER_NAME}" -c "$*" 2>/dev/null \
+        || su - "${USER_NAME}" -c "$*" 2>/dev/null
+}
+
+started=0
+declare -a NAMES=()
+
+# --- 1. executable launcher scripts (the reliable headless path) -------------
+shopt -s nullglob
+for f in "${SVC_DIR}"/*.sh; do
+    name="$(basename "${f}" .sh)"
+    [ -f "${SVC_DIR}/disabled/$(basename "${f}")" ] && { log "skip ${name} (disabled)"; continue; }
+    pidf="${RUN_DIR}/${name}.pid"
+    logf="${RUN_DIR}/${name}.log"
+    # Already running? leave it (idempotent).
+    if [ -r "${pidf}" ]; then
+        oldpid="$(cat "${pidf}" 2>/dev/null)"
+        if [ -n "${oldpid}" ] && kill -0 "${oldpid}" 2>/dev/null; then
+            log "service ${name} already running (pid ${oldpid})"
+            NAMES+=("${name}"); started=$((started+1)); continue
+        fi
+    fi
+    chmod +x "${f}" 2>/dev/null || true
+    log "starting home service '${name}' as ${USER_NAME}: ${f}"
+    # Launch as the user, cwd=home, detached, recording pid + log in the home.
+    # nohup + background; the launcher `exec`s the long-running service so the
+    # recorded pid (the bash that execs it) IS the service process, owned by the
+    # user. No setsid (its fork-or-not behaviour makes the pid unreliable).
+    runas "cd '${HOME_DIR}' && nohup bash '${f}' >'${logf}' 2>&1 < /dev/null & echo \$! > '${pidf}'"
+    sleep 1
+    npid="$(cat "${pidf}" 2>/dev/null || true)"
+    if [ -n "${npid}" ] && kill -0 "${npid}" 2>/dev/null; then
+        owner="$(ps -o user= -p "${npid}" 2>/dev/null | tr -d '[:space:]')"
+        log "PARTYOS-HOMESVC-STARTED name=${name} pid=${npid} user=${owner}"
+        NAMES+=("${name}"); started=$((started+1))
+    else
+        # Short-lived oneshot launchers may have already exited 0; that is fine.
+        log "PARTYOS-HOMESVC-RAN name=${name} (launcher exited; see ${logf})"
+        NAMES+=("${name}"); started=$((started+1))
+    fi
+done
+
+# --- 2. systemd user units (best-effort; graphical/logind path) --------------
+# Headless tty1 boots have no user logind session, so `systemctl --user` may not
+# be reachable; this is intentionally best-effort and never fatal.
+for u in "${SVC_DIR}"/*.service; do
+    uname="$(basename "${u}")"
+    [ -f "${SVC_DIR}/disabled/${uname}" ] && continue
+    udir="${HOME_DIR}/.config/systemd/user"
+    install -d "${udir}"; cp -f "${u}" "${udir}/${uname}"
+    chown -R "${USER_NAME}:${USER_NAME}" "${HOME_DIR}/.config" 2>/dev/null || true
+    if runas "XDG_RUNTIME_DIR=/run/user/$(id -u "${USER_NAME}") systemctl --user enable --now '${uname}'"; then
+        log "PARTYOS-HOMESVC-UNIT name=${uname} (systemctl --user enable --now)"
+        NAMES+=("${uname%.service}"); started=$((started+1))
+    else
+        log "home unit ${uname} installed (systemctl --user unavailable headless)"
+    fi
+done
+shopt -u nullglob
+
+log "PARTYOS-HOMESVC-DONE user=${USER_NAME} started=${started} names=${NAMES[*]:-}"
+echo "${started}" > /run/partyos-home-services-count 2>/dev/null || true
+exit 0

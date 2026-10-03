@@ -1,0 +1,20 @@
+#!/bin/bash
+# First-boot guard: the pacman keyring is BAKED at build time and visible at runtime
+# (the empty-tmpfs mount that used to shadow it is masked). Verify-only on the happy
+# path - NO init/populate, NO entropy wait. Repopulate ONLY as a defensive fallback.
+set -u
+log() { echo "PARTYOS-KEYRING $*"; logger -t partyos-keyring "$*" 2>/dev/null || true; }
+have=$(pacman-key --list-keys 2>/dev/null | grep -c '^pub' || echo 0)
+if [ "${have}" -ge 50 ]; then log "baked keyring visible keys=${have} (no init) - sig verify armed"; exit 0; fi
+# Defensive fallback only: the baked trust db is missing/empty at runtime. Re-init +
+# populate so SigLevel=Required is not left without a trust root (costs the entropy wait,
+# but only on this unexpected path - the happy path above never gets here).
+log "WARN baked keyring not visible (keys=${have}); repopulating as fallback"
+rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
+install -d -m700 /etc/pacman.d/gnupg
+if pacman-key --init >/dev/null 2>&1 && pacman-key --populate archlinux >/dev/null 2>&1; then
+  now=$(pacman-key --list-keys 2>/dev/null | grep -c '^pub' || echo 0)
+  if [ "${now}" -ge 1 ]; then log "fallback populated keys=${now} - runtime sig verify armed"; exit 0; fi
+  log "FATAL fallback populate produced ${now} keys"; exit 1
+fi
+log "FATAL fallback pacman-key --init/--populate failed"; exit 1

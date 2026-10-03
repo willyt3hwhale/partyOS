@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# partyos-userconf-setup - parse + sanitize the per-player config into /run/partyos-*.
+#
+# PRIMARY source: `internyet.env` on the shared exFAT partition (a share label,
+# /mnt/share). Mapping:
+#   NICK     <- INTERNYET_ALIAS
+#   FULLNAME <- INTERNYET_ALIAS      (the venue ships no separate real name)
+#   EMAIL    <- INTERNYET_EMAIL
+# FALLBACK: the legacy `user.conf` on the ext4 home partition, so an old stick
+# still works. The legacy file also owns the keys the venue file has no answer
+# for (IRC_SERVER, MUMBLE_SERVER, KEYBOARD, TIMEZONE).
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[userconf] $*" > "${SER}" 2>/dev/null; echo "[userconf] $*"; }
+
+MNT="/mnt/usbhome"
+CFG_FILE="${MNT}/user.conf"
+OUT="/run/partyos-user.conf"
+
+# shellcheck source=/dev/null
+source /usr/local/bin/partyos-cfg
+# shellcheck source=/dev/null
+source /usr/local/lib/partyos-internyet.sh
+
+ENV_FILE=""
+[ -r /run/partyos-internyet-env ] && ENV_FILE="$(cat /run/partyos-internyet-env 2>/dev/null || true)"
+[ -n "${ENV_FILE}" ] && [ -r "${ENV_FILE}" ] || ENV_FILE="$(internyet_env_file)"
+
+# Strip everything that could break a KEY=value file or a literal-sed seed:
+# quotes, backslashes, newlines/CR, and the shell-dangerous set $`;|&<>(){} plus
+# control chars. Whitespace inside a value is collapsed to single spaces. Keeps
+# the value usable for IRC hosts, nicks, real names, emails.
+sanitize() {
+    printf '%s' "$1" \
+        | tr -d '\r\n' \
+        | tr -d '"'"'"'\\`$;|&<>(){}' \
+        | tr -d '[:cntrl:]' \
+        | sed -E 's/[[:space:]]+/ /g; s/^ +//; s/ +$//'
+}
+
+# read+sanitize a key from user.conf (empty if absent/unreadable)
+getk() { sanitize "$(partyos_cfg "$1" "${CFG_FILE}" 2>/dev/null || true)"; }
+
+# read+sanitize a key from internyet.env (empty if absent/unreadable)
+getenvk() {
+    [ -n "${ENV_FILE}" ] || { printf ''; return 0; }
+    sanitize "$(internyet_get "$1" "${ENV_FILE}" 2>/dev/null || true)"
+}
+
+# internyet.env first, legacy user.conf second, per key.
+NICK_RAW="$(getenvk INTERNYET_ALIAS)";  [ -n "${NICK_RAW}" ] || NICK_RAW="$(getk NICK)"
+FULLNAME="$(getenvk INTERNYET_ALIAS)";  [ -n "${FULLNAME}" ] || FULLNAME="$(getk FULLNAME)"
+EMAIL="$(getenvk INTERNYET_EMAIL)";     [ -n "${EMAIL}" ]    || EMAIL="$(getk EMAIL)"
+IRC_SERVER="$(getk IRC_SERVER)"
+MUMBLE_SERVER="$(getk MUMBLE_SERVER)"
+# locale defaults: Swedish keyboard + Stockholm time unless the stick overrides.
+KEYBOARD="$(getk KEYBOARD)"; [ -n "${KEYBOARD}" ] || KEYBOARD="se"
+TIMEZONE="$(getk TIMEZONE)"; [ -n "${TIMEZONE}" ] || TIMEZONE="Europe/Stockholm"
+
+# --- NICK: strict identifier; fall back to the resolved username, then partygoer
+NICK=""
+if [ -n "${NICK_RAW}" ] && printf '%s' "${NICK_RAW}" | grep -qE '^[A-Za-z_][A-Za-z0-9_-]{0,30}$'; then
+    NICK="${NICK_RAW}"
+else
+    [ -n "${NICK_RAW}" ] && log "invalid NICK '${NICK_RAW}' -> falling back"
+    un="$(tr -d '[:space:]' < /run/partyos-username 2>/dev/null || true)"
+    if [ -n "${un}" ] && printf '%s' "${un}" | grep -qE '^[A-Za-z_][A-Za-z0-9_-]{0,30}$'; then
+        NICK="${un}"
+    else
+        NICK="partygoer"
+    fi
+fi
+
+# --- IRC_SERVER / MUMBLE_SERVER: host[:port], permissive host charset --------
+valid_server() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9.:_-]{1,253}$'; }
+[ -n "${IRC_SERVER}" ] && ! valid_server "${IRC_SERVER}" && { log "invalid IRC_SERVER -> dropping"; IRC_SERVER=""; }
+[ -n "${MUMBLE_SERVER}" ] && ! valid_server "${MUMBLE_SERVER}" && { log "invalid MUMBLE_SERVER -> dropping"; MUMBLE_SERVER=""; }
+
+# --- EMAIL: permissive but reject anything with spaces / bad chars -----------
+[ -n "${EMAIL}" ] && ! printf '%s' "${EMAIL}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
+    && { log "invalid EMAIL -> dropping"; EMAIL=""; }
+
+# --- publish: a single sanitized KEY=value file (root-owned tmpfs) -----------
+umask 022
+{
+    echo "NICK=${NICK}"
+    [ -n "${FULLNAME}" ]      && echo "FULLNAME=${FULLNAME}"
+    [ -n "${IRC_SERVER}" ]    && echo "IRC_SERVER=${IRC_SERVER}"
+    [ -n "${MUMBLE_SERVER}" ] && echo "MUMBLE_SERVER=${MUMBLE_SERVER}"
+    [ -n "${EMAIL}" ]         && echo "EMAIL=${EMAIL}"
+    echo "KEYBOARD=${KEYBOARD}"
+    echo "TIMEZONE=${TIMEZONE}"
+} > "${OUT}"
+chmod 0644 "${OUT}" 2>/dev/null || true
+
+# convenience single-value files (mirror /run/partyos-username's shape)
+printf '%s' "${NICK}" > /run/partyos-nick
+printf '%s' "${FULLNAME}" > /run/partyos-fullname
+
+# --- apply keyboard layout (console + X11) -----------------------------------
+# Runs BEFORE the desktp/Xorg (service is Before=display-manager), so the X11
+# config is in place when the session starts. Default 'se' (Swedish).
+if printf '%s' "${KEYBOARD}" | grep -qE '^[a-z][a-z0-9_-]{1,15}$'; then
+    # The X11 layout code (KEYBOARD, e.g. 'se') is NOT always a valid CONSOLE keymap:
+    # 'se' is an X11 layout, but the Swedish console map is 'sv-latin1', so writing
+    # KEYMAP=se makes systemd-vconsole-setup fail (loadkeys: Unable to open file: se).
+    # Translate the X11 layout to its console keymap for vconsole.conf/loadkeys while
+    # leaving the X11 XkbLayout below untouched (the desktop keyboard is already right).
+    case "${KEYBOARD}" in
+        se) CKMAP="sv-latin1" ;;
+        *)  CKMAP="${KEYBOARD}" ;;
+    esac
+    printf 'KEYMAP=%s\n' "${CKMAP}" > /etc/vconsole.conf 2>/dev/null || true
+    loadkeys "${CKMAP}" 2>/dev/null || true
+    install -d /etc/X11/xorg.conf.d 2>/dev/null || true
+    cat > /etc/X11/xorg.conf.d/00-keyboard.conf <<KB 2>/dev/null || true
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "${KEYBOARD}"
+EndSection
+KB
+else
+    log "invalid KEYBOARD '${KEYBOARD}' -> leaving system default"; KEYBOARD="(default)"
+fi
+
+# --- apply timezone ----------------------------------------------------------
+# Default Europe/Stockholm. Validate against the zoneinfo db so a bad value is
+# ignored rather than breaking /etc/localtime.
+if [ -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
+    ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime 2>/dev/null || true
+    printf '%s\n' "${TIMEZONE}" > /etc/timezone 2>/dev/null || true
+else
+    log "unknown TIMEZONE '${TIMEZONE}' -> leaving system default"; TIMEZONE="(default)"
+fi
+
+log "PARTYOS-USERCONF-RESOLVED nick=${NICK} fullname=${FULLNAME:-<none>} irc=${IRC_SERVER:-<none>} mumble=${MUMBLE_SERVER:-<none>} keyboard=${KEYBOARD} timezone=${TIMEZONE}"
+exit 0

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=partyOS operator broadcasts
+Exec=/usr/local/bin/partyos-notify-poll
+X-XFCE-Autostart-enabled=true
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

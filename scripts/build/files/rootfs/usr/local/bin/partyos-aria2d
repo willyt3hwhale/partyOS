@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# partyos-aria2d - start the ONE client aria2c. partyos-seeder.service runs this.
+#
+# The process seeds every cached blob and does every catalog download. Other
+# scripts talk to it over JSON-RPC with partyos-aria2rpc:
+#   * seed a blob     = aria2.addTorrent with bt-seed-unverified (no re-hash)
+#   * download a blob = aria2.addTorrent; the entry keeps seeding when complete
+#   * evict a blob    = aria2.forceRemove, then removeDownloadResult
+# The RPC listens on loopback only. The secret is new at each start and is
+# kept in root-only files, never on the command line.
+#
+# Rules kept from the per-blob seeders:
+#   * P2P only: no web-seed, no HTTP fallback.
+#   * Seed without limit: seed-ratio 0 and no seed-time.
+#   * The per-client upload cap is blob_seed_up_limit= on /proc/cmdline.
+#   * LPD finds peers on the LAN; the tracker comes from each .torrent.
+set -u
+RUN_DIR=/run/partyos
+SECRET_FILE="${RUN_DIR}/aria2.secret"
+CONF="${RUN_DIR}/aria2.conf"
+
+cmdline_kv() {
+    local key="$1" v="" p
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in "${key}="*) v="${p#*=}";; esac; done
+    printf '%s' "${v}"
+}
+# 0 = no cap, or an aria2 rate such as 5M or 500K.
+UP="$(cmdline_kv blob_seed_up_limit)"; case "${UP}" in ''|*[!0-9KMkm]*) UP=0;; esac
+
+install -d -m 0700 "${RUN_DIR}"
+umask 077
+head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${SECRET_FILE}"
+chmod 0600 "${SECRET_FILE}"
+printf 'rpc-secret=%s\n' "$(cat "${SECRET_FILE}")" > "${CONF}"
+chmod 0600 "${CONF}"
+# Back to the normal umask: the blobs aria2c writes must stay world-readable
+# (partyos-share-game and the progress UI run as the player).
+umask 022
+install -d /var/cache/partyos
+
+# Option notes:
+#   --rpc-save-upload-metadata=false  do not write <infohash>.torrent into the cache.
+#   --max-concurrent-downloads=2 with --bt-detach-seed-only=true
+#       Seeding entries do not use a slot. At most 2 downloads write at once.
+#   --file-allocation=none   the file grows with the download (the progress UI
+#       counts its blocks). No preallocation write burst on the USB stick.
+#   --disk-cache  BitTorrent writes pieces out of order. The RAM cache merges them
+#       into longer writes before they reach the stick.
+#   --auto-save-interval=30  save the .aria2 control file often, so a stopped
+#       download resumes near where it stopped.
+exec /usr/bin/aria2c \
+    --conf-path="${CONF}" \
+    --enable-rpc=true --rpc-listen-all=false --rpc-listen-port=6800 \
+    --rpc-save-upload-metadata=false \
+    --enable-dht=false --enable-dht6=false \
+    --bt-enable-lpd=true --enable-peer-exchange=true \
+    --listen-port=51413-51420 \
+    --seed-ratio=0.0 \
+    --max-overall-upload-limit="${UP}" \
+    --max-concurrent-downloads=2 --bt-detach-seed-only=true \
+    --file-allocation=none --allow-overwrite=true --auto-file-renaming=false \
+    --disk-cache="${PARTYOS_DISK_CACHE:-256M}" \
+    --auto-save-interval=30 \
+    --ca-certificate=/etc/partyos/ca.pem \
+    --dir=/var/cache/partyos \
+    --console-log-level=notice --summary-interval=0 --show-console-readout=false

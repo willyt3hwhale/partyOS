@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# partyos-report-flush - send any USB-queued player reports once the server is up.
+# Payload-agnostic: it relays whatever JSON the queue files hold (a plain inbox
+# message or a bug report with system info), so the opt-in shape needs no changes here.
+set -u
+
+QUEUE_DIR="/mnt/usbhome/.partyos-reports"
+PARTYOS_CA="/etc/partyos/ca.pem"
+
+# nothing queued -> nothing to do (cheap fast exit; the timer fires often).
+ls "${QUEUE_DIR}"/*.json >/dev/null 2>&1 || exit 0
+
+report_base() {
+    if [ -r /etc/partyos/appstore.conf ]; then
+        local b; b="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+        [ -n "${b}" ] && { printf '%s' "${b}"; return; }
+    fi
+    local rb=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+    [ -n "${rb}" ] && { printf '%s' "${rb}"; return; }
+    # No server parameter: fail loudly. Never dial a guessed address.
+    local m="PARTYOS-REPORT-FLUSH-NO-SERVER: no report_url= on /proc/cmdline and no SERVER_BASE= in /etc/partyos/appstore.conf"
+    echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    return 1
+}
+# --cacert ONLY for an https base (curl ignores it for http - transition-safe).
+cacert_args() {
+    case "$1" in
+        https://*) [ -r "${PARTYOS_CA}" ] && printf '%s' "--cacert ${PARTYOS_CA}";;
+    esac
+}
+BASE="$(report_base)" || exit 1
+CA="$(cacert_args "${BASE}")"
+
+# reachability gate: one cheap bounded probe before draining. If the server is
+# down we leave the whole queue intact for the next tick (no per-file timeouts).
+curl -fsS ${CA} --max-time 5 -o /dev/null "${BASE}/report?step=report-flush&status=probe" 2>/dev/null \
+    || { echo "[report-flush] server ${BASE} unreachable - leaving queue intact"; exit 0; }
+
+sent=0; kept=0
+for f in "${QUEUE_DIR}"/*.json; do
+    [ -f "${f}" ] || continue
+    if curl -fsS ${CA} --max-time 10 -X POST -H 'Content-Type: application/json' \
+            --data-binary @"${f}" "${BASE}/feedback" >/dev/null 2>&1; then
+        rm -f "${f}" 2>/dev/null || true
+        sent=$((sent+1))
+    else
+        kept=$((kept+1))   # keep it; try again next tick
+    fi
+done
+[ "${sent}" -gt 0 ] && sync 2>/dev/null || true
+echo "[report-flush] flushed ${sent}, kept ${kept} (server ${BASE})"

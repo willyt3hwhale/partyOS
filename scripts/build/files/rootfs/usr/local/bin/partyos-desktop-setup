@@ -1,0 +1,33 @@
+#!/bin/bash
+# Force Chicago95 GTK+icon+cursor theme at RUNTIME. xfsettingsd OWNS the xsettings channel
+# and regenerates the xml to Adwaita defaults at session start (and a persisted USB home
+# mirrors its own Adwaita xml back over the seed via home-pull), so the baked/seeded
+# xsettings.xml is clobbered every boot. Setting it live - AFTER xfsettingsd is up and the
+# channel is answerable - makes the daemon apply+persist Chicago95 for fresh AND persisted
+# homes and broadcast it to GTK apps before the setup wizard draws. Do NOT rely on the xml.
+for _i in $(seq 1 60); do
+  pgrep -x xfsettingsd >/dev/null 2>&1 && xfconf-query -c xsettings -l >/dev/null 2>&1 && break
+  sleep 0.2
+done
+xfconf-query -c xsettings -p /Net/ThemeName -n -t string -s Chicago95 2>/dev/null \
+  || xfconf-query -c xsettings -p /Net/ThemeName -s Chicago95 2>/dev/null || true
+xfconf-query -c xsettings -p /Net/IconThemeName -n -t string -s Chicago95 2>/dev/null \
+  || xfconf-query -c xsettings -p /Net/IconThemeName -s Chicago95 2>/dev/null || true
+xfconf-query -c xsettings -p /Gtk/CursorThemeName -n -t string -s Chicago95_Standard_Cursors 2>/dev/null \
+  || xfconf-query -c xsettings -p /Gtk/CursorThemeName -s Chicago95_Standard_Cursors 2>/dev/null || true
+IMG=/usr/share/backgrounds/partyos.png; [ -f "$IMG" ] || IMG=/usr/share/backgrounds/partyos.ppm
+for m in $(xrandr --listmonitors 2>/dev/null | awk 'NR>1{print $NF}'); do
+  for ws in 0 1 2 3; do b="/backdrop/screen0/monitor${m}/workspace${ws}"
+    xfconf-query -c xfce4-desktop -p "$b/last-image" -n -t string -s "$IMG" 2>/dev/null || \
+    xfconf-query -c xfce4-desktop -p "$b/last-image" -s "$IMG" 2>/dev/null || true
+    xfconf-query -c xfce4-desktop -p "$b/image-style" -n -t int -s 5 2>/dev/null || true
+    xfconf-query -c xfce4-desktop -p "$b/color-style" -n -t int -s 0 2>/dev/null || true
+  done
+done
+# apply a resolution persisted by the first-run wizard, best-effort
+RES="$(grep -E '^RESOLUTION=' /mnt/usbhome/user.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+if [ -n "${RES}" ]; then
+  P="$(xrandr 2>/dev/null | awk '/ connected/{print $1; exit}')"
+  [ -n "${P}" ] && xrandr --output "${P}" --mode "${RES}" 2>/dev/null || true
+fi
+xfdesktop --reload 2>/dev/null || true

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=FAQ
+Icon=help-browser
+Exec=/usr/local/bin/partyos-launch browser
+Terminal=false
+Categories=System;partyOS;

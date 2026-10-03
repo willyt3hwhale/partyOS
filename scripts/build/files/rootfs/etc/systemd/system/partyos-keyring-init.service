@@ -1,0 +1,13 @@
+[Unit]
+Description=partyOS first-boot pacman keyring guard (baked trust root verify; fallback populate)
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=partyos-mirror.service sysinit.target shutdown.target
+Conflicts=shutdown.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=180s
+ExecStart=/usr/local/bin/partyos-keyring-init
+[Install]
+WantedBy=sysinit.target

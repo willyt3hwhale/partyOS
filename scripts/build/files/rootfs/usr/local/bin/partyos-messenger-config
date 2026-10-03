@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Generate HexChat's servlist + skip the network-list dialog. FIRST-RUN-ONLY:
+# previously this regenerated servlist.conf on EVERY launch, clobbering any edits
+# the user made (and re-running needless work). Now it gates on the existence of
+# ~/.config/hexchat (delegated to partyos-seed-config's never-clobber gate) so it
+# runs exactly once. Resolves the IRC server with the documented precedence
+# (user.conf IRC_SERVER via sanitized /run -> cmdline irc_server=; none -> PARTYOS-MESSENGER-CONFIG-NO-SERVER),
+# normalizes host:port -> host/port for HexChat's S= line, then renders the
+# server-side template through the shared seeder. gui_slist_skip is set on the
+# first run only (alongside the freshly seeded config).
+set -u
+
+# already configured? do nothing (idempotent, never clobber).
+[ -e "${HOME}/.config/hexchat" ] && exit 0
+
+# resolve the IRC server: sanitized /run (from user.conf) -> cmdline.
+IRC=""
+[ -r /run/partyos-user.conf ] && IRC="$(grep -E '^IRC_SERVER=' /run/partyos-user.conf 2>/dev/null | tail -1 | cut -d= -f2-)"
+[ -n "${IRC}" ] || for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in irc_server=*) IRC="${p#*=}";; esac; done
+# No IRC server: fail loudly. Never dial a guessed address.
+if [ -z "${IRC}" ]; then
+    m="PARTYOS-MESSENGER-CONFIG-NO-SERVER: no IRC_SERVER= in user.conf and no irc_server= on /proc/cmdline"; echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    exit 1
+fi
+HOST="${IRC%:*}"; PORT="${IRC##*:}"; [ "${PORT}" = "${HOST}" ] && PORT=6667
+
+# resolve the server base (same precedence as partyos-launch/partyos-app).
+SERVER_BASE="${PARTYOS_SERVER:-}"
+if [ -z "${SERVER_BASE}" ] && [ -r /etc/partyos/appstore.conf ]; then
+    SERVER_BASE="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+fi
+[ -n "${SERVER_BASE}" ] || for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) SERVER_BASE="${p#*=}";; esac; done
+if [ -z "${SERVER_BASE}" ]; then
+    m="PARTYOS-MESSENGER-CONFIG-NO-SERVER: no SERVER_BASE= in appstore.conf and no report_url= on /proc/cmdline"; echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    exit 1
+fi
+
+# render the servlist template once. HexChat wants S=host/port, so pass the
+# already-split IRC_SERVER as host/port via an override key.
+partyos-seed-config hexchat "${SERVER_BASE}/server/config/hexchat/servlist.conf.tmpl" \
+    servlist.conf "IRC_SERVER=${HOST}/${PORT}" || exit 0
+
+# autoconnect + skip the network list on startup (first run only).
+CFG="${HOME}/.config/hexchat"
+touch "${CFG}/hexchat.conf" 2>/dev/null || true
+grep -q '^gui_slist_skip' "${CFG}/hexchat.conf" 2>/dev/null || echo 'gui_slist_skip = 1' >> "${CFG}/hexchat.conf"

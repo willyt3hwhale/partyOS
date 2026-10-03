@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=First-time Setup
+Comment=Re-run the partyOS setup wizard (keyboard, display, audio)
+Exec=/usr/local/bin/partyos-setup-wizard --force
+Icon=preferences-desktop
+Terminal=false
+Categories=Settings;System;

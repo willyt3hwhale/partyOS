@@ -1,0 +1,145 @@
+#!/bin/bash
+# partyOS first-run setup wizard. Usage: partyos-setup-wizard [--force]
+MNT=/mnt/usbhome
+CFG="${MNT}/user.conf"
+SENT="${MNT}/.partyos-setup-done"
+[ -n "${DISPLAY}" ] || export DISPLAY=:0
+FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
+command -v zenity >/dev/null 2>&1 || exit 0
+# already done (and not forced) -> nothing to do
+[ "${FORCE}" = 0 ] && [ -e "${SENT}" ] && exit 0
+
+# Can we persist? The USB partition ROOT (where user.conf + the sentinel live) is
+# root-owned, so the desktop user can't write it directly - but it has NOPASSWD sudo, so
+# all persistent writes go through `sudo -n`. PERSIST just means "a USB home is mounted".
+# No stick -> show the welcome but skip persisted steps + don't seal the sentinel.
+PERSIST=0
+if [ -d "${MNT}" ] && mountpoint -q "${MNT}" 2>/dev/null; then
+  PERSIST=1; sudo -n touch "${CFG}" 2>/dev/null || true
+fi
+
+# set_key KEY VALUE - upsert into user.conf
+set_key() {
+  [ "${PERSIST}" = 1 ] || return 0
+  local k="$1" v="$2"
+  # root-owned partition root -> write through sudo -n (user has NOPASSWD).
+  if grep -qE "^${k}=" "${CFG}" 2>/dev/null; then
+    sudo -n sed -i "s|^${k}=.*|${k}=${v}|" "${CFG}"
+  else
+    printf '%s=%s\n' "${k}" "${v}" | sudo -n tee -a "${CFG}" >/dev/null
+  fi
+}
+getk() { grep -E "^${1}=" "${CFG}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]'; }
+
+# 1) WELCOME / MOTD ----------------------------------------------------------
+zenity --info --title "Welcome to partyOS" --width=460 --no-wrap \
+  --text="<b>Welcome to partyOS!</b>\n\nThis is a LAN-party OS that runs entirely in RAM.\n\n - Your home lives on your USB stick. Pull it out and your data is gone.\n - Games download from the LAN and cache to your stick.\n - There is no internet here - only us.\n\nLet's set up your keyboard." 2>/dev/null || true
+
+# 2) KEYBOARD LAYOUT ---------------------------------------------------------
+cur_kb="$(getk KEYBOARD)"; [ -n "${cur_kb}" ] || cur_kb=se
+# EVERY X11 layout, straight from the system xkb DB (~250: us, se, de, ru, gr, ...)
+# rather than a curated subset. base.lst is exactly what `localectl` reads; one awk
+# pass emits zenity rows (radio, code, human description). Fed via stdin (newline
+# per cell) so descriptions with spaces/parens are safe. Current layout preselected.
+LSTF=/usr/share/X11/xkb/rules/base.lst
+rows="$(awk -v cur="${cur_kb}" '
+  /^! layout/{f=1;next} /^!/{f=0}
+  f && NF { code=$1; $1=""; sub(/^ +/,"");
+            print (code==cur ? "TRUE" : "FALSE"); print code; print $0 }' \
+  "${LSTF}" 2>/dev/null)"
+if [ -n "${rows}" ]; then
+  sel="$(printf '%s\n' "${rows}" | zenity --list --radiolist \
+    --title "partyOS - Keyboard" --text "Pick your keyboard layout:" \
+    --column "" --column "Code" --column "Layout" --print-column=2 \
+    --height=460 --width=420 2>/dev/null)"
+else
+  # xkb DB missing -> fall back to a small curated list (newline-fed, spaces ok)
+  sel="$(printf '%s\n' \
+      "$([ "${cur_kb}" = se ] && echo TRUE || echo FALSE)" se "Swedish" \
+      FALSE us "English (US)"  FALSE gb "English (UK)"  FALSE de "German" \
+      FALSE fi "Finnish"  FALSE no "Norwegian"  FALSE dk "Danish" \
+      FALSE fr "French"  FALSE es "Spanish"  FALSE it "Italian" \
+    | zenity --list --radiolist --title "partyOS - Keyboard" \
+        --text "Pick your keyboard layout:" --column "" --column "Code" \
+        --column "Layout" --print-column=2 --height=360 --width=360 2>/dev/null)"
+fi
+if [ -n "${sel}" ]; then
+  set_key KEYBOARD "${sel}"
+  setxkbmap "${sel}" 2>/dev/null || true     # live; full apply (vconsole/Xorg) next boot
+fi
+
+# 3) OPTIONAL: DISPLAY RESOLUTION -------------------------------------------
+if command -v xrandr >/dev/null 2>&1 && \
+   zenity --question --title "Display" --width=360 \
+     --text="Adjust screen resolution? (optional)" 2>/dev/null; then
+  PRIMARY="$(xrandr 2>/dev/null | awk '/ connected/{print $1; exit}')"
+  modes="$(xrandr 2>/dev/null | awk '/^ /{print $1}' | grep -E '^[0-9]+x[0-9]+$' | awk '!seen[$0]++')"
+  if [ -n "${PRIMARY}" ] && [ -n "${modes}" ]; then
+    rmode="$(printf '%s\n' ${modes} | zenity --list --title "partyOS - Resolution" \
+      --text="Resolution for ${PRIMARY}:" --column "Mode" --height=340 2>/dev/null)"
+    if [ -n "${rmode}" ]; then
+      xrandr --output "${PRIMARY}" --mode "${rmode}" 2>/dev/null && set_key RESOLUTION "${rmode}"
+    fi
+  fi
+fi
+
+# 4) OPTIONAL: DEFAULT AUDIO OUTPUT -----------------------------------------
+# wpctl/wireplumber now ship in the image (PipeWire stack), so this guard passes.
+# This is the OPTIONAL OVERRIDE on top of partyos-default-sink (which already picked
+# the onboard analog jack at session start): if the player picks a device here it wins
+# for this session and wireplumber persists it to the home (USB), so no user.conf key
+# is needed. If the player skips this step the default-sink choice stands.
+if command -v wpctl >/dev/null 2>&1 && \
+   zenity --question --title "Audio" --width=360 \
+     --text="Choose the audio output device? (optional)" 2>/dev/null; then
+  # list sinks as "ID Name"
+  mapfile -t sinks < <(wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sources:/p' | grep -oE '[0-9]+\. .*' )
+  if [ "${#sinks[@]}" -gt 0 ]; then
+    args=(); for s in "${sinks[@]}"; do id="${s%%.*}"; nm="${s#*. }"; args+=("${id}" "${nm}"); done
+    pick="$(printf '%s\n' "${args[@]}" | xargs -d '\n' zenity --list --title "partyOS - Audio" \
+      --text="Default output:" --column "ID" --column "Device" --print-column=1 --height=300 2>/dev/null)"
+    [ -n "${pick}" ] && wpctl set-default "${pick}" 2>/dev/null || true
+  fi
+fi
+
+# 5) PASSWORD + away-from-keyboard lock - REQUIRED ----------------------
+# Every stick MUST have a password (the lockscreen protects a stepped-away rig). Stored
+# as a crypt hash on the USB (never plaintext), applied live + every boot. The loop has
+# no skip/cancel - the wizard won't finish (sentinel stays unsealed) until one is set.
+if [ "${PERSIST}" = 1 ] && command -v openssl >/dev/null 2>&1; then
+  PWF=/mnt/usbhome/.partyos-passwd
+  set_pw() {   # loop until a password is actually set; no way out.
+    local p1 p2 h
+    while :; do
+      p1="$(zenity --password --title 'partyOS - Set a password (required)' 2>/dev/null)"
+      [ -n "${p1}" ] || { zenity --warning --title partyOS --width=340 \
+          --text 'A password is required to protect your session. Please set one.' 2>/dev/null || true; continue; }
+      p2="$(zenity --password --title 'partyOS - Confirm password' 2>/dev/null)"
+      [ "${p1}" = "${p2}" ] || { zenity --warning --title partyOS --text "Didn't match - try again." 2>/dev/null || true; continue; }
+      h="$(printf '%s\n' "${p1}" | openssl passwd -6 -stdin 2>/dev/null)"
+      if [ -n "${h}" ] && printf '%s' "${h}" | sudo -n /usr/local/bin/partyos-set-passwd 2>/dev/null; then
+        /usr/local/bin/partyos-lock-setup 2>/dev/null || true   # flip lock True this session
+        zenity --info --title partyOS --width=360 \
+          --text='Password set. Lock with Win+L, the Start menu, or when idle.' 2>/dev/null || true
+        return 0
+      fi
+      zenity --error --title partyOS --text="Couldn't set the password - try again." 2>/dev/null || true
+    done
+  }
+  if [ -s "${PWF}" ]; then
+    # already has one (pre-provisioned or a re-run) -> Keep or Change; never Remove.
+    act="$(zenity --list --radiolist --title 'partyOS - Password' \
+        --text='This stick already has a password.' \
+        --column '' --column 'Action' --print-column=2 \
+        TRUE Keep FALSE Change --height=220 --width=340 2>/dev/null)"
+    [ "${act}" = Change ] && set_pw
+  else
+    set_pw
+  fi
+fi
+
+# DONE: seal the sentinel (only if we could persist) - root-owned root -> sudo -n
+[ "${PERSIST}" = 1 ] && sudo -n touch "${SENT}" 2>/dev/null
+zenity --info --title "partyOS" --width=400 --no-wrap \
+  --text="All set. Have fun!\n\n<i>partyOS - hand-crafted by <b>LilWil</b>, fuelled by\nMountain Dew and questionable decisions.\nIf it breaks, that's a feature.</i>" 2>/dev/null || true
+exit 0

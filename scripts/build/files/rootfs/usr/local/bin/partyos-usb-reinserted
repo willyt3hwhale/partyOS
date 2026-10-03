@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+. /usr/local/lib/partyos-sync-common.sh
+. /usr/local/lib/partyos-usb-labels.sh
+EVENT_LOG="/run/partyos-hotplug.log"
+LOCK="/run/partyos-usb-reinsert.lock"
+# Safety net: whatever exit path we take (dup exit, mount-lock timeout, a SIGKILLed pull),
+# never leave the RAM-side PULL_INPROGRESS marker behind - it would wedge the push off for
+# the rest of the session. The gen-guard pull block below also clears it explicitly before
+# the resume-push so that push is not gated by our own marker.
+trap 'rm -f "${PULL_INPROGRESS}" 2>/dev/null || true' EXIT
+
+# udev fires the add rule more than once; serialize with a non-blocking flock.
+# fd 9 = udev-dedup lock (this script's OWN concern - drop duplicate udev events).
+exec 9>"${LOCK}"
+flock -n 9 || exit 0
+# fd 7 = MUTUAL HOTPLUG lock (HOTPLUG_LOCK from sync-common). Serializes THIS handler
+# against partyos-usb-removed so a fast yank-replug can't interleave the two (removed's
+# PAUSE+umount racing our remount+PAUSE-clear -> stranded device-present/mount-gone/PAUSE
+# state the poll won't heal). Taken AFTER the fd 9 dedup (so duplicate udev adds still exit
+# free without contending) and held for the whole body; bounded wait, then proceed with a
+# WARN rather than hang. DISTINCT from fd 8 (mount lock) and fd 9 (udev-dedup).
+exec 7>"${HOTPLUG_LOCK}"
+flock -w 25 7 || say "PARTYOS-USB reinsert: WARN timed out on hotplug lock, proceeding unserialized"
+# fd 8 = SHARED mount lock (USBHOME_MOUNT_LOCK from sync-common). DIFFERENT concern:
+# it serializes our check-then-mount of /mnt/usbhome against the CONCURRENT sysinit
+# partyos-usbhome boot-mount so the two never both see "not mounted" and stack two
+# mounts. Acquired only around the quick mount blocks below and RELEASED (fd 8 closed)
+# before the slow generation-guard rsync pull, so the pull never holds the mount lock.
+exec 8>"${USBHOME_MOUNT_LOCK}"
+# Already remounted rw by a prior winning invocation? then we are a dup.
+if mountpoint -q "${MNT}" && is_rw && findmnt -no SOURCE "${MNT}" 2>/dev/null | grep -q '/dev/'; then
+    src="$(findmnt -no SOURCE "${MNT}" 2>/dev/null)"
+    if [ -n "${src}" ] && [ -b "${src}" ] && partyos_dev_is home "${src}"; then
+        exit 0
+    fi
+fi
+
+echo "$(date '+%H:%M:%S') reinserted" >> "${EVENT_LOG}" 2>/dev/null || true
+say "PARTYOS-USB-REINSERTED home stick insertion detected"
+
+install -d "${MNT}"
+udevadm settle --timeout=5 2>/dev/null || true
+DEV=""
+for _ in $(seq 1 20); do
+    DEV="$(partyos_resolve_label_dev home)"
+    if [ -n "${DEV}" ] && [ -b "${DEV}" ]; then break; fi
+    DEV=""
+    udevadm trigger 2>/dev/null || true
+    sleep 0.5
+done
+
+mounted=0
+# Take the SHARED mount lock now - bounded so a stuck holder cannot wedge us. Held
+# across both the home and share check-then-mount blocks, then dropped
+# (exec 8>&-) before the generation-guard pull. -w 20 worst case: proceed unserialized
+# (rare double-mount, drained by umount_all on removal) rather than hang.
+flock -w 20 8 || say "PARTYOS-USB reinsert: WARN timed out on shared mount lock, proceeding"
+if [ -n "${DEV}" ]; then
+    say "PARTYOS-USB reinsert: fresh home device is ${DEV}"
+    # IDEMPOTENT: if the boot-mount (partyos-usbhome) already mounted this exact
+    # device first, do NOT stack a second mount - just adopt it. Only when MNT is
+    # empty or mounted on a STALE/wrong device do we drain (umount-all) and remount.
+    if is_mounted_dev "${MNT}" "${DEV}"; then
+        mounted=1
+        say "PARTYOS-USB reinsert: ${DEV} already mounted at ${MNT}, skipping remount"
+    else
+        umount_all "${MNT}"   # clear any stale/wrong (possibly stacked) mount first
+        for _ in 1 2 3 4 5; do
+            if mount -o rw,noatime "${DEV}" "${MNT}" 2>/dev/null || mount "${DEV}" "${MNT}" 2>/dev/null; then mounted=1; break; fi
+            sleep 0.5
+        done
+        [ "${mounted}" -eq 1 ] && say "PARTYOS-USB reinsert: remounted ${DEV} at ${MNT} (rw)" \
+            || say "PARTYOS-USB WARN remount ${DEV} failed"
+    fi
+    install -d "${MNT}/home" 2>/dev/null || true
+else
+    say "PARTYOS-USB WARN no home device after reinsert (labels: $(partyos_usb_labels home | tr '\n' ' '))"
+fi
+
+# Remount the exFAT share (a share label) FIRST, before the gate (best-effort, idempotent
+# on device). ORDER MATTERS: the stick's identity now lives in `internyet.env` on THIS
+# partition, so the USERNAME MOUNT GATE below cannot read it until the share is mounted.
+# With the share absent the gate falls back to the legacy .partyos on the home partition.
+if [ "${mounted}" -eq 1 ]; then
+    SDEV="$(partyos_resolve_label_dev share)"
+    if [ -n "${SDEV}" ] && ! is_mounted_dev "${SHARE}" "${SDEV}"; then
+        umount_all "${SHARE}"
+        install -d "${SHARE}"
+        mount -o rw,noatime,uid=1000,gid=1000,umask=0022 "${SDEV}" "${SHARE}" 2>/dev/null \
+            || mount "${SDEV}" "${SHARE}" 2>/dev/null || true
+    fi
+fi
+
+# USERNAME MOUNT GATE: the identity of a home stick is the PROVISIONED
+# user name stored on it (internyet.env INTERNYET_USER_NAME, with the legacy .partyos
+# USERNAME= as fallback - the same source used for autologin and hostname), NOT
+# a per-boot box-id. A stick is mounted + synced ONLY IF its username matches the logged-in
+# user; a DIFFERENT named user's stick is refused (unmounted, not synced, left untouched). A
+# blank/unprovisioned stick is adoptable. Applied ONLY once identity has resolved the login
+# user (LOGIN_RESOLVED) - at pre-identity coldplug the boot path (partyos-usbhome +
+# partyos-identity) owns the mount and DEFINES the login from whatever stick it reads, so there
+# is no foreign case to refuse yet and the gate stands down. This is what makes the box-id, the
+# cross-box tie and the authoritative re-push all obsolete: a foreign stick is never mounted.
+if [ "${mounted}" -eq 1 ] && [ "${LOGIN_RESOLVED}" -eq 1 ]; then
+    stick_user="$(stick_username)"
+    case "$(home_stick_gate "${stick_user}" "${USER_NAME}")" in
+        foreign)
+            say "PARTYOS-HOME-FOREIGN-STICK ${DEV:-stick} at ${MNT} not mounting (belongs to '${stick_user}', logged in as '${USER_NAME}') - left untouched, no sync"
+            umount_all "${MNT}"
+            # the share belongs to the SAME foreign stick - drop it too, or ~/Shared
+            # would expose another player's files.
+            umount_all "${SHARE}"
+            mounted=0
+            exec 8>&- 2>/dev/null || true   # release the shared mount lock we still hold
+            exit 0
+            ;;
+        blank)
+            say "PARTYOS-HOME reinsert: blank/unprovisioned stick at ${MNT} (no USERNAME) - adopting as '${USER_NAME}'s home"
+            ;;
+    esac
+fi
+
+# RELEASE the shared mount lock before any slow work (the generation-guard rsync pull
+# below). The mount critical section is done; holding it across the pull would block the
+# concurrent boot-mount for the pull's whole duration. fd 9 (udev-dedup) stays held.
+exec 8>&-
+
+# (d) GENERATION GUARD: if the reinserted stick's generation is NEWER than what THIS box
+# last synced, it is a newer copy of THIS user's home (they booted their own stick on another
+# of their rigs and brought it back) -> PULL its newer home into RAM instead of pushing ours
+# (which would clobber it). The USERNAME MOUNT GATE above already refused any DIFFERENT user's
+# stick, so a newer stick here is always the same player's own. An EQUAL gen is just our own
+# steady state (folds into the normal push - no cross-box tie, no box-id). corrupt is handled
+# data-preservingly: never pull-clobber the RAM home behind an unreadable counter.
+resumed_pulled=0
+# pull_failed: a reinsert PULL that died mid-copy (rc not 0/24) left RAM a partial mix
+# of old-RAM + new-stick content. It must NOT advance the generation baseline (that
+# would let the next 45s push --delete-mirror the partial mix back over the stick's
+# genuinely newer home) and must NOT let the resume-push open below. Mirrors the
+# boot pull's rc-gate (PARTYOS-HOME-PULL-INCOMPLETE): on failure we leave the pause flag
+# set and notify instead of resuming.
+pull_failed=0
+# was_paused: did a REMOVAL cause this reinsert? partyos-usb-removed sets PAUSE_FLAG, so PAUSE
+# present at ENTRY == a genuine mid-session yank->replug (RAM may have diverged from the stick
+# while it was OUT -> we must flush RAM -> stick promptly, below). PAUSE ABSENT == a normal
+# boot coldplug / poll-kick where the stick was NEVER removed: the boot pull already populated
+# RAM from this SAME stick and the 45s timer owns steady state, so a synchronous re-push here
+# would just re-mirror the whole home to a (possibly slow) stick inside this oneshot's
+# TimeoutStartSec - the degraded-boot cause. So on the OWN-stick normal boot we do NO re-push.
+was_paused=0; [ -e "${PAUSE_FLAG}" ] && was_paused=1
+# COLDPLUG/BOOT GATE: udev coldplug replays
+# a USB "add" at boot that starts THIS handler BEFORE partyos-home-pull has run and before
+# identity-setup resolved the desktop username. Its generation-guard pull would then
+# --delete-mirror a foreign-gen stick into HOME_DIR, racing the ordered boot pull/identity
+# path (at boot my_gen is unset, so ANY stick gen reads "newer" -> standdown -> premature
+# pull). Defer to the boot pull: only run the generation-guard pull once PULL_RAN exists
+# (the boot pull FINISHED - it is ordered After partyos-identity.service, so PULL_RAN also
+# implies identity is resolved). PULL_RAN, not PULL_DONE: PULL_RAN is set on EVERY boot-pull
+# exit incl. no-stick/ro, so a genuine LATER mid-session insert still pulls; gating on
+# PULL_DONE would wedge that off forever (a no-stick boot never opens it).
+if [ ! -e "${PULL_RAN}" ]; then
+    say "PARTYOS-USB-REINSERT-DEFER boot pull not run yet (PULL_RAN absent); deferring generation-guard pull to partyos-home-pull (coldplug/boot window)"
+elif [ "${mounted}" -eq 1 ] && is_rw; then
+    # PULL-IN-PROGRESS marker: the poll reconciler can kick THIS handler with the 45s push
+    # timer still running and PAUSE_FLAG NOT set (a mount lost without a remove event). Drop
+    # the RAM-side marker the push stands down on so a tick can't --delete-mirror a partial
+    # RAM home over the newer stick mid-pull. Cleared after the pull (success OR fail) so the
+    # resume-push still runs and a failed pull is gated by PAUSE_FLAG, not a stuck marker.
+    : > "${PULL_INPROGRESS}"
+    my_gen="$(gen_mine)"
+    read -r stick_status stick_gen <<<"$(gen_read_status "${STATE_FILE}")"
+    # OWN INTERRUPTED COMMIT (see partyos-sync-home): a stick one push ahead whose pending
+    # marker names THIS boot holds our own mirror, not a newer home. Do not pull it over the
+    # newer RAM home; adopt its generation so the resume-push below pushes again.
+    if [ "${stick_status}" = "ok" ] && [ "${stick_gen}" -gt "${my_gen}" ] 2>/dev/null \
+       && gen_own_pending "${stick_gen}"; then
+        say "PARTYOS-HOME-PUSH-RESUME reinsert: stick gen ${stick_gen} > mine ${my_gen} is this boot's own interrupted push; adopting it, NOT pulling"
+        gen_baseline "${stick_gen}"
+        my_gen="${stick_gen}"
+    fi
+    verdict="$(gen_decide "${my_gen}" "${stick_status}" "${stick_gen}")"
+    if [ "${verdict}" = "corrupt" ]; then
+        # Stick gen unreadable -> do NOT pull it over our RAM home (could be garbage).
+        # Leave resumed_pulled=0 so the resume-push below runs; that push STANDS DOWN on the
+        # corrupt stick (PARTYOS-SYNC-GEN-CORRUPT) - it does NOT push over it, leaving the
+        # stick untouched (no backup any more). Log loudly here.
+        say "PARTYOS-SYNC-GEN-CORRUPT reinsert: stick generation unreadable (mine ${my_gen}); NOT pulling stick"
+    elif [ "${verdict}" = "standdown" ]; then
+        # stick strictly newer -> a newer copy of THIS user's home (their own stick from
+        # another of their rigs - the mount gate already refused any different user): PULL it in.
+        say "PARTYOS-USB reinsert: stick gen ${stick_gen} > mine ${my_gen}; PULLING (same-user newer stick)"
+        if [ -d "${USB_HOME}" ] && ! dir_empty "${USB_HOME}"; then
+            # --delete-delay (NOT plain --delete): defer ALL deletions until every transfer has
+            # completed, matching the boot pull + the push. With the ram-tie backup gone this is
+            # the sole safety on a newer-stick reinsert pull - an interrupted pull (SIGTERM at
+            # the unit's TimeoutStartSec, a --timeout=20 stall) deletes NOTHING from the RAM home,
+            # so the rc-gate below just leaves it un-adopted and paused, never gutted.
+            rsync -a --delete-delay --timeout=20 "${RSYNC_EX[@]}" "${USB_HOME}/" "${HOME_DIR}/"
+            rc=$?
+            # RC-GATE (mirror of the boot pull): only adopt the stick's generation when
+            # the pull actually COMPLETED (rc 0 clean, 24 benign vanished-source-files).
+            if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 24 ]; then
+                chown -R "${UIDGID}:${UIDGID}" "${HOME_DIR}" 2>/dev/null || true
+                gen_baseline "${stick_gen}"
+                sync
+                resumed_pulled=1
+            else
+                say "PARTYOS-USB-REINSERT-PULL-INCOMPLETE reinsert pull rc=${rc}; NOT adopting stick generation (partial RAM must never push over the newer stick)"
+                pull_failed=1
+            fi
+        else
+            say "PARTYOS-USB reinsert: newer stick home empty; not pulling"
+        fi
+    fi
+    # verdict == push (stick older/fresh/EQUAL) -> fall through; the resume-push owns it. An
+    # equal gen is just our own steady state (no cross-box tie any more), so there is nothing
+    # to pull - the resume-push re-mirrors RAM -> stick normally.
+    rm -f "${PULL_INPROGRESS}"   # pull done (or skipped) -> reopen the push gate for the resume-push
+fi
+
+if [ "${pull_failed}" -eq 1 ]; then
+    # A reinsert pull failed partway: RAM is a partial mix and the stick's home is the
+    # genuine truth. Do NOT clear the pause and do NOT run the resume-push - either would
+    # let the partial RAM mirror back over the newer stick. Leave sync PAUSED and tell the
+    # player to re-seat the stick; the next clean reinsert clears the pause and retries.
+    say "PARTYOS-USB-REINSERT-PULL-INCOMPLETE leaving sync PAUSED (pull did not complete); stick preserved, not pushing"
+    /usr/local/bin/partyos-usb-notify reinserted "Home stick reinsert didn't finish - sync paused. Please re-seat the stick."
+else
+    # Resume: clear pause + restart the every-45s timer.
+    rm -f "${PAUSE_FLAG}"
+    # STALE RO_FLAG CLEAR: a single transient read-only mount earlier this boot sets the
+    # sticky RO_FLAG, which disables persistence for the WHOLE session even after the stick
+    # comes back cleanly rw. A confirmed clean rw (re)mount here is the "USB is healthy
+    # again" signal, so re-evaluate against the LIVE mount state and CLEAR the flag - else
+    # every later push keeps honoring the stale flag and sync stays silently off.
+    if mountpoint -q "${MNT}" && is_rw && [ -e "${RO_FLAG}" ]; then
+        say "PARTYOS-USB reinsert: clean rw remount confirmed - clearing stale RO_FLAG (persistence re-enabled)"
+        rm -f "${RO_FLAG}"
+    fi
+    # --no-block: partyos-home-pull.service has Before=partyos-home-sync.timer. At boot a
+    # blocking start waits for the whole boot pull. A slow pull then kills this unit at its
+    # TimeoutStartSec.
+    systemctl --no-block start partyos-home-sync.timer 2>/dev/null || true
+    say "PARTYOS-USB-SYNC-RESUMED timer restarted + ${PAUSE_FLAG} cleared"
+
+    # SYNCHRONOUS RESUME-PUSH only on a GENUINE reinsert (a removal set PAUSE at entry, so RAM
+    # may have diverged from the stick while it was OUT -> flush it now). On a normal boot of the
+    # box's OWN stick (was_paused=0: coldplug / poll-kick, no prior removal) we do NO re-push: the
+    # username matches, the boot pull already synced this same stick, and the 45s timer owns steady
+    # state. This is what clears the degraded boot - a full RAM -> slow-stick mirror must never run
+    # synchronously inside this oneshot's TimeoutStartSec at boot. Skipped too when we just pulled a
+    # newer same-user stick (resumed_pulled=1 -> pushing would clobber the newer home we just took).
+    if [ "${was_paused}" -eq 1 ] && [ "${resumed_pulled}" -eq 0 ] && mountpoint -q "${MNT}" && is_rw; then
+        /usr/local/bin/partyos-sync-home || say "PARTYOS-USB resume-sync rc=$?"
+    fi
+    /usr/local/bin/partyos-usb-notify reinserted "Home stick back - sync resumed."
+fi

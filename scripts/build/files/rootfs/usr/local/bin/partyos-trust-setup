@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# partyos-trust-setup - import the venue certificates from the shared exFAT
+# partition into the OS trust store and into the browser stores.
+#
+# Sources (next to internyet.env on the share, /mnt/share):
+#   ca.crt      the venue certificate authority ("partyOS event CA")
+#   client.p12  the player's client certificate, locked with
+#               INTERNYET_P12_PASSWORD from internyet.env
+#
+# Targets:
+#   OS        /etc/ca-certificates/trust-source/anchors + `update-ca-trust`.
+#             This is what WebKitGTK (Epiphany, the image browser) reads, through
+#             glib-networking and p11-kit. It also covers curl, git and python.
+#   Firefox   every profile under ~/.mozilla/firefox - certutil for the CA,
+#             pk12util for the client certificate.
+#   Chromium  the shared NSS database ~/.pki/nssdb - same two tools.
+#
+# CONTRACT: every step is IDEMPOTENT and NON-FATAL. A missing file, a missing
+# tool, a locked database or a wrong password logs one line and the script still
+# exits 0. Login and boot must never block on a certificate import.
+#
+# SECRET HANDLING: the p12 password is read into a variable and passed to
+# pk12util through a FILE descriptor, never on a command line and never in a log
+# line. Nothing in this script prints the value.
+#
+# Usage:
+#   partyos-trust-setup            system anchor + the calling user's browsers
+#   partyos-trust-setup --system   system anchor only (runs as root at boot)
+#   partyos-trust-setup --user     browser stores only (runs in the session)
+set -u
+
+MODE="${1:-all}"
+case "${MODE}" in
+    --system) MODE="system" ;;
+    --user)   MODE="user" ;;
+    ""|all)   MODE="all" ;;
+    *)        MODE="all" ;;
+esac
+
+log() { echo "[trust] $*"; }
+
+# shellcheck source=/dev/null
+. /usr/local/lib/partyos-internyet.sh
+
+ANCHOR_DIR="/etc/ca-certificates/trust-source/anchors"
+ANCHOR_NAME="partyos-internyet-ca.crt"
+STATE_DIR="/run/partyos-trust"
+
+ENV_FILE=""
+[ -r /run/partyos-internyet-env ] && ENV_FILE="$(cat /run/partyos-internyet-env 2>/dev/null || true)"
+[ -n "${ENV_FILE}" ] && [ -r "${ENV_FILE}" ] || ENV_FILE="$(internyet_env_file)"
+CERT_DIR=""
+[ -n "${ENV_FILE}" ] && CERT_DIR="$(internyet_dir "${ENV_FILE}")"
+# No env file: the certificates may still sit at the share root on their own.
+[ -n "${CERT_DIR}" ] || CERT_DIR="${PARTYOS_SHARE_MNT}"
+
+CA_CRT="${CERT_DIR}/ca.crt"
+P12="${CERT_DIR}/client.p12"
+CA_NICK="partyOS event CA"
+CLIENT_NICK="INTERNYET client"
+
+# --- 1. the OS trust anchor ---------------------------------------------------
+# Copy ca.crt into the anchor dir and rebuild the trust database. `update-ca-trust`
+# is the Arch/p11-kit entry point; on a system without it we fall back to
+# `update-ca-certificates`. Skipped when the anchor is already byte-identical, so
+# a re-run costs nothing.
+import_system_ca() {
+    [ -r "${CA_CRT}" ] || { log "no ca.crt at ${CA_CRT} - skipping the OS anchor"; return 0; }
+    [ "$(id -u)" = "0" ] || { log "not root - skipping the OS anchor"; return 0; }
+    install -d "${ANCHOR_DIR}" 2>/dev/null || true
+    if cmp -s "${CA_CRT}" "${ANCHOR_DIR}/${ANCHOR_NAME}" 2>/dev/null; then
+        log "OS anchor already current (${ANCHOR_NAME})"
+        return 0
+    fi
+    install -m 0644 "${CA_CRT}" "${ANCHOR_DIR}/${ANCHOR_NAME}" 2>/dev/null || {
+        log "WARN could not install the OS anchor"; return 0; }
+    if command -v update-ca-trust >/dev/null 2>&1; then
+        update-ca-trust extract >/dev/null 2>&1 \
+            && log "OS trust store updated (update-ca-trust)" \
+            || log "WARN update-ca-trust failed - the anchor file is in place"
+    elif command -v update-ca-certificates >/dev/null 2>&1; then
+        update-ca-certificates >/dev/null 2>&1 \
+            && log "OS trust store updated (update-ca-certificates)" \
+            || log "WARN update-ca-certificates failed"
+    else
+        log "WARN no trust-db update tool - the anchor file is in place"
+    fi
+    return 0
+}
+
+# --- 2. NSS databases (Firefox profiles + Chromium ~/.pki/nssdb) --------------
+# certutil/pk12util take either a legacy "dbm:" directory or the modern "sql:"
+# one. Firefox and Chromium both write sql:, so we address every database that
+# way. A database that does not exist yet is CREATED (empty password), which is
+# what a first-run Chromium expects.
+have_nss() { command -v certutil >/dev/null 2>&1 && command -v pk12util >/dev/null 2>&1; }
+
+nss_import_ca() {
+    local db="$1"
+    certutil -d "sql:${db}" -L -n "${CA_NICK}" >/dev/null 2>&1 && {
+        log "CA already in ${db}"; return 0; }
+    certutil -d "sql:${db}" -A -t "CT,C,C" -n "${CA_NICK}" -i "${CA_CRT}" >/dev/null 2>&1 \
+        && log "CA imported into ${db}" \
+        || log "WARN CA import into ${db} failed"
+    return 0
+}
+
+# nss_import_p12 DB - import client.p12. The password reaches pk12util through
+# -w <file>, a 0600 file in a private tmp dir that is removed immediately. It is
+# never an argv element (visible in /proc) and never logged.
+#
+# IDEMPOTENCY: pk12util names the imported certificate after the friendly name in
+# the p12 bag and IGNORES -n, so the nickname we ask for is not the nickname we
+# get. Checking for our own nickname therefore never matches, and every login
+# would import a duplicate. We key on the p12's own CONTENT instead: a marker
+# beside the database records the sha256 of the file we already imported. A
+# replaced p12 has a new sum, so it imports again.
+nss_import_p12() {
+    local db="$1" pwfile rc marker sum
+    marker="${db}/.partyos-p12-imported"
+    sum="$(sha256sum "${P12}" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "${sum}" ] && [ "$(cat "${marker}" 2>/dev/null)" = "${sum}" ]; then
+        log "client certificate already in ${db}"
+        return 0
+    fi
+    pwfile="$(mktemp "${TMPDIR:-/tmp}/.partyos-p12.XXXXXX")" || return 0
+    chmod 0600 "${pwfile}" 2>/dev/null || true
+    printf '%s' "${P12_PASSWORD}" > "${pwfile}"
+    pk12util -d "sql:${db}" -i "${P12}" -n "${CLIENT_NICK}" -w "${pwfile}" >/dev/null 2>&1
+    rc=$?
+    rm -f "${pwfile}" 2>/dev/null || true
+    if [ "${rc}" -eq 0 ]; then
+        [ -n "${sum}" ] && printf '%s' "${sum}" > "${marker}" 2>/dev/null || true
+        log "client certificate imported into ${db}"
+    else
+        # rc is reported, the password is NOT.
+        log "WARN client certificate import into ${db} failed (rc=${rc})"
+    fi
+    return 0
+}
+
+# nss_databases - print every NSS database directory for the current user.
+nss_databases() {
+    local d
+    # Chromium and every other NSS consumer share this one.
+    printf '%s\n' "${HOME}/.pki/nssdb"
+    # Firefox keeps one database per profile.
+    for d in "${HOME}"/.mozilla/firefox/*/; do
+        [ -d "${d}" ] || continue
+        case "${d}" in *"/Crash Reports/"*) continue ;; esac
+        printf '%s\n' "${d%/}"
+    done
+}
+
+import_user_stores() {
+    local db any=0
+    if [ ! -r "${CA_CRT}" ] && [ ! -r "${P12}" ]; then
+        log "no ca.crt or client.p12 at ${CERT_DIR} - nothing to import"
+        return 0
+    fi
+    if ! have_nss; then
+        log "certutil/pk12util absent - browser stores skipped (the OS anchor still covers WebKitGTK)"
+        return 0
+    fi
+    P12_PASSWORD=""
+    [ -n "${ENV_FILE}" ] && P12_PASSWORD="$(internyet_get INTERNYET_P12_PASSWORD "${ENV_FILE}" 2>/dev/null || true)"
+    while IFS= read -r db; do
+        [ -n "${db}" ] || continue
+        # Create the database when it is absent (Chromium's first run expects it).
+        if [ ! -e "${db}/cert9.db" ]; then
+            install -d -m 0700 "${db}" 2>/dev/null || continue
+            certutil -d "sql:${db}" -N --empty-password >/dev/null 2>&1 || true
+        fi
+        [ -e "${db}/cert9.db" ] || { log "no NSS db at ${db} - skipping"; continue; }
+        any=1
+        [ -r "${CA_CRT}" ] && nss_import_ca "${db}"
+        if [ -r "${P12}" ]; then
+            if [ -n "${P12_PASSWORD}" ]; then
+                nss_import_p12 "${db}"
+            else
+                log "no INTERNYET_P12_PASSWORD - skipping the client certificate for ${db}"
+            fi
+        fi
+    done <<EOF
+$(nss_databases)
+EOF
+    P12_PASSWORD=""
+    [ "${any}" -eq 1 ] || log "no NSS database to import into"
+    # Epiphany (WebKitGTK) is the browser this image ships. It has no NSS store of
+    # its own: it trusts the OS anchor through glib-networking, and it has no user
+    # interface for a client certificate. So the CA works for it already, and the
+    # PEM pair is left where a tool that wants it can read it (on the share).
+    log "Epiphany/WebKitGTK uses the OS anchor - no separate CA import needed"
+    return 0
+}
+
+case "${MODE}" in
+    system) import_system_ca ;;
+    user)   import_user_stores ;;
+    all)    import_system_ca; import_user_stores ;;
+esac
+
+# Record that this mode ran. /run/partyos-trust is root-owned, so the SESSION run
+# (--user) writes its marker under the user's own runtime dir instead - writing to
+# the root-owned one printed a "Permission denied" line on every login.
+if [ "$(id -u)" = "0" ]; then
+    install -d "${STATE_DIR}" 2>/dev/null || true
+    : > "${STATE_DIR}/${MODE}-done" 2>/dev/null || true
+else
+    USER_STATE="${XDG_RUNTIME_DIR:-${HOME}/.cache}/partyos-trust"
+    install -d "${USER_STATE}" 2>/dev/null || true
+    : > "${USER_STATE}/${MODE}-done" 2>/dev/null || true
+fi
+log "PARTYOS-TRUST-DONE mode=${MODE} certdir=${CERT_DIR}"
+exit 0

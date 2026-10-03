@@ -1,0 +1,19 @@
+#!/bin/bash
+# partyos-set-passwd [--clear]    (when setting: the crypt string is read from stdin)
+set -u
+PWF=/mnt/usbhome/.partyos-passwd
+log(){ echo "partyos-set-passwd: $*"; }
+# the person setting their own password (wizard runs as the desktop user via sudo -n)
+U="${SUDO_USER:-}"; [ -n "${U}" ] || U="$(id -un 1000 2>/dev/null || echo gamer)"
+if [ "${1:-}" = "--clear" ]; then
+    rm -f "${PWF}" 2>/dev/null || true
+    passwd -d "${U}" 2>/dev/null || true
+    log "password cleared for ${U}"; exit 0
+fi
+H="$(head -1 2>/dev/null | tr -d '[:space:]')"
+printf '%s' "${H}" | grep -qE '^\$(y|6|7|2[aby])\$' || { log "not a valid crypt hash - refusing"; exit 2; }
+[ -d /mnt/usbhome ] && mountpoint -q /mnt/usbhome 2>/dev/null || { log "USB home not mounted - cannot persist"; exit 3; }
+( umask 077; printf '%s\n' "${H}" > "${PWF}" ) && chmod 600 "${PWF}" 2>/dev/null
+usermod -p "${H}" "${U}" 2>/dev/null \
+  && log "password set for ${U} (live + persisted on USB)" \
+  || { log "usermod -p failed"; exit 1; }

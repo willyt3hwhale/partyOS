@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# partyos-seed-config <config_dir> <template> <out_relpath> [KEY=VALUE ...]
+# <template> and <out_relpath> can each be a space-separated list of the same
+# length. Then the seeder renders each template to the out path at the same
+# position, and writes the sentinel after all files are written.
+set -u
+
+CDIR="${1:-}"; TMPL="${2:-}"; OUT_REL="${3:-}"; shift 3 2>/dev/null || true
+[ -n "${CDIR}" ] && [ -n "${TMPL}" ] && [ -n "${OUT_REL}" ] || {
+    echo "usage: partyos-seed-config <config_dir> <template> <out_relpath> [K=V ...]" >&2; exit 2; }
+
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+
+# Resolve the config dir. A bare name (openttd, hexchat) lives under ~/.config; a
+# dotfile or a path (.xonotic, .local/share/ddnet, .config/openra) is HOME-relative
+# so games that don't use ~/.config can be seeded too. Backward compatible: existing
+# bare-name rows (openttd/hexchat/mumble) resolve exactly as before.
+case "${CDIR}" in
+    .*|*/*) CONF_DIR="${HOME}/${CDIR}";;
+    *)      CONF_DIR="${HOME}/.config/${CDIR}";;
+esac
+# FIRST-RUN GATE: the completion SENTINEL (.partyos-seeded) - written LAST, only after
+# a fully successful seed - is what marks "already configured". Gating on the config DIR
+# instead permanently POISONED the seed: a transient first-run failure that had already
+# created the dir (install -d, below) but never reached the sentinel write left the dir
+# present with no sentinel, so the dir-gate skipped the seed FOREVER on that USB home
+# (half-configured nick/IRC/game preconfig). Gating on the sentinel makes an interrupted
+# seed RE-RUN next launch instead; a genuinely completed seed is skipped as before.
+if [ -e "${CONF_DIR}/.partyos-seeded" ]; then
+    say "PARTYOS-SEED-SKIP ${CDIR} (already configured)"; exit 0
+fi
+
+# --- gather substitution values from sanitized /run + any cmdline overrides ---
+declare -A KV=()
+if [ -r /run/partyos-user.conf ]; then
+    while IFS='=' read -r k v; do
+        case "${k}" in [A-Za-z_]*) KV["${k}"]="${v}";; esac
+    done < /run/partyos-user.conf
+fi
+# fallbacks for the two convenience files (only if not already set)
+[ -n "${KV[NICK]:-}" ]     || KV[NICK]="$(tr -d '[:space:]' < /run/partyos-nick 2>/dev/null || true)"
+[ -n "${KV[NICK]:-}" ]     || KV[NICK]="$(tr -d '[:space:]' < /run/partyos-username 2>/dev/null || true)"
+[ -n "${KV[NICK]:-}" ]     || KV[NICK]="partygoer"
+[ -n "${KV[FULLNAME]:-}" ] || KV[FULLNAME]="$(cat /run/partyos-fullname 2>/dev/null || true)"
+[ -n "${KV[FULLNAME]:-}" ] || KV[FULLNAME]="${KV[NICK]}"
+# cmdline K=V overrides (caller-supplied, e.g. MUMBLE_SERVER_HOST/_PORT)
+for kv in "$@"; do
+    case "${kv}" in *=*) KV["${kv%%=*}"]="${kv#*=}";; esac
+done
+
+# --- split the template and out lists ----------------------------------------
+read -r -a TMPLS <<< "${TMPL}"
+read -r -a OUTS <<< "${OUT_REL}"
+if [ "${#TMPLS[@]}" -ne "${#OUTS[@]}" ]; then
+    say "PARTYOS-SEED-ERR ${CDIR}: ${#TMPLS[@]} templates but ${#OUTS[@]} out paths"; exit 1
+fi
+
+# --- fetch every template (URL or local path) --------------------------------
+# An https template URL is verified against the partyOS CA baked at
+# /etc/partyos/ca.pem; pin it only for https (curl ignores --cacert for http, so an
+# http template fetch is unchanged - transition-safe).
+# Fetch all templates before the first write. If one fetch fails, write nothing.
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/partyos-seed.XXXXXX")" || exit 1
+trap 'rm -rf "${TMPD}"' EXIT
+i=0
+for t in "${TMPLS[@]}"; do
+    SEED_CA=""
+    case "${t}" in https://*) [ -r /etc/partyos/ca.pem ] && SEED_CA="--cacert /etc/partyos/ca.pem";; esac
+    case "${t}" in
+      http://*|https://*) curl -fsS ${SEED_CA} --max-time 30 -o "${TMPD}/${i}" "${t}" 2>/dev/null || { say "PARTYOS-SEED-ERR fetch ${t}"; exit 1; } ;;
+      *) [ -r "${t}" ] && cp -- "${t}" "${TMPD}/${i}" || { say "PARTYOS-SEED-ERR no template ${t}"; exit 1; } ;;
+    esac
+    i=$((i+1))
+done
+
+# --- substitute every @KEY@ with its value (literal, sanitized values) --------
+# Build one sed program (no in-place edit, so it's portable + a single pass) and
+# stream the template through it. Values are pre-sanitized in /run; we still
+# escape sed's replacement metacharacters (/ & |) defensively.
+SEDPROG=""
+for k in "${!KV[@]}"; do
+    esc="$(printf '%s' "${KV[$k]}" | sed -e 's/[\/&|]/\\&/g')"
+    SEDPROG="${SEDPROG}s|@${k}@|${esc}|g;"
+done
+i=0
+while [ "${i}" -lt "${#TMPLS[@]}" ]; do
+    if [ -n "${SEDPROG}" ]; then
+        sed "${SEDPROG}" "${TMPD}/${i}" > "${TMPD}/${i}.r" 2>/dev/null || cp -- "${TMPD}/${i}" "${TMPD}/${i}.r"
+    else
+        cp -- "${TMPD}/${i}" "${TMPD}/${i}.r"
+    fi
+    i=$((i+1))
+done
+
+# --- atomic write into the user's config + sentinel --------------------------
+install -d "${CONF_DIR}" 2>/dev/null || { say "PARTYOS-SEED-ERR mkdir ${CONF_DIR}"; exit 1; }
+i=0
+while [ "${i}" -lt "${#OUTS[@]}" ]; do
+    DEST="${CONF_DIR}/${OUTS[$i]}"
+    install -d "$(dirname "${DEST}")" 2>/dev/null || true
+    if cp -- "${TMPD}/${i}.r" "${DEST}.tmp" 2>/dev/null && mv -f "${DEST}.tmp" "${DEST}" 2>/dev/null; then
+        say "PARTYOS-SEED-OK ${CDIR}/${OUTS[$i]} nick=${KV[NICK]}"
+    else
+        say "PARTYOS-SEED-ERR write ${DEST}"; exit 1
+    fi
+    i=$((i+1))
+done
+: > "${CONF_DIR}/.partyos-seeded" 2>/dev/null || true
+exit 0

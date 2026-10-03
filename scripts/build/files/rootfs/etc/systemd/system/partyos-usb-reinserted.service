@@ -1,0 +1,14 @@
+[Unit]
+Description=partyOS - handle home stick reinsertion (remount + resume sync)
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+# 120s: the reinsert handler does a bounded remount + at most ONE --delete-delay pull of a
+# foreign-newer stick home into RAM (the ram-tie backup was REMOVED, so nothing here can
+# time out from a backup any more). 120s covers a full mirror of a realistic home on a slow
+# (~4-5 MB/s) stick with headroom, matching partyos-home-pull's budget for the same op; a
+# genuinely-hung stick still aborts on rsync's own --timeout=20, and this unit is not
+# boot-critical (nothing Requires it). --delete-delay keeps even a timeout non-destructive.
+TimeoutStartSec=120s
+ExecStart=/usr/local/bin/partyos-usb-reinserted

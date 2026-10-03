@@ -1,0 +1,21 @@
+[Unit]
+Description=partyOS - resolve desktop account from USB .partyos and set autologin
+DefaultDependencies=no
+# No systemd-udev-settle dep (deprecated; on real HW it burns its full ~90-120s
+# timeout and stalls the boot). partyos-usbhome already waits for + mounts the home
+# via its own blkid -L retry loop, so the home is ready by the time we run.
+After=local-fs.target partyos-usbhome.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bounded start timeout - same class of bug as partyos-usbhome. This runs Before
+# display-manager and reads the USB `.partyos`; a slow/wedge-prone stick must not
+# block the desktop forever (Type=oneshot defaults to an INFINITE start timeout).
+# On timeout the unit fails and boot CONTINUES with the 'gamer' fallback identity.
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/partyos-identity-setup
+
+[Install]
+WantedBy=multi-user.target

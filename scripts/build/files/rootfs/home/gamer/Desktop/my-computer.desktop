@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=My Computer
+Icon=computer
+Exec=thunar
+Terminal=false
+Categories=System;partyOS;

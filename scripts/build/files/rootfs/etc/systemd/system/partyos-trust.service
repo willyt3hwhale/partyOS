@@ -1,0 +1,23 @@
+[Unit]
+Description=partyOS - import the venue CA into the OS trust store
+DefaultDependencies=no
+# Needs the exFAT share mounted (partyos-usbhome does that) and the env-file hint
+# that partyos-identity-setup publishes. Runs Before the display manager so the
+# anchor is in place before the first browser launch.
+After=local-fs.target partyos-usbhome.service partyos-identity.service
+Wants=partyos-identity.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bounded: a slow or wedged stick must never hold the desktop. The import is
+# best-effort, so a timeout here costs trust, not the boot.
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/partyos-trust-setup --system
+# NON-FATAL by contract: the script already exits 0 on every error path, and this
+# makes a kill on timeout harmless too.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

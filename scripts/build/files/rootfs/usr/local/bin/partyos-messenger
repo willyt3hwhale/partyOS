@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Launch NYET Messenger (HexChat) - RUNTIME exec only. Installing HexChat from the
+# LAN mirror + the zenity progress dialog now live in partyos-launch (the
+# messenger catalog row is source=pkg -> hexchat). Config seeding is owned by
+# partyos-messenger-config (the HexChat-specific seeder: it does the
+# host:port -> host/port S= normalization + gui_slist_skip that the generic
+# seeder can't), called here first-run-only and idempotent.
+/usr/local/bin/partyos-messenger-config 2>/dev/null || true
+exec hexchat "$@"

@@ -1,0 +1,40 @@
+[Unit]
+# partyOS party servers: the PXE/netboot listener, every blob listener, the
+# BitTorrent tracker and the persistent seeder. One unit, because
+# run-servers.sh starts and supervises the whole set from deploy.conf.
+#
+# The unit replaces "start it in an SSH session". A dropped session, a logout
+# or a crash no longer stops the party servers.
+#
+# Install it with scripts/deploy/install-server-service.sh. The placeholders
+# below are filled in there.
+Description=partyOS party servers (PXE, blob, tracker, seeder)
+Documentation=file://{{REPO}}/docs/HOSTING.md
+After=network-online.target
+Wants=network-online.target
+# network-online.target does not wait for the party address. If the party
+# interface has no link at boot, the party address is missing and
+# run-servers.sh exits with "nothing to start".
+# Disable the start limit. Then Restart=always retries every RestartSec until
+# the address is there. A start limit stops the retries after a burst and leaves
+# the unit failed, also after the link comes up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{USER}}
+WorkingDirectory={{REPO}}
+ExecStart=/bin/bash {{REPO}}/scripts/deploy/run-servers.sh {{REPO}}/deploy.conf
+# Always come back. A crashed listener must not end the party.
+Restart=always
+RestartSec=5
+# run-servers.sh starts child processes. Stop the whole group, not only the
+# shell, so no listener keeps a port.
+KillMode=control-group
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

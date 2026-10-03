@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Regenerate the app-store icons from the LAN catalog. At boot the server can be
+# unreachable, so retry for up to ~5 min (150 x 2s).
+for _i in $(seq 1 150); do
+  /usr/local/bin/partyos-app gen-launchers >/dev/null 2>&1 && exit 0
+  sleep 2
+done
+exit 0

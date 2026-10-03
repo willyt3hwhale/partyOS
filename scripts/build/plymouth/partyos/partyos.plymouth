@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=partyOS
+Description=partyOS boot splash - logo, live boot status, by LilWil
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/partyos
+ScriptFile=/usr/share/plymouth/themes/partyos/partyos.script

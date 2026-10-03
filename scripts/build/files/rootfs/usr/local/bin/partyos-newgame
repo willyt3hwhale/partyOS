@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# partyos-newgame - zenity wizard for "New Windows Game (Proton env)". GUI only.
+set -u
+
+ENG=/usr/local/bin/partyos-proton-env
+TITLE="partyOS - New Windows Game"
+
+# env root, resolved the SAME way the engine does (for the Choose-a-program start dir).
+APP_USER="gamer"
+[ -r /run/partyos-username ] && APP_USER="$(tr -d '[:space:]' < /run/partyos-username)"
+[ -n "${APP_USER}" ] || APP_USER="gamer"
+id "${APP_USER}" >/dev/null 2>&1 || APP_USER="gamer"
+ENVROOT="/mnt/usbhome/.partyos-proton-envs"
+
+# zenity reads --text as Pango markup. If the markup is not valid, zenity shows its
+# default text. Escape &, < and > in all text that can contain them.
+markup() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+err()  { zenity --error --width=470 --title="${TITLE}" --text="$(markup "$1")" >/dev/null 2>&1 || true; }
+info() { zenity --info  --width=470 --title="${TITLE}" --text="$(markup "$1")" >/dev/null 2>&1 || true; }
+
+# slugify TEXT -> a valid engine env name (lowercase [a-z0-9_-], collapsed dashes).
+slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' \
+        | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+# pull the first "PARTYOS-PENV ERROR ..." line out of a log, fall back to its tail.
+engine_msg() {
+    local f="$1" m
+    m="$(grep -m1 'PARTYOS-PENV ERROR' "${f}" 2>/dev/null | sed 's/^PARTYOS-PENV ERROR //')"
+    [ -n "${m}" ] || m="$(tail -3 "${f}" 2>/dev/null)"
+    printf '%s' "${m}"
+}
+
+# run a SHORT engine op (set-exe / remove) and pop its error on failure. The exit code is
+# meaningful for these (no long-running wine window). run_engine label <engine args...>
+run_engine() {
+    local label="$1"; shift
+    local ef; ef="$(mktemp /tmp/partyos-newgame.XXXXXX 2>/dev/null)" || ef="/tmp/partyos-newgame.$$.e"
+    if "${ENG}" "$@" 2>"${ef}"; then rm -f "${ef}" 2>/dev/null || true; return 0; fi
+    local m; m="$(engine_msg "${ef}")"; [ -n "${m}" ] || m="${label} failed."
+    rm -f "${ef}" 2>/dev/null || true
+    err "${m}"; return 1
+}
+
+# run a WINE op (run-exe installer / play). These block on a wine window and a game can
+# exit non-zero on a normal quit, so DON'T treat the exit code as failure - only pop an
+# error if the engine itself reported a PARTYOS-PENV ERROR (env/runtime precondition).
+run_wine() {
+    local ef; ef="$(mktemp /tmp/partyos-newgame.XXXXXX 2>/dev/null)" || ef="/tmp/partyos-newgame.$$.w"
+    "${ENG}" "$@" 2>"${ef}" || true
+    if grep -q 'PARTYOS-PENV ERROR' "${ef}" 2>/dev/null; then
+        local m; m="$(engine_msg "${ef}")"; rm -f "${ef}" 2>/dev/null || true
+        err "${m}"; return 1
+    fi
+    rm -f "${ef}" 2>/dev/null || true
+    return 0
+}
+
+# pick_env [need_exe] -> echo the chosen env NAME on stdout, or return 1 (cancel/none).
+# need_exe=1 lists only envs that already have a game program chosen (playable).
+pick_env() {
+    local need_exe="${1:-0}" rows=() name title state
+    while IFS=$'\t' read -r name title state; do
+        [ -n "${name}" ] || continue
+        [ "${need_exe}" = "1" ] && [ "${state}" != "ready" ] && continue
+        rows+=( "${name}" "${title}" "${state}" )
+    done < <("${ENG}" list 2>/dev/null)
+    if [ "${#rows[@]}" -eq 0 ]; then
+        if [ "${need_exe}" = "1" ]; then
+            info "No games are ready to play yet.\n\nCreate an env, run its installer, then choose its program first."
+        else
+            info "You have no game envs yet.\n\nPick \"Create a new game env\" first."
+        fi
+        return 1
+    fi
+    local sel
+    sel="$(zenity --list --width=540 --height=380 --title="${TITLE}" \
+        --text="Pick a game env:" \
+        --column="Env" --column="Game" --column="Status" \
+        "${rows[@]}" 2>/dev/null)" || return 1
+    [ -n "${sel}" ] || return 1
+    printf '%s' "${sel}"
+}
+
+do_create() {
+    local typed slug rc
+    typed="$(zenity --entry --width=480 --title="${TITLE}" \
+        --text="Name this game (for example: Age of Empires):" 2>/dev/null)" || return 0
+    [ -n "${typed}" ] || { err "Please enter a name."; return 0; }
+    slug="$(slugify "${typed}")"
+    [ -n "${slug}" ] || { err "That name has no usable letters or digits - try another."; return 0; }
+    # The prefix clone is slow on a USB stick - feed a pulsating progress dialog from the
+    # engine call so it auto-closes when create finishes.
+    local log="/tmp/partyos-newgame.$$.create.log" rcf="/tmp/partyos-newgame.$$.create.rc"
+    ( "${ENG}" create "${slug}" "${typed}" >"${log}" 2>&1; echo $? >"${rcf}" ) &
+    local worker=$!
+    ( echo "# Preparing your Windows game env..."
+      while kill -0 "${worker}" 2>/dev/null; do echo "# Copying the wine environment (this can take a minute)..."; sleep 1; done ) | \
+        zenity --progress --pulsate --auto-close --no-cancel --width=480 \
+            --title="${TITLE}" --text="Preparing your Windows game env..." >/dev/null 2>&1 || true
+    wait "${worker}" 2>/dev/null || true
+    rc="$(cat "${rcf}" 2>/dev/null || echo 1)"
+    if [ "${rc}" != "0" ]; then
+        local m; m="$(engine_msg "${log}")"
+        rm -f "${log}" "${rcf}" 2>/dev/null || true
+        err "Could not create the env.\n\n${m}"
+        return 0
+    fi
+    rm -f "${log}" "${rcf}" 2>/dev/null || true
+    # branch on how the game is packaged: an installer (the existing path) or a ready-to-run
+    # portable game (a folder or a single .exe - the new path).
+    local pkg
+    pkg="$(zenity --list --radiolist --width=560 --height=340 --title="${TITLE}" \
+        --text="$(markup "Env \"${typed}\" is ready.\n\nHow is your game packaged?")" \
+        --column="" --column="Packaging" \
+        TRUE  "I have an installer (setup.exe / .msi)" \
+        FALSE "It is ready to run (a folder or a single .exe)" 2>/dev/null)" || return 0
+    case "${pkg}" in
+        "I have an installer (setup.exe / .msi)")         do_installer "${slug}";;
+        "It is ready to run (a folder or a single .exe)") do_portable  "${slug}";;
+        *) : ;;
+    esac
+}
+
+do_installer() {
+    local slug="${1:-}" f
+    [ -n "${slug}" ] || { slug="$(pick_env 0)" || return 0; }
+    f="$(zenity --file-selection --title="${TITLE} - pick the installer" \
+        --filename="/mnt/usbhome/" \
+        --file-filter='Windows installer (exe, msi) | *.exe *.EXE *.msi *.MSI' \
+        --file-filter='All files | *' 2>/dev/null)" || return 0
+    [ -n "${f}" ] || return 0
+    run_wine run-exe "${slug}" "${f}" || return 0
+    info "When the installer has finished, choose the game's program next (the .exe it installed)."
+}
+
+do_choose() {
+    local slug="${1:-}" start f
+    [ -n "${slug}" ] || { slug="$(pick_env 0)" || return 0; }
+    start="${ENVROOT}/${slug}/prefix/drive_c/"
+    [ -d "${start}" ] || start="${ENVROOT}/${slug}/prefix/"
+    f="$(zenity --file-selection --title="${TITLE} - choose the game's program" \
+        --filename="${start}" \
+        --file-filter='Programs (exe) | *.exe *.EXE' \
+        --file-filter='All files | *' 2>/dev/null)" || return 0
+    [ -n "${f}" ] || return 0
+    run_engine "Choosing the program" set-exe "${slug}" "${f}" || return 0
+    "${ENG}" gen-tiles >/dev/null 2>&1 || true
+    if zenity --question --width=470 --title="${TITLE}" \
+        --text="$(markup "Saved. A play tile was added to Apps & Games.\n\nPlay now?")" 2>/dev/null; then
+        run_wine play "${slug}"
+    fi
+}
+
+# import_into SLUG SRC -> echo the imported path (under the env) on stdout, or return 1.
+# Wraps the engine `import` with a pulsating progress dialog (the copy is slow on USB) and
+# pops a zenity error on failure.
+import_into() {
+    local slug="$1" src="$2"
+    local out="/tmp/partyos-newgame.$$.imp.out" log="/tmp/partyos-newgame.$$.imp.log" rcf="/tmp/partyos-newgame.$$.imp.rc"
+    ( "${ENG}" import "${slug}" "${src}" >"${out}" 2>"${log}"; echo $? >"${rcf}" ) &
+    local worker=$!
+    ( echo "# Copying your game into the env..."
+      while kill -0 "${worker}" 2>/dev/null; do echo "# Copying files (this can take a moment on USB)..."; sleep 1; done ) | \
+        zenity --progress --pulsate --auto-close --no-cancel --width=480 \
+            --title="${TITLE}" --text="Copying your game into the env..." >/dev/null 2>&1 || true
+    wait "${worker}" 2>/dev/null || true
+    local rc; rc="$(cat "${rcf}" 2>/dev/null || echo 1)"
+    if [ "${rc}" != "0" ]; then
+        local m; m="$(engine_msg "${log}")"
+        rm -f "${out}" "${log}" "${rcf}" 2>/dev/null || true
+        err "Could not copy your game into the env.\n\n${m}"
+        return 1
+    fi
+    local p; p="$(tail -1 "${out}" 2>/dev/null)"
+    rm -f "${out}" "${log}" "${rcf}" 2>/dev/null || true
+    [ -n "${p}" ] || { err "Importing your game did not return a location."; return 1; }
+    printf '%s' "${p}"
+}
+
+# do_portable [SLUG] - the READY-TO-RUN path: import a portable game (a single .exe or a
+# folder) INTO the env, choose its program, set it (CWD = its folder), then play.
+do_portable() {
+    local slug="${1:-}" kind src imported exe
+    [ -n "${slug}" ] || { slug="$(pick_env 0)" || return 0; }
+    kind="$(zenity --list --radiolist --width=560 --height=320 --title="${TITLE}" \
+        --text="Where is your ready-to-run game?" \
+        --column="" --column="Type" \
+        TRUE  "A single program (.exe)" \
+        FALSE "A folder containing the game" 2>/dev/null)" || return 0
+    case "${kind}" in
+        "A single program (.exe)")
+            src="$(zenity --file-selection --title="${TITLE} - pick the game .exe" \
+                --filename="/mnt/usbhome/" \
+                --file-filter='Programs (exe) | *.exe *.EXE' \
+                --file-filter='All files | *' 2>/dev/null)" || return 0
+            [ -n "${src}" ] || return 0
+            imported="$(import_into "${slug}" "${src}")" || return 0
+            exe="${imported}"
+            ;;
+        "A folder containing the game")
+            src="$(zenity --file-selection --directory --title="${TITLE} - pick the game folder" \
+                --filename="/mnt/usbhome/" 2>/dev/null)" || return 0
+            [ -n "${src}" ] || return 0
+            imported="$(import_into "${slug}" "${src}")" || return 0
+            exe="$(zenity --file-selection --title="${TITLE} - choose the game's program" \
+                --filename="${imported}/" \
+                --file-filter='Programs (exe) | *.exe *.EXE' \
+                --file-filter='All files | *' 2>/dev/null)" || return 0
+            [ -n "${exe}" ] || return 0
+            ;;
+        *) return 0 ;;
+    esac
+    run_engine "Choosing the program" set-exe "${slug}" "${exe}" || return 0
+    "${ENG}" gen-tiles >/dev/null 2>&1 || true
+    if zenity --question --width=470 --title="${TITLE}" \
+        --text="$(markup "Saved. A play tile was added to Apps & Games.\n\nPlay now?")" 2>/dev/null; then
+        run_wine play "${slug}"
+    fi
+}
+
+do_play() {
+    local slug; slug="$(pick_env 1)" || return 0
+    run_wine play "${slug}"
+}
+
+do_manage() {
+    local slug; slug="$(pick_env 0)" || return 0
+    if zenity --question --width=480 --title="${TITLE}" \
+        --text="$(markup "Remove the env \"${slug}\"?\n\nThis deletes its installed game and saves from your USB stick. This cannot be undone.")" 2>/dev/null; then
+        run_engine "Removing" remove "${slug}" || return 0
+        "${ENG}" gen-tiles >/dev/null 2>&1 || true
+        info "Removed \"${slug}\"."
+    fi
+}
+
+while :; do
+    choice="$(zenity --list --radiolist --width=580 --height=440 --title="${TITLE}" \
+        --text="Install and play a Windows game on partyOS.\n\nWhat would you like to do?" \
+        --column="" --column="Action" \
+        TRUE  "Create a new game env" \
+        FALSE "Run an installer / program in an env" \
+        FALSE "Choose a game's program (.exe)" \
+        FALSE "Add a ready-to-run game (folder or .exe)" \
+        FALSE "Play a game" \
+        FALSE "Manage envs (list / remove)" 2>/dev/null)" || exit 0
+    case "${choice}" in
+        "Create a new game env")                    do_create;;
+        "Run an installer / program in an env")     do_installer;;
+        "Choose a game's program (.exe)")           do_choose;;
+        "Add a ready-to-run game (folder or .exe)") do_portable;;
+        "Play a game")                              do_play;;
+        "Manage envs (list / remove)")              do_manage;;
+        "") exit 0;;
+    esac
+done

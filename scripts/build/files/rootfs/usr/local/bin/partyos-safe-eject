@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# partyos-safe-eject - the player chose "eject my stick before leaving".
+# Run a FINAL push, pause sync so no timer tick touches the gone mount, then release
+# EVERYTHING that pins the stick (game seeders + game overlays whose squashfs lower is a
+# loop mount of a cached blob ON the stick), lazily unmount the home + share, and only
+# then notify "safe to remove".
+#
+# The original eject only flushed + unmounted the home/share. But the USB blob cache
+# (/mnt/usbhome/.partyos-cache/games/*.squashfs) is held open by (a) running aria2c
+# seeders and (b) the live squashfs loop mounts under /run/partyos-games. Pulling the
+# stick with those still up corrupts/wedges it, so "safe to remove" was misleading. We
+# now stop the seeders + drop the game overlays first (steps mirrored from
+# partyos-shutdown-teardown, MINUS its sysrq force-reboot arm - we are NOT shutting down).
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+. /usr/local/lib/partyos-sync-common.sh
+
+GAMES_BASE=/run/partyos-games
+
+say "PARTYOS-SAFE-EJECT preparing eject (barrier against in-flight push)"
+# (A) IN-FLIGHT PUSH BARRIER: stopping the timer
+# does NOT stop a partyos-sync-home instance the timer ALREADY started - it can still be
+# mid-rsync to the stick. Stop the timer AND any running service instance, then wait
+# (bounded) for every push process + rsync-to-stick to EXIT, so our final flush and the
+# unmount below never race a live writer. A SIGTERMed push leaves the on-stick
+# .partyos-home-pushing marker; our own final flush (B) re-pushes + clears it, (B') re-checks.
+systemctl stop partyos-home-sync.timer 2>/dev/null || true
+systemctl stop partyos-home-sync.service 2>/dev/null || true
+for _ in $(seq 1 30); do
+    pgrep -f /usr/local/bin/partyos-sync-home >/dev/null 2>&1 && { sleep 1; continue; }
+    pgrep -f "rsync.* ${USB_HOME}/"           >/dev/null 2>&1 && { sleep 1; continue; }
+    break
+done
+pgrep -f "rsync.* ${USB_HOME}/" >/dev/null 2>&1 \
+    && say "PARTYOS-SAFE-EJECT WARN a push rsync did not drain in time; continuing to final flush"
+
+# (B) FINAL FLUSH, now that no other push runs. Runs BEFORE the pause flag is set (the helper
+# no-ops if PAUSE_FLAG exists); honors the pull-done gate + sane-source guard inside it.
+say "PARTYOS-SAFE-EJECT final sync before eject"
+/usr/local/bin/partyos-sync-home || say "PARTYOS-SAFE-EJECT final sync rc=$?"
+sync
+
+# (B') FULLY-SYNCED GATE: the push drops .partyos-home-pushing before its rsync and clears it
+# only on a COMPLETED (rc 0/24) push. If it is STILL present the final push did NOT finish
+# (stall / ENOSPC / I-O error) - the stick is a partial mirror. Do NOT unmount or claim safe:
+# leave everything mounted and tell the player to retry.
+if [ -e "${PUSH_INPROGRESS}" ]; then
+    say "PARTYOS-SAFE-EJECT final sync did NOT complete (.partyos-home-pushing still set); NOT ejecting"
+    /usr/local/bin/partyos-usb-notify eject "Sync didn't finish - your stick is NOT safe to remove yet. Wait a few seconds and click Eject again."
+    exit 0
+fi
+
+# (C) Pause so no timer tick touches the gone mount (the timer is already stopped above).
+: > "${PAUSE_FLAG}"
+
+# --- release the stick's game holds ------------------------------------------
+# 1. Stop the one client aria2c (graceful), then hard-kill any aria2 still holding a
+#    cached blob open. wine/bwrap are killed too so a running game can't keep its blob's
+#    overlay busy. SIGTERM, brief bounded grace, then SIGKILL - never wait on a wedge.
+systemctl stop partyos-seeder.service 2>/dev/null || true
+PATS='aria2c|wineserver|[w]ine|bwrap'
+if pgrep -f "${PATS}" >/dev/null 2>&1; then
+    say "PARTYOS-SAFE-EJECT TERM game/seed procs ($(pgrep -f "${PATS}" | tr '\n' ' '))"
+    pkill -TERM -f "${PATS}" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        pgrep -f "${PATS}" >/dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -f "${PATS}" >/dev/null 2>&1; then
+        say "PARTYOS-SAFE-EJECT KILL surviving procs ($(pgrep -f "${PATS}" | tr '\n' ' '))"
+        pkill -KILL -f "${PATS}" 2>/dev/null || true
+    fi
+fi
+# 2. Lazily unmount the game overlays so the USB blob cache is no longer pinned. The
+#    overlay DESTS (lowerdir under /run/partyos-games) sit in the user home; drop them
+#    first, then the squashfs lowerdirs + .rw scratch under /run/partyos-games (deepest
+#    first). `umount -l` detaches even if something still references it, so it can't block.
+for mp in $(awk -v b="${GAMES_BASE}" '$4 ~ ("lowerdir="b) {print $2}' /proc/self/mounts 2>/dev/null | sort -r); do
+    say "PARTYOS-SAFE-EJECT umount -l overlay ${mp}"
+    umount -l "${mp}" 2>/dev/null || true
+done
+if [ -d "${GAMES_BASE}" ]; then
+    for mp in $(awk -v b="${GAMES_BASE}" '$2 ~ "^"b {print $2}' /proc/self/mounts 2>/dev/null | sort -r); do
+        say "PARTYOS-SAFE-EJECT umount -l ${mp}"
+        umount -l "${mp}" 2>/dev/null || true
+    done
+fi
+sync
+
+# (D) OPEN-WRITERS GATE: a player copying a big file
+# into ~/Shared (the exFAT stick share) or the home with the file manager still holds the
+# mount open. The umount -l below is LAZY, so a surviving writer keeps writing into the now-
+# detached fs - truncating their file and dirtying the journal-less exFAT for their other OS.
+# The game/blob writers were already killed above; check for any OTHER writer on the home or
+# share (pure /proc, excludes our own PID) and REFUSE if found - don't yank, tell them to
+# close their files and retry (the same "wait a few seconds" advisory path).
+writers=""
+for _m in "${MNT}" "${SHARE}"; do
+    mountpoint -q "${_m}" 2>/dev/null || continue
+    w="$(mount_writers "${_m}" "$$")"
+    [ -n "${w}" ] && writers="${writers} ${w}"
+done
+if [ -n "${writers// /}" ]; then
+    say "PARTYOS-SAFE-EJECT open writers on home/share (pids:${writers} ); refusing to yank"
+    /usr/local/bin/partyos-usb-notify eject "Files are still open on your stick - close them (file manager, editors), wait a few seconds, then click Eject again."
+    exit 0
+fi
+
+umount -l "${MNT}" 2>/dev/null || true
+# Flush + cleanly unmount the exFAT share, then fsck.exfat it (best-effort, bounded)
+# while the device is still present - this is the graceful path, so the FAT gets checked
+# before the player walks off with the stick. Never blocks: a missing exfatprogs or a
+# non-zero fsck just logs.
+share_unmount_clean "${SHARE}"
+say "PARTYOS-SAFE-EJECT unmounted ${MNT} + ${SHARE}"
+# If a blob loop mount or seeder somehow SURVIVED (a wedged D-state read), the stick is
+# NOT actually free - warn rather than falsely claim safe.
+if pgrep -f 'aria2c' >/dev/null 2>&1 || mountpoint -q "${GAMES_BASE}" 2>/dev/null; then
+    say "PARTYOS-SAFE-EJECT WARN seeder/overlay still active - stick may still be busy"
+    /usr/local/bin/partyos-usb-notify eject "Sync done, but a game is still shutting down. Wait a few seconds before removing your stick."
+    exit 0
+fi
+/usr/local/bin/partyos-usb-notify eject "Sync complete - safe to remove your stick now."
+exit 0

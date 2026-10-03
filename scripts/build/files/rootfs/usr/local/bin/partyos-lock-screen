@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+# partyos-lock-screen <unix_username> [<display_nick>]
+# Win95 "Welcome to Windows" logon locker. Real PAM auth, hardened grab, no escape.
+import sys, os, time, ctypes, ctypes.util, pwd
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GObject, GLib
+
+PAM_SERVICE = "partyos-lock"
+PAM_SUCCESS = 0
+
+# ---- resolve the auth target (unix login) + the friendly display nick --------
+# The username we AUTHENTICATE is the resolved unix login (argv, then
+# /run/partyos-username, then geteuid->getpwuid). The on-screen User name is the friendly
+# nick and is COSMETIC + read-only - it is never used for authentication.
+def resolve_user():
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        return sys.argv[1].strip()
+    try:
+        with open("/run/partyos-username") as f:
+            u = f.read().strip()
+            if u:
+                return u
+    except OSError:
+        pass
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return "partygoer"
+
+AUTH_USER = resolve_user()
+if len(sys.argv) > 2 and sys.argv[2].strip():
+    DISPLAY_NICK = sys.argv[2].strip()
+else:
+    try:
+        with open("/run/partyos-nick") as f:
+            DISPLAY_NICK = f.read().strip() or AUTH_USER
+    except OSError:
+        DISPLAY_NICK = AUTH_USER
+
+# ---- ctypes -> libpam (no python-pam, no custom crypto) -----------------------
+# Minimal conversation: feed the typed password to every PAM_PROMPT_ECHO_OFF prompt.
+# Require BOTH pam_authenticate AND pam_acct_mgmt == PAM_SUCCESS. Treat ANYTHING else as
+# DENY (fail closed). pam_unix's setuid helper (unix_chkpwd) does the privileged shadow
+# read, so this app stays unprivileged (NOT setuid).
+PAM_PROMPT_ECHO_OFF = 1
+
+class PamMessage(ctypes.Structure):
+    _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
+
+class PamResponse(ctypes.Structure):
+    _fields_ = [("resp", ctypes.c_char_p), ("resp_retcode", ctypes.c_int)]
+
+CONV_FUNC = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.POINTER(PamMessage)),
+    ctypes.POINTER(ctypes.POINTER(PamResponse)),
+    ctypes.c_void_p)
+
+class PamConv(ctypes.Structure):
+    _fields_ = [("conv", CONV_FUNC), ("appdata_ptr", ctypes.c_void_p)]
+
+_libpam_name = ctypes.util.find_library("pam") or "libpam.so.0"
+libpam = ctypes.CDLL(_libpam_name)
+libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+
+# calloc returns a 64-bit heap pointer. Without an explicit restype ctypes assumes
+# c_int and TRUNCATES the pointer to 32 bits; on Arch's PIE python the heap sits far
+# above 4GB, so the PAM conversation would then write the password response through a
+# garbage (truncated) pointer and segfault on EVERY unlock. Declare calloc's real
+# signature - the same argtypes/restype care the libpam bindings below already get.
+libc.calloc.restype = ctypes.c_void_p
+libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+
+libpam.pam_start.restype = ctypes.c_int
+libpam.pam_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                             ctypes.POINTER(PamConv), ctypes.POINTER(ctypes.c_void_p)]
+libpam.pam_authenticate.restype = ctypes.c_int
+libpam.pam_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_int]
+libpam.pam_acct_mgmt.restype = ctypes.c_int
+libpam.pam_acct_mgmt.argtypes = [ctypes.c_void_p, ctypes.c_int]
+libpam.pam_end.restype = ctypes.c_int
+libpam.pam_end.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+def pam_authenticate(username, password):
+    # Belt-and-braces: reject an empty password BEFORE PAM. No nullok path is ever taken.
+    if not password:
+        return False
+
+    def _conv(n_msg, msgs, resp_ptr, appdata):
+        # Allocate the response array PAM expects (it frees it with free()).
+        arr = ctypes.cast(libc.calloc(n_msg, ctypes.sizeof(PamResponse)),
+                          ctypes.POINTER(PamResponse))
+        for i in range(n_msg):
+            if msgs[i].contents.msg_style == PAM_PROMPT_ECHO_OFF:
+                pw = password.encode("utf-8")
+                buf = libc.calloc(len(pw) + 1, 1)
+                ctypes.memmove(buf, pw, len(pw))
+                arr[i].resp = ctypes.cast(buf, ctypes.c_char_p)
+            arr[i].resp_retcode = 0
+        resp_ptr[0] = arr
+        return 0
+
+    conv = PamConv(CONV_FUNC(_conv), None)
+    handle = ctypes.c_void_p()
+    rc = libpam.pam_start(PAM_SERVICE.encode(), username.encode(),
+                          ctypes.byref(conv), ctypes.byref(handle))
+    if rc != PAM_SUCCESS:
+        return False
+    try:
+        if libpam.pam_authenticate(handle, 0) != PAM_SUCCESS:
+            return False
+        if libpam.pam_acct_mgmt(handle, 0) != PAM_SUCCESS:
+            return False
+        return True
+    finally:
+        libpam.pam_end(handle, rc)
+
+# ---- cairo-drawn gold key over a colorful card (the reference icon) -----------
+def draw_key(area, cr):
+    import math
+    TAU = 2 * math.pi
+    # --- colorful card behind the key (top-left), a small upright rounded rect with a
+    # rainbow stripe across it - the classic "credential / network card" the Win95 logon
+    # key is laid over. Drawn first so the gold key sits on top.
+    cr.save()
+    cx, cy, cw, ch, r = 3.0, 4.0, 22.0, 17.0, 2.5
+    def rrect(x, y, w, h, rad):
+        cr.new_sub_path()
+        cr.arc(x + w - rad, y + rad,     rad, -math.pi / 2, 0)
+        cr.arc(x + w - rad, y + h - rad, rad, 0, math.pi / 2)
+        cr.arc(x + rad,     y + h - rad, rad, math.pi / 2, math.pi)
+        cr.arc(x + rad,     y + rad,     rad, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+    # card body (white) + dark edge
+    rrect(cx, cy, cw, ch, r)
+    cr.set_source_rgb(0.95, 0.95, 0.95); cr.fill_preserve()
+    cr.set_line_width(1.0); cr.set_source_rgb(0.0, 0.0, 0.0); cr.stroke()
+    # rainbow stripe band across the upper third of the card (clipped to the card)
+    rrect(cx, cy, cw, ch, r); cr.clip()
+    bands = ((0.20, 0.40, 0.95), (0.15, 0.70, 0.30),
+             (0.95, 0.80, 0.15), (0.85, 0.20, 0.20))
+    bh = 3.0
+    for i, col in enumerate(bands):
+        cr.rectangle(cx, cy + 2 + i * bh, cw, bh)
+        cr.set_source_rgb(*col); cr.fill()
+    cr.reset_clip()
+    cr.restore()
+
+    # --- gold key laid diagonally over the card: round bow (upper-left) with a hole,
+    # a straight shaft running down to the lower-right, and two teeth near the tip.
+    gold   = (0.92, 0.78, 0.16)
+    goldhi = (1.00, 0.92, 0.45)
+    edge   = (0.45, 0.34, 0.00)
+    cr.save()
+    bx, by, br = 14.0, 16.0, 7.5          # bow centre + radius
+    tx, ty     = 41.0, 41.0               # shaft tip (lower-right)
+    # shaft: a thick gold stroke from just outside the bow to the tip, dark outline first.
+    ux, uy = (tx - bx), (ty - by)
+    ul = math.hypot(ux, uy); ux, uy = ux / ul, uy / ul
+    sx, sy = bx + ux * (br - 1), by + uy * (br - 1)
+    cr.set_line_cap(1)  # ROUND
+    cr.set_line_width(6.5); cr.set_source_rgb(*edge)
+    cr.move_to(sx, sy); cr.line_to(tx, ty); cr.stroke()
+    cr.set_line_width(4.5); cr.set_source_rgb(*gold)
+    cr.move_to(sx, sy); cr.line_to(tx, ty); cr.stroke()
+    cr.set_line_width(1.4); cr.set_source_rgb(*goldhi)
+    cr.move_to(sx - uy, sy + ux); cr.line_to(tx - uy, ty + ux); cr.stroke()
+    # two teeth: short gold stubs sticking out perpendicular near the tip.
+    px, py = -uy, ux   # perpendicular (points "down-left")
+    cr.set_line_width(3.0); cr.set_source_rgb(*gold)
+    for back in (3.0, 8.0):
+        ex, ey = tx - ux * back, ty - uy * back
+        cr.move_to(ex, ey); cr.line_to(ex + px * 6.0, ey + py * 6.0); cr.stroke()
+    # bow (round head) with a hole, drawn last so it sits cleanly over the shaft root.
+    cr.set_line_width(1.4)
+    cr.arc(bx, by, br, 0, TAU)
+    cr.set_source_rgb(*gold); cr.fill_preserve()
+    cr.set_source_rgb(*edge); cr.stroke()
+    cr.arc(bx - 1.5, by - 1.5, 2.0, 0, TAU)   # subtle highlight
+    cr.set_source_rgb(*goldhi); cr.fill()
+    cr.arc(bx, by, 3.0, 0, TAU)               # the hole
+    cr.set_source_rgb(0.55, 0.45, 0.12); cr.fill_preserve()
+    cr.set_line_width(0.8); cr.set_source_rgb(*edge); cr.stroke()
+    cr.restore()
+    return False
+
+# ---- the dialog UI -----------------------------------------------------------
+class Locker:
+    def __init__(self):
+        self.windows = []
+        self.entry_pw = None
+        self.build()
+
+    def build(self):
+        # per-app CSS at APPLICATION priority (overrides nothing the theme owns).
+        prov = Gtk.CssProvider()
+        try:
+            prov.load_from_path("/usr/share/partyos/lock/style.css")
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), prov,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        except GLib.Error:
+            pass
+
+        screen = Gdk.Screen.get_default()
+        self.display = Gdk.Display.get_default()
+        # cover EVERY monitor; the primary one carries the dialog, the rest are teal fill.
+        n = self.display.get_n_monitors()
+        primary = screen.get_primary_monitor()
+        for i in range(n):
+            geo = self.display.get_monitor(i).get_geometry()
+            self.windows.append(self.make_cover(geo, dialog=(i == primary)))
+
+        # re-cover on monitor hotplug so no desktop sliver leaks.
+        screen.connect("monitors-changed", self.on_monitors_changed)
+        screen.connect("size-changed", self.on_monitors_changed)
+
+    def make_cover(self, geo, dialog):
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)   # POPUP == no WM decorations/management
+        win.set_decorated(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        # NOTE: do NOT call set_app_paintable(True) here. With app_paintable on, GTK
+        # skips painting the window's CSS background, so the .lock-bg (#008080 teal)
+        # rule never renders and the cover goes black. Leaving it off lets GTK paint
+        # the teal CSS background for us.
+        win.get_style_context().add_class("lock-bg")
+        win.move(geo.x, geo.y)
+        win.set_size_request(geo.width, geo.height)
+        # block Escape / Alt-F4 / menu accelerators reaching anything.
+        win.connect("key-press-event", self.on_key)
+        win.connect("delete-event", lambda *a: True)
+        if dialog:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.set_halign(Gtk.Align.CENTER); box.set_valign(Gtk.Align.CENTER)
+            box.add(self.build_dialog())
+            win.add(box)
+        return win
+
+    def build_dialog(self):
+        # grey raised frame (themed). A Gtk.Frame gets the Chicago95 raised bevel.
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.OUT)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        frame.add(outer)
+
+        # --- navy titlebar -----------------------------------------------------
+        title = Gtk.EventBox(); title.get_style_context().add_class("win95-title")
+        tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        tb.set_border_width(2)
+        lbl = Gtk.Label()
+        lbl.get_style_context().add_class("win95-title-label")
+        # joke title: "Welcome to <s>Windows</s> partyOS" - strike out "Windows".
+        # bold+white comes from the .win95-title-label class; <b> keeps it bold even
+        # if the markup resets attributes.
+        lbl.set_markup("<b>Welcome to <s>Windows</s> partyOS</b>")
+        lbl.set_xalign(0.0)
+        tb.pack_start(lbl, True, True, 4)
+        for glyph in ("?", "✕"):   # cosmetic ? and X - INERT, no-op handlers
+            b = Gtk.Button(label=glyph)
+            b.get_style_context().add_class("win95-titlebtn")
+            b.set_can_focus(False)
+            b.connect("clicked", lambda *a: None)
+            tb.pack_start(b, False, False, 0)
+        title.add(tb)
+        outer.pack_start(title, False, False, 0)
+
+        # --- body --------------------------------------------------------------
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        body.set_border_width(12)
+
+        key = Gtk.DrawingArea(); key.set_size_request(48, 48)
+        key.connect("draw", draw_key)
+        keybox = Gtk.Box(); keybox.set_valign(Gtk.Align.START); keybox.add(key)
+        body.pack_start(keybox, False, False, 0)
+
+        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        prompt = Gtk.Label(label="Type a user name and password to log on to Windows.")
+        prompt.set_xalign(0.0); prompt.set_line_wrap(True)
+        mid.pack_start(prompt, False, False, 0)
+
+        grid = Gtk.Grid(); grid.set_row_spacing(6); grid.set_column_spacing(8)
+        l_user = Gtk.Label(label="User name:"); l_user.set_xalign(0.0)
+        l_pass = Gtk.Label(label="Password:");  l_pass.set_xalign(0.0)
+        e_user = Gtk.Entry(); e_user.set_text(DISPLAY_NICK)
+        e_user.set_editable(False); e_user.set_can_focus(False)
+        e_user.set_width_chars(18)
+        self.entry_pw = Gtk.Entry(); self.entry_pw.set_visibility(False)
+        self.entry_pw.set_width_chars(18)
+        self.entry_pw.set_activates_default(True)
+        self.entry_pw.connect("activate", self.on_ok)
+        grid.attach(l_user, 0, 0, 1, 1); grid.attach(e_user, 1, 0, 1, 1)
+        grid.attach(l_pass, 0, 1, 1, 1); grid.attach(self.entry_pw, 1, 1, 1, 1)
+        mid.pack_start(grid, False, False, 0)
+        body.pack_start(mid, True, True, 0)
+
+        # OK / Cancel stacked at the right
+        btns = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        btns.set_valign(Gtk.Align.START)
+        ok = Gtk.Button(label="OK"); ok.set_size_request(72, -1)
+        ok.connect("clicked", self.on_ok)
+        ok.set_can_default(True)
+        cancel = Gtk.Button(label="Cancel"); cancel.set_size_request(72, -1)
+        cancel.set_can_focus(False)
+        cancel.connect("clicked", self.on_cancel)   # cosmetic: clears the field only
+        btns.pack_start(ok, False, False, 0)
+        btns.pack_start(cancel, False, False, 0)
+        body.pack_start(btns, False, False, 0)
+
+        outer.pack_start(body, True, True, 0)
+        self._ok = ok
+        return frame
+
+    # ---- handlers ------------------------------------------------------------
+    def on_key(self, widget, event):
+        # swallow Escape so it can't dismiss; everything else flows to the entry.
+        if event.keyval in (Gdk.KEY_Escape,):
+            return True
+        return False
+
+    def on_cancel(self, *a):
+        # INERT: never an escape-to-desktop. Just clear the password field.
+        if self.entry_pw:
+            self.entry_pw.set_text("")
+            self.entry_pw.grab_focus()
+
+    def on_ok(self, *a):
+        pw = self.entry_pw.get_text() if self.entry_pw else ""
+        if pam_authenticate(AUTH_USER, pw):
+            self.ungrab()
+            Gtk.main_quit()           # success -> falls through to sys.exit(0)
+            return
+        # DENY: clear + keep the lock. (fail closed)
+        self.entry_pw.set_text("")
+        self.entry_pw.grab_focus()
+
+    def on_monitors_changed(self, *a):
+        # tear down + rebuild covers so a hotplugged monitor is covered too.
+        try:
+            self.ungrab()
+        except Exception:
+            pass
+        for w in self.windows:
+            w.destroy()
+        self.windows = []
+        screen = Gdk.Screen.get_default()
+        primary = screen.get_primary_monitor()
+        n = self.display.get_n_monitors()
+        for i in range(n):
+            geo = self.display.get_monitor(i).get_geometry()
+            self.windows.append(self.make_cover(geo, dialog=(i == primary)))
+        self.present_and_grab()
+
+    # ---- override-redirect + atomic fail-closed grab -------------------------
+    def present_and_grab(self):
+        for w in self.windows:
+            # realize (create the GdkWindow) BEFORE mapping, so override-redirect is set
+            # while unmapped - setting it after mapping is a no-op on most servers.
+            w.realize()
+            gw = w.get_window()
+            if gw is not None:
+                gw.set_override_redirect(True)   # bypass the WM entirely
+            w.show_all()
+        # focus the password field on the dialog window
+        if self.entry_pw:
+            self.entry_pw.grab_focus()
+        return self.grab_fail_closed()
+
+    def grab_fail_closed(self):
+        # Grab keyboard+pointer atomically on the dialog (primary) window. Retry on
+        # AlreadyGrabbed (the Super+L race). NEVER return without a successful grab while
+        # locked - the caller keeps the screen covered and we keep retrying.
+        seat = self.display.get_default_seat()
+        # pick the dialog window's GdkWindow (it has focus); fall back to first cover.
+        target = None
+        for w in self.windows:
+            if w.get_child() is not None:
+                target = w.get_window()
+                break
+        if target is None and self.windows:
+            target = self.windows[0].get_window()
+        if target is None:
+            return False
+        for _ in range(50):
+            status = seat.grab(target, Gdk.SeatCapabilities.ALL, False,
+                               None, None, None, None)
+            if status == Gdk.GrabStatus.SUCCESS:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def ungrab(self):
+        try:
+            self.display.get_default_seat().ungrab()
+        except Exception:
+            pass
+
+
+def main():
+    locker = Locker()
+    if not locker.present_and_grab():
+        # FAIL CLOSED: couldn't grab input. Do NOT present an escapable field. Exit
+        # non-zero so the partyos-lock supervisor re-launches and keeps the screen guarded.
+        for w in locker.windows:
+            w.destroy()
+        sys.exit(2)
+    Gtk.main()
+    sys.exit(0)   # only reached after a genuine PAM unlock (on_ok -> main_quit)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        # ANY unexpected failure must fail CLOSED (supervisor respawns), never fall open.
+        sys.exit(3)

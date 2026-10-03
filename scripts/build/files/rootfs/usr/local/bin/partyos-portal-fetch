@@ -1,0 +1,23 @@
+#!/bin/bash
+# Download the portal/homepage once so the browser opens it from disk (offline OK).
+base=""
+for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in portal_url=*) base="${p#*=}";; esac; done
+[ -n "$base" ] || for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) base="${p#*=}/portal";; esac; done
+# No server parameter: fail loudly. Never dial a guessed address.
+if [ -z "$base" ]; then
+    m="PARTYOS-PORTAL-FETCH-NO-SERVER: no portal_url= or report_url= on /proc/cmdline"; echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    exit 1
+fi
+# portal_url= is emitted as https:// with the partyOS CA baked at
+# /etc/partyos/ca.pem; pin it for an https base (curl ignores --cacert for http, so the
+# report_url= HTTP fallback is unaffected - transition-safe).
+ca_args=""
+case "${base}" in https://*) [ -r /etc/partyos/ca.pem ] && ca_args="--cacert /etc/partyos/ca.pem";; esac
+install -d /var/lib/partyos/portal
+for _i in $(seq 1 30); do
+  if curl -fsS ${ca_args} --max-time 8 -o /var/lib/partyos/portal/index.html "${base}/index.html"; then
+    chmod 644 /var/lib/partyos/portal/index.html; exit 0
+  fi
+  sleep 2
+done
+exit 0

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# partyos-home-pull - boot-time USB -> RAM home pull. Runs ONCE per boot, after
+# identity (account + empty home exist), before the display-manager. Guards:
+#   (a) seed an empty p2:/home from the baked skel BEFORE any --delete.
+#   (b) if p2:/home is STILL empty after seeding -> abort (bad mount); never pull.
+# On success: --delete-mirror p2:/home -> RAM /home/<user>, chown to uid 1000,
+# record the generation baseline, and write /run/partyos-home-pull-done (the gate
+# the runtime push waits on).
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[home-pull] $*" > "${SER}" 2>/dev/null; echo "[home-pull] $*"; }
+. /usr/local/lib/partyos-sync-common.sh
+
+# Signal "the boot pull has RUN" on every normal exit path so the desktop launcher
+# (partyos-xfce-launch) can order the XFCE session strictly AFTER the pull, whatever
+# the outcome. Without this, xfce4-panel/xfconfd can start while the home is still
+# being seeded/pulled, read a config that isn't there yet, and regenerate + save the
+# DEFAULT two-panel layout over the just-seeded Win95 single bottom bar (the race that
+# only bites a custom USERNAME, whose home is created empty at identity time; gamer's
+# home is baked into the image so its config is present before any session). RAN is set
+# for stick/no-stick/ro/bad-mount alike; PULL_DONE (the push gate) is stricter.
+trap ': > "${PULL_RAN}" 2>/dev/null || true; rm -f "${PULL_INPROGRESS}" 2>/dev/null || true' EXIT
+
+install -d "${HOME_DIR}"
+
+# NO-STICK: no home partition mount -> the home is the baked RAM template; nothing
+# persists. Exit 0 (the push timer no-ops without pull-done) - preserves today's
+# no-stick behavior exactly.
+if ! mountpoint -q "${MNT}"; then
+    log "no USB home mounted at ${MNT}; RAM-only home this boot (no persistence)"
+    exit 0
+fi
+if ! is_rw; then
+    log "USB at ${MNT} is read-only; disabling sync (RAM-only home, no push)"
+    : > "${RO_FLAG}"
+    exit 0
+fi
+install -d "${USB_HOME}"
+
+# (a) FIRST-BOOT SEED: empty p2:/home -> populate from the baked read-only skel
+# WITHOUT --delete, then chown to uid 1000. Must happen BEFORE the --delete pull,
+# else the pull would wipe the just-seeded tree.
+if dir_empty "${USB_HOME}"; then
+    if [ -d "${SKEL}" ] && ! dir_empty "${SKEL}"; then
+        log "first boot: seeding empty ${USB_HOME} from ${SKEL}"
+        rsync -a --timeout=20 "${SKEL}/" "${USB_HOME}/" 2>/dev/null || log "WARN seed rsync rc=$?"
+        chown -R "${UIDGID}:${UIDGID}" "${USB_HOME}" 2>/dev/null || true
+        sync
+    else
+        log "WARN no home skel at ${SKEL}; ${USB_HOME} stays empty"
+    fi
+fi
+
+# (b) SANE-SOURCE ABORT: if still empty after seeding the mount is suspect - do
+# NOT --delete-mirror an empty source onto the RAM home (would blank the desktop).
+if dir_empty "${USB_HOME}"; then
+    log "ERROR ${USB_HOME} empty after seed; aborting pull (bad mount?), keeping RAM home"
+    exit 0
+fi
+
+# PUSH-IN-PROGRESS BREADCRUMB: the last push did not complete. Log it only.
+# --delete-delay on both sides leaves the stick content intact, so the pull is safe.
+if [ -e "${PUSH_INPROGRESS}" ]; then
+    log "PARTYOS-HOME-PUSH-INPROGRESS marker on stick; last push did not complete - --delete-delay pull is non-destructive, proceeding without backup"
+fi
+
+# --timeout=20: bail if rsync stalls on a slow/vanished device rather than blocking
+# the boot pull (the unit's TimeoutStartSec is the outer net; this bounds rsync itself).
+# --delete-delay: defer all deletions until every transfer completes. An interrupted
+# pull deletes nothing.
+log "pull: ${USB_HOME} -> ${HOME_DIR} (--delete-delay)"
+# PULL-IN-PROGRESS: hold the RAM-side marker across the pull so a concurrent push stands
+# down (belt-and-suspenders with PULL_DONE, which is only opened at the end). The EXIT
+# trap also clears it, so a SIGKILL mid-pull can never leave the push wedged off.
+: > "${PULL_INPROGRESS}"
+rsync -a --delete-delay --timeout=20 "${RSYNC_EX[@]}" "${USB_HOME}/" "${HOME_DIR}/"
+rc=$?
+chown -R "${UIDGID}:${UIDGID}" "${HOME_DIR}" 2>/dev/null || true
+sync
+rm -f "${PULL_INPROGRESS}"
+
+# (e) RE-ASSERT THE IMAGE-OWNED WIN95 DESKTOP over the pulled home. The single-taskbar
+# panel layout (Start/whiskermenu + clock + volume) and the static desktop icons are
+# branded appliance files owned by the IMAGE, not player data. The empty-only seed (a)
+# is bypassed forever once the stick's p2:/home is non-empty, so a stick that ever
+# captured the DEFAULT two-panel XFCE layout (an early boot that raced xfce before the
+# PULL_RAN ordering) keeps --delete-mirroring that default into RAM on every boot; and
+# partyos-panel-layout (panel only) / partyos-desktop-layout (icon ORDER only) never
+# restore the MISSING static Win95 icons. Overlay the known skel files here - BEFORE xfce
+# reads the home (partyos-xfce-launch blocks on PULL_RAN) - so a fresh OR an already-
+# clobbered home always renders the Win95 single-taskbar + full static icon set with NO
+# runtime panel reload. The 45s push then heals the stick. Idempotent (a correct home
+# already holds identical files); non-destructive to the runtime appstore launchers
+# (only the named skel files are copied, no --delete).
+if [ -d "${SKEL}" ] && ! dir_empty "${SKEL}"; then
+    install -d \
+        "${HOME_DIR}/.config/xfce4/xfconf/xfce-perchannel-xml" \
+        "${HOME_DIR}/.config/xfce4/panel" \
+        "${HOME_DIR}/Desktop"
+    [ -f "${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" ] \
+        && cp -f "${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" \
+                 "${HOME_DIR}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+    # the Win95 THEME (GTK + icons + wm): a stale/default home renders the plain
+    # GTK/hicolor look until this is restored, so re-assert it alongside the panel.
+    [ -f "${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" ] \
+        && cp -f "${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" \
+                 "${HOME_DIR}/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml"
+    [ -f "${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" ] \
+        && cp -f "${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" \
+                 "${HOME_DIR}/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
+    [ -f "${SKEL}/.config/xfce4/panel/whiskermenu-1.rc" ] \
+        && cp -f "${SKEL}/.config/xfce4/panel/whiskermenu-1.rc" \
+                 "${HOME_DIR}/.config/xfce4/panel/whiskermenu-1.rc"
+    for _ico in "${SKEL}"/Desktop/*.desktop; do
+        [ -e "${_ico}" ] && cp -f "${_ico}" "${HOME_DIR}/Desktop/"
+    done
+    chown -R "${UIDGID}:${UIDGID}" \
+        "${HOME_DIR}/.config/xfce4" "${HOME_DIR}/Desktop" 2>/dev/null || true
+    sync
+    log "re-asserted Win95 theme (GTK+icons+wm) + panel + static desktop icons from ${SKEL}"
+fi
+
+# DATA-SAFETY GATE: only record the baseline + OPEN the push gate when the pull
+# actually COMPLETED. rc=0 is a clean pull; rc=24 is "some source files vanished
+# mid-transfer" (benign - everything that still existed was copied). ANY other rc
+# (a --timeout=20 stall on a slow stick, a transient read error) means the RAM home
+# is only a PARTIAL copy of the stick. Opening the push gate on a partial home would
+# let the 45s push timer --delete-mirror it back over the stick and permanently
+# delete whatever the pull never copied. So on a failed pull we leave PULL_DONE and
+# the baseline UNwritten: the push stays gated and the stick is left intact until a
+# later boot re-pulls cleanly.
+if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 24 ]; then
+    # (d) generation baseline: record the stick's current generation as what THIS box
+    # is in sync with. A reinsert that finds a NEWER generation pulls instead of pushes.
+    gen_baseline "$(gen_read)"
+
+    # (c) open the gate: the runtime push is a no-op until this file exists.
+    : > "${PULL_DONE}"
+    log "pull rc=${rc}; generation=$(gen_mine); pull-done set"
+else
+    log "PARTYOS-HOME-PULL-INCOMPLETE pull rc=${rc}; NOT opening the push gate (partial RAM home must never --delete-mirror over the stick)"
+fi
+exit 0

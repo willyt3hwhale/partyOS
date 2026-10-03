@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# partyos-shutdown-teardown - bounded teardown of game/seed procs + USB-backed game
+# overlays so reboot/poweroff can't be blocked. Idempotent; safe to run
+# stand-alone (for testing) or from the ExecStop at shutdown.
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[teardown] $*" > "${SER}" 2>/dev/null; echo "[teardown] $*"; }
+
+GAMES_BASE=/run/partyos-games
+
+# 0. Reboot fallback: a D-state aria2 on the USB can block umount.target past every
+#    userspace timeout. Arm a detached sysrq force-reboot (75s) in its own slice, so the
+#    shutdown stop pass does not kill it. The iTCO watchdog is the primary bound.
+#    Arm only during a real shutdown. On a stand-alone or restart run, disarm instead.
+#    On an unknown state, do neither.
+_sysstate="$(systemctl is-system-running 2>/dev/null)"
+_shutting_down() {
+    [ "${_sysstate}" = "stopping" ] && return 0
+    systemctl list-jobs 2>/dev/null \
+        | grep -Eq '(shutdown|reboot|poweroff|halt|final)\.target[[:space:]].*start' && return 0
+    return 1
+}
+if _shutting_down && ! systemctl is-active partyos-force-reboot.scope >/dev/null 2>&1; then
+    if command -v systemd-run >/dev/null 2>&1; then
+        # Do not run `sync` first: it blocks in D-state on the same stuck I/O.
+        # Use sysrq 's' (emergency sync), wait 5s, then sysrq 'b' (force reboot).
+        # Set sysrq=1 first, in case sysctl.d has not applied yet.
+        systemd-run --scope --quiet --collect \
+            --slice=partyos-force.slice --unit=partyos-force-reboot \
+            /bin/sh -c 'sleep 75; echo 1 > /proc/sys/kernel/sysrq 2>/dev/null; echo s > /proc/sysrq-trigger 2>/dev/null; sleep 5; echo b > /proc/sysrq-trigger' \
+            >/dev/null 2>&1 < /dev/null &
+        log "armed detached sysrq force-reboot (75s) in partyos-force.slice"
+    fi
+elif ! _shutting_down && [ -n "${_sysstate}" ]; then
+    # Stand-alone / `systemctl restart` on a healthy box: never arm, and cancel any
+    # force-reboot scope a prior run left armed so it can't fire on this healthy box.
+    log "not a shutdown transaction (${_sysstate}); disarming any armed sysrq force-reboot scope"
+    systemctl stop partyos-force-reboot.scope >/dev/null 2>&1 || true
+    systemctl reset-failed partyos-force-reboot.scope >/dev/null 2>&1 || true
+fi
+
+# 1. Stop the one client aria2c first (graceful), then hard-kill any survivor procs.
+#    partyos-seeder.service has KillMode=mixed + TimeoutStopSec=10s, so the stop
+#    SIGKILLs its cgroup within ~10s. `timeout` bounds it again so a wedged stop
+#    can't stall the teardown. The pkill below catches a standalone load-url aria2c.
+timeout 15 systemctl stop partyos-seeder.service 2>/dev/null || true
+
+# 2. Kill aria2 seeders + wine/wineserver/bwrap game processes: SIGTERM, brief grace,
+#    then SIGKILL the holdouts. Bounded so we never wait on a wedged process.
+PATS='aria2c|wineserver|[w]ine|bwrap'
+if pgrep -f "${PATS}" >/dev/null 2>&1; then
+    log "TERM game/seed procs ($(pgrep -f "${PATS}" | tr '\n' ' '))"
+    pkill -TERM -f "${PATS}" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        pgrep -f "${PATS}" >/dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -f "${PATS}" >/dev/null 2>&1; then
+        log "KILL surviving procs ($(pgrep -f "${PATS}" | tr '\n' ' '))"
+        pkill -KILL -f "${PATS}" 2>/dev/null || true
+    fi
+fi
+
+# 3. Lazily unmount the game overlays so the USB blob cache is no longer pinned.
+#    `umount -l` detaches even if something still references it, so this cannot
+#    block; the kernel finalizes once refs drop.
+#  3a. First the overlay DESTS in the user homes (lowerdir under /run/partyos-games)
+#      - these sit inside /home/<user> and would otherwise interfere with the home
+#      unmount/finalsync.
+for mp in $(awk -v b="${GAMES_BASE}" '$4 ~ ("lowerdir="b) {print $2}' /proc/self/mounts 2>/dev/null | sort -r); do
+    log "umount -l overlay ${mp}"
+    umount -l "${mp}" 2>/dev/null || true
+done
+#  3b. Then the squashfs lowerdirs + .rw scratch tmpfs under /run/partyos-games
+#      (deepest-first so a parent isn't unmounted before its child).
+if [ -d "${GAMES_BASE}" ]; then
+    for mp in $(awk -v b="${GAMES_BASE}" '$2 ~ "^"b {print $2}' /proc/self/mounts 2>/dev/null | sort -r); do
+        log "umount -l ${mp}"
+        umount -l "${mp}" 2>/dev/null || true
+    done
+fi
+
+log "teardown done"
+exit 0

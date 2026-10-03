@@ -1,0 +1,39 @@
+#!/bin/bash
+# Resolve the mirror base from the kernel cmdline: mirror_url= (deploy.conf
+# MIRROR_SERVER, emitted only when != PXE) else report_url= (the PXE server).
+base=""
+for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in mirror_url=*) base="${p#*=}";; esac; done
+[ -n "$base" ] || for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) base="${p#*=}";; esac; done
+# No server parameter: fail loudly. Never write a guessed address.
+if [ -z "$base" ]; then
+    m="PARTYOS-MIRROR-SETUP-NO-SERVER: no mirror_url= or report_url= on /proc/cmdline"; echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    exit 1
+fi
+echo "Server = ${base}/server/lanmirror"       > /etc/pacman.d/partyos-mirror
+echo "Server = ${base}/server/lanmirror-local" > /etc/pacman.d/partyos-local-mirror
+# Neutralize the archive-pinned [core]/[extra] repos: this is a RAM-booted LAN
+# appliance with NO internet, so archive.archlinux.org is unreachable. Worse, pacman
+# REQUIRES every configured repo to have a synced db before it will prepare ANY
+# transaction, so an unreachable [core]/[extra] blocks even a [partyos] install
+# ("could not find database"). The [partyos] LAN mirror already carries the FULL
+# dependency closure of everything we install (the ~525 stock packages), so [core]/
+# [extra] are redundant here. Comment them out (idempotent) so installs resolve purely
+# from the LAN repos. Done at runtime (not baked) so a future internet-connected build
+# variant keeps them. The Arch SIGNATURE trust is unaffected - [partyos] stays Required.
+sed -i -E 's/^\[(core|extra)\]/#[\1]/; /^#\[(core|extra)\]$/,/^$/{ s/^(Include|Server)/#\1/ }' /etc/pacman.conf 2>/dev/null || true
+# Refresh the LAN repo dbs. This is a db refresh only, never -u, and it names no
+# targets. [partyos] is SigLevel=Required (stock pkgs verified vs the first-boot-
+# populated keyring); [partyos-local] is Never (our unsigned custom).
+# The build wipes /var/lib/pacman/sync (c0-finalize), so this sync is the only source
+# of the client sync db. It also finds packages added to the mirror after the build.
+# -Sy without -u is safe here: mirror-pkgs.sh and build-custom-image.sh pin the same
+# SNAPSHOT, so a newer db adds only new packages at the versions of the image. It
+# never holds a newer version of an installed package, so no partial upgrade occurs.
+# Offline-safe: if the sync fails, log it and exit 0. The Server= lines are set, and
+# partyos-pkg-install syncs again before each install. The inner timeout stays below
+# TimeoutStartSec of the unit, so a hung sync does not fail the unit.
+if ! out="$(timeout 25 pacman -Sy --noconfirm 2>&1)"; then
+    m="PARTYOS-MIRROR-SETUP-SYNC-FAILED: pacman -Sy failed: $(printf '%s\n' "${out}" | tail -1)"
+    echo "${m}" >&2; logger -t partyos -p user.warning "${m}" 2>/dev/null || true
+fi
+exit 0

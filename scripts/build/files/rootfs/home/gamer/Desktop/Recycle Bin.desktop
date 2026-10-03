@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Recycle Bin
+Comment=partyOS - the Recycle Bin
+Icon=user-trash-full
+Exec=/usr/local/bin/partyos-recyclebin
+Terminal=false
+Categories=System;partyOS;

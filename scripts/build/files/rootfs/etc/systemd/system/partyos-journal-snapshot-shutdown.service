@@ -1,0 +1,18 @@
+[Unit]
+Description=partyOS - final journal snapshot to the USB on shutdown (diagnostics)
+DefaultDependencies=no
+After=partyos-usbhome.service
+Conflicts=shutdown.target
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The snapshot runs in ExecStop (on the way down); bound it so it can't hang reboot.
+TimeoutStartSec=15s
+TimeoutStopSec=40s
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/partyos-journal-snapshot
+
+[Install]
+WantedBy=multi-user.target

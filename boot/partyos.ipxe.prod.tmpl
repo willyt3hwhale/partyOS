@@ -1,0 +1,63 @@
+#!ipxe
+# partyOS production boot script (template). scripts/deploy/render.sh renders it
+# from deploy.conf to boot/partyos.ipxe. Placeholders:
+#   PXE_HTTPS     https://<PXE_SERVER>:8443, used for the kernel, initrd, script= and report fetches.
+#   SFS_URL       https://<PXE_SERVER>:8443, where the initramfs fetches airootfs.sfs.
+#   EXTRA_PARAMS  extra kernel params from deploy.conf (blob_url=, mirror_url=, irc_server=, portal_url=).
+#
+# RECOVERY: if a CA or cert issue breaks the chain, point PXE_HTTPS at
+# http://<PXE_SERVER>, re-render and re-serve. No re-flash is needed.
+
+echo ================================================
+echo partyOS - Custom XFCE Desktop Boot
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{PXE_HTTPS}}
+echo PARTYOS-NETBOOT-OK
+# First-line diagnostic - prove partyos.ipxe ran (server log distinguishes
+# "ipxe chained" from "never fetched"). Best-effort, never blocks boot.
+imgfetch {{PXE_HTTPS}}/report?step=ipxe&status=chained&ip=${ip} rk || echo report-ipxe-skipped
+imgfree rk || echo continuing
+# The iPXE/boot-stage callback uses a DISTINCT step name (step=netboot) so it no
+# longer collides with the desktop's step=3 status=ok desktop=ready (the load-bearing
+# desktop-ready gate). This cleanly separates "boot started" from "desktop ready".
+imgfetch {{PXE_HTTPS}}/report?step=netboot&status=start&ip=${ip} r3 || echo callback-skipped
+imgfree r3 || echo continuing
+
+echo Loading custom desktop image (XFCE) into RAM...
+# Kernel parameters:
+#   copytoram: the initramfs fetches airootfs.sfs into RAM (the build adds curl retries).
+#   checksum: verify airootfs.sfs against the served airootfs.sha512. Bare word only.
+#   nouveau.modeset=0 nvidia-drm.modeset=1: nouveau hangs the boot on Ampere (RTX 30xx).
+#   script= brings up the desktop. report_url= is where to POST. EXTRA_PARAMS = blob/mirror/irc/portal.
+#   partyos_dns= gives the lease DNS to the initramfs, because ip= cannot carry DNS.
+#   partyos_routes= gives DHCP option 121 to the partyos_routes hook.
+#   BOOTIF= selects the boot NIC by MAC, so ip= has no device field.
+#   cow_spacesize=50%: the writable overlay (and the player home) can use half the RAM.
+# Retry the kernel fetch every 2s, up to 10 attempts.
+set kidx:int32 0
+:kretry
+kernel {{PXE_HTTPS}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SFS_URL}}/server/images/custom/ ip=${net0/ip}::${net0/gateway}:${net0/netmask} BOOTIF=01-${net0/mac:hexhyp} partyos_dns=${net0/dns} partyos_routes=${net0/121:hex} copytoram checksum cow_spacesize=50% no_timer_check nouveau.modeset=0 nvidia-drm.modeset=1 loglevel=4 console=tty0 splash script={{PXE_HTTPS}}/boot/step3-script.sh report_url={{PXE_HTTPS}}{{EXTRA_PARAMS}} && goto kok ||
+inc kidx
+iseq ${kidx} 10 && goto failed ||
+echo   kernel fetch failed (attempt ${kidx}/10) - retrying...
+sleep 2
+goto kretry
+:kok
+
+echo Downloading initramfs...
+set iidx:int32 0
+:iretry
+initrd {{PXE_HTTPS}}/server/images/initramfs-linux.img && goto iok ||
+inc iidx
+iseq ${iidx} 10 && goto failed ||
+echo   initrd fetch failed (attempt ${iidx}/10) - retrying...
+sleep 2
+goto iretry
+:iok
+
+echo Starting partyOS desktop...
+boot || goto failed
+
+:failed
+echo partyOS boot failed - check the server is reachable at {{PXE_HTTPS}}

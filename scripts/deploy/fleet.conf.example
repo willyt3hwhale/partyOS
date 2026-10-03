@@ -1,0 +1,5 @@
+# Fleet table for fleet-verify.sh. Copy to fleet.conf (not in git) and edit.
+# One host per line: name|ip|gpu-vendor|quirks  (quirks: - or manual-power-on)
+box-amd|192.168.0.10|amd|manual-power-on
+box-nvidia|192.168.0.11|nvidia|-
+box-intel|192.168.0.12|intel|-

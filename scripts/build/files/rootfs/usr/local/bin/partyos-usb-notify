@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# partyos-usb-notify STATE MESSAGE  - STATE is removed|reinserted|eject
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+STATE="${1:-unknown}"
+MSG="${2:-USB ${STATE}}"
+STATUS_FILE="/run/partyos-usb-status"
+echo "${STATE}" > "${STATUS_FILE}" 2>/dev/null || true
+echo "[usb-notify] ${STATE}: ${MSG}" > "${SER}" 2>/dev/null || true
+echo "[usb-notify] ${STATE}: ${MSG}"
+GUSER="gamer"
+[ -r /run/partyos-username ] && GUSER="$(tr -d '[:space:]' < /run/partyos-username)"
+[ -n "${GUSER}" ] || GUSER="gamer"
+GUID="$(id -u "${GUSER}" 2>/dev/null || echo 1000)"
+# Benign USB events (reinsert, safe-to-eject / sync-complete advisories) auto-expire so
+# toasts don't pile up sticky on the desktop. Only a genuine data-loss risk - the home
+# stick pulled while sync was still pending - stays critical/sticky until dismissed.
+case "${STATE}" in
+    removed) URG="critical"; EXPIRE="0"    ;;
+    *)       URG="normal";   EXPIRE="4000" ;;
+esac
+# BOOT-RACE GATE: the udev COLDPLUG replays a USB "add" at boot, firing this toast
+# BEFORE xfce4-session has exported DISPLAY into the systemd --user env. notify-send
+# then just spams xfce4-notifyd with "cannot open display" (~15x) and the first toast
+# is dropped anyway. Only pop the desktop toast once the session is actually up (DISPLAY
+# exported into the --user env); the serial + status-file records above are written
+# regardless. Post-boot events (session already up) toast normally.
+session_ready() {
+    pgrep -u "${GUSER}" -x xfce4-session >/dev/null 2>&1 || return 1
+    sudo -u "${GUSER}" XDG_RUNTIME_DIR="/run/user/${GUID}" \
+        systemctl --user show-environment 2>/dev/null | grep -q '^DISPLAY=' || return 1
+    return 0
+}
+if session_ready; then
+    for disp in :0 :1; do
+        sudo -u "${GUSER}" \
+            DISPLAY="${disp}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${GUID}/bus" \
+            notify-send -u "${URG}" -t "${EXPIRE}" "partyOS USB" "${MSG}" 2>/dev/null && break
+    done || true
+else
+    echo "[usb-notify] desktop session not up yet - skipped toast (serial/status recorded)" > "${SER}" 2>/dev/null || true
+fi
+exit 0

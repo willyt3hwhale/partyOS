@@ -1,0 +1,23 @@
+# Example partyOS player config (committed template - copy, do not edit in place).
+#
+# One folder per player under users/: users/<name>/config + users/<name>/home/.
+# Create one with the generator (networking defaults to DHCP):
+#   scripts/deploy/gen-user-config.sh <name>
+# Then flash that player's stick BY NAME:
+#   sudo scripts/deploy/flash-usb.sh /dev/sdX --user <name>
+#
+# Format and key routing: see users/README.md.
+
+# Login account name (a-z, _, -, digits; must start a-z/_; <=32).
+USERNAME=example
+# Machine hostname (optional; omit and the OS derives <username>-<machine-suffix>).
+HOSTNAME=example-pc
+# Display / IRC nick.
+NICK=Example
+# Networking is DHCP by default. The LAN DHCP server assigns the address.
+# Optional opt-in: pin a client-side static IP, A.B.C.D[/prefix] (prefix defaults to /24).
+#STATIC_IP=192.168.1.200/24
+# Optional off-subnet routing - fine to leave unset on a flat, offline party LAN
+# (mDNS handles discovery). Both require STATIC_IP.
+#GATEWAY=192.168.1.1
+#DNS=192.168.1.1

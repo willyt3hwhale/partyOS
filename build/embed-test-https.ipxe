@@ -1,0 +1,53 @@
+#!ipxe
+# Embedded autoboot: the same DHCP-retry and reboot-on-fail structure as
+# embed-test.ipxe, but the chain line goes over HTTPS:8443 so the
+# whole boot chain (chained partyos.ipxe + kernel + initrd) is fetched over TLS
+# and validated against the pinned partyOS CA compiled in via TRUST=.
+#
+# Two facts about embedded iPXE scripts:
+#  1. In an EMBEDDED EFI script, a command that fails WITHOUT a trailing `||`
+#     aborts the whole script; an aborted EMBED binary returns to UEFI firmware,
+#     which then boots the NEXT BootOrder entry. It does NOT drop to a
+#     shell. So every fallible line below ends in `||`.
+#  2. "Link up but DHCP config fails on the first try" = switch spanning-tree
+#     forwarding delay: the port links up but drops frames for 15-30s during STP
+#     listening/learning, outlasting iPXE's default ~10s DHCP timeout. Fix:
+#     `dhcp --timeout 30000` (30s/attempt, outlasts STP) inside a retry loop.
+echo partyOS autoboot (embedded HTTPS, baked server)...
+# Cold-power-on NIC link-up - bring the iface up and let the PHY negotiate
+# link BEFORE the first dhcp.
+ifopen net0 || echo   ifopen net0 failed - continuing
+sleep 3 ||
+# DHCP retry loop (each step its own line so a succeeding `inc` does not
+# short-circuit the rest via its own `||`).
+set idx:int32 0
+:retry
+dhcp --timeout 30000 net0 && goto neton ||
+inc idx
+iseq ${idx} 15 && goto giveup ||
+echo   DHCP failed (attempt ${idx}/15) - link up, switch STP converging, retrying...
+sleep 2
+goto retry
+
+:neton
+echo Got lease: ${net0/ip} via ${net0/gateway} mac=${net0/mac}
+# CLOCK NOTE: iPXE can boot with no valid clock. The CA and leaf are backdated
+# (notBefore 2026-06-22), so TLS validation needs no clock set.
+# If a client shows a cert-time error, add `ntp <server> ||` on the next line.
+chain https://partyos.lan:8443/boot/partyos.ipxe || goto failed
+
+# A headless LAN client has no keyboard, so REBOOT (re-POST re-runs this
+# embedded autoboot) instead of dropping to a dead-end shell.
+:failed
+echo chain to partyos.lan:8443 failed - rebooting to retry in 5s...
+sleep 5 ||
+reboot ||
+echo reboot unsupported by firmware - dropping to iPXE shell
+shell ||
+
+:giveup
+echo DHCP never succeeded after 15 attempts - rebooting to retry in 5s...
+sleep 5 ||
+reboot ||
+echo reboot unsupported by firmware - dropping to iPXE shell
+shell ||

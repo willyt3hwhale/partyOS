@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xsettings" version="1.0">
+  <property name="Net" type="empty">
+    <property name="ThemeName" type="string" value="Chicago95"/>
+    <property name="IconThemeName" type="string" value="Chicago95"/>
+  </property>
+  <property name="Gtk" type="empty">
+    <property name="FontName" type="string" value="Sans 8"/>
+    <property name="CursorThemeName" type="string" value="Chicago95_Standard_Cursors"/>
+    <property name="DialogsUseHeader" type="bool" value="false"/>
+  </property>
+</channel>

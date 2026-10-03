@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# partyos-share-game [NAME] - make a Load-from-URL share code for a cached game blob.
+set -u
+zerr() { zenity --error --title="partyOS - Share" --width=420 --text="$1" 2>/dev/null || echo "$1" >&2; }
+
+CDIRS="/mnt/usbhome/.partyos-cache/games /var/cache/partyos/games"
+
+# No arg: pick from the installed (mounted) games via the app-store backend.
+NAME="${1:-}"
+if [ -z "${NAME}" ]; then
+    list="$(partyos-app installed 2>/dev/null | grep -vE '^PARTYOS-APP' || true)"
+    if [ -z "${list}" ]; then zerr "No games are loaded.\n\nPlay a game once, then share it."; exit 1; fi
+    NAME="$(printf '%s\n' ${list} | zenity --list --title="partyOS - Share a Game" \
+        --text="Pick a game to share:" --column="Game" 2>/dev/null)" || exit 0
+    [ -n "${NAME}" ] || exit 0
+fi
+
+# Locate the cached blob (USB cache first, then RAM cache).
+blob=""; cdir=""
+for d in ${CDIRS}; do
+    if [ -f "${d}/${NAME}.squashfs" ]; then blob="${d}/${NAME}.squashfs"; cdir="${d}"; break; fi
+done
+if [ -z "${blob}" ]; then zerr "${NAME} is not cached.\n\nPlay it once first, then share it."; exit 1; fi
+
+tor="${cdir}/${NAME}.squashfs.torrent"
+# piece size scaled to blob size, matching gen-blob-torrents.sh so a runtime-built
+# torrent uses the SAME tiers as the server-side one:
+#   <1 GiB -> 18 (256 KiB)   1-4 GiB -> 20 (1 MiB)   >4 GiB -> 21 (2 MiB)
+# A fixed -l 18 bloated the .torrent + hashing on multi-GB proton blobs.
+piece_l() {
+    local b="${1:-0}"
+    if   [ "${b}" -ge $((4*1024*1024*1024)) ]; then echo 21
+    elif [ "${b}" -ge $((1*1024*1024*1024)) ]; then echo 20
+    else echo 18; fi
+}
+# Ensure a .torrent exists next to the blob. A normal pull already wrote one; a
+# RAM-cache pull may not, so generate it on the spot.
+if [ ! -s "${tor}" ]; then
+    if command -v mktorrent >/dev/null 2>&1; then
+        L="$(piece_l "$(wc -c < "${blob}" 2>/dev/null | tr -d ' ')")"
+        webseed=""
+        [ -n "${PARTYOS_BLOB_BASE:-}" ] && webseed="${PARTYOS_BLOB_BASE}/${NAME}.squashfs"
+        if [ -n "${webseed}" ]; then
+            mktorrent -l "${L}" -w "${webseed}" -o "${tor}" "${blob}" >/dev/null 2>&1 || mktorrent -l "${L}" -o "${tor}" "${blob}" >/dev/null 2>&1
+        else
+            mktorrent -l "${L}" -o "${tor}" "${blob}" >/dev/null 2>&1
+        fi
+    fi
+fi
+if [ ! -s "${tor}" ]; then zerr "Could not build a .torrent for ${NAME}."; exit 1; fi
+
+# Ensure we are seeding so the friend has a live peer (seed-cached skips blobs already in aria2c).
+partyos-app seed-cached >/dev/null 2>&1 || true
+
+sha="$(sha256sum "${blob}" 2>/dev/null | awk '{print $1}')"
+size="$(wc -c < "${blob}" 2>/dev/null | tr -d ' ')"
+# Robust LAN-IP detection. `ip route get 1.1.1.1` returns NOTHING when there is no
+# default route (a flat isolated LAN with no internet gateway, as on an isolated test LAN ->
+# "Network is unreachable" and an empty ip), which then produced an empty ip= field.
+# Fall through: route-get, then the first global-scope v4 addr, then any non-loopback v4.
+# (slim image has no `hostname` binary, so the old `hostname -I` fallback always errored
+# with "command not found"; use an ip-based equivalent that covers a link-local-only LAN.)
+ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+[ -n "${ip}" ] || ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+[ -n "${ip}" ] || ip="$(ip -4 -o addr show 2>/dev/null | awk '$2!="lo"{print $4}' | cut -d/ -f1 | head -1)"
+# The magnet's x.pe/pt carries the BitTorrent port of this box. One client aria2c
+# (partyos-seeder.service) seeds every blob on one port in 51413..51420. Read the
+# port it bound from its TCP listen socket. Skip the RPC port 6800 (loopback only).
+# If the socket can't be read, use 51413, the first port of the range. The receiver's
+# LPD finds this box anyway.
+# NOTE: for aria2 1.37 x.pe is DECORATIVE (the magnet x.pe explicit-peer is ignored on
+# the leecher side); LPD is the load-bearing discovery. We keep pt accurate anyway so the
+# code is correct for any honouring client and for human/diagnostic inspection.
+seeder_port() {
+    local pid lp=""
+    pid="$(systemctl show -p MainPID --value partyos-seeder.service 2>/dev/null)"
+    case "${pid}" in ''|0) pid="$(pgrep -x aria2c 2>/dev/null | head -1)";; esac
+    if [ -n "${pid}" ] && command -v ss >/dev/null 2>&1; then
+        lp="$(ss -ltnp 2>/dev/null | awk -v p="pid=${pid}," '/LISTEN/ && index($0,p){n=split($4,a,":"); if (a[n]>=51413 && a[n]<=51420) {print a[n]; exit}}')"
+    fi
+    echo "${lp:-51413}"
+}
+port="$(seeder_port)"
+
+if [ -z "${sha}" ] || [ -z "${size}" ]; then zerr "Could not read ${NAME} (sha/size)."; exit 1; fi
+
+# --- MAGNET share code (replaces the old 334KB inline-base64-torrent partyos:// URI)
+# The inline torrent busted Linux's 128KB argv limit (a 3GB blob -> ~334KB code), so
+# `partyos-app load-url "<code>"` could not even be invoked. A magnet is ~200 bytes,
+# pasteable + QR-able. The receiver re-fetches the small .torrent from the web-seed host
+# (ws + ".torrent"), so we carry only the magnet, not the torrent itself.
+#   magnet:?xt=urn:btih:<infohash>&dn=<name>&x.pe=<seeder-ip>:<seeder-port>&ws=<webseed>&s=<sha256>&z=<size>
+#   (seeder-port is the port the one client aria2c bound, in 51413..51420)
+# infohash = sha1(bencode(info)) of the .torrent. aria2c --show-files does NOT print it
+# (1.37), so compute it directly with a tiny bencode walker.
+infohash="$(python3 - "${tor}" <<'PY'
+import sys, hashlib
+d=open(sys.argv[1],"rb").read()
+i=d.find(b"4:infod")
+if i<0: sys.exit(0)
+start=i+6
+def skip(d,p):
+    c=d[p:p+1]
+    if c in (b"d",b"l"):
+        p+=1
+        while d[p:p+1]!=b"e":
+            if c==b"d": p=skip(d,p); p=skip(d,p)
+            else: p=skip(d,p)
+        return p+1
+    if c==b"i": return d.find(b"e",p)+1
+    if c.isdigit():
+        co=d.find(b":",p); return co+1+int(d[p:co])
+    raise ValueError
+print(hashlib.sha1(d[start:skip(d,start)]).hexdigest())
+PY
+)"
+if [ -z "${infohash}" ]; then zerr "Could not compute info-hash for ${NAME}."; exit 1; fi
+
+# Web-seed (ws): the url-list baked into the .torrent IS the canonical HTTP source the
+# receiver re-fetches the torrent + pulls pieces from. Read it straight out of the
+# torrent so a code always points at a live server, regardless of this box's env.
+webseed="$(grep -aoE 'url-list[0-9]+:https?://[^ ]+\.squashfs' "${tor}" 2>/dev/null | sed -E 's/^url-list[0-9]+://' | head -1)"
+[ -n "${webseed}" ] || { [ -n "${PARTYOS_BLOB_BASE:-}" ] && webseed="${PARTYOS_BLOB_BASE}/${NAME}.squashfs"; }
+if [ -z "${webseed}" ]; then zerr "No web-seed URL for ${NAME} (torrent has no url-list)."; exit 1; fi
+
+# percent-encode helper for the magnet field values (dn / ws can carry reserved bytes).
+urlenc() {
+    printf '%s' "$1" | od -An -tx1 | tr ' ' '\n' | grep . | while read -r h; do
+        c="$(printf "\\x${h}")"
+        case "${c}" in [a-zA-Z0-9._~-]) printf '%s' "${c}";; *) printf '%%%s' "${h}";; esac
+    done
+}
+dn_enc="$(urlenc "${NAME}")"
+ws_enc="$(urlenc "${webseed}")"
+
+code="magnet:?xt=urn:btih:${infohash}&dn=${dn_enc}&x.pe=${ip}:${port}&ws=${ws_enc}&s=${sha}&z=${size}"
+
+# Copy to the clipboard. The image ships xclip; fall back to xsel if present.
+copied=0
+if command -v xclip >/dev/null 2>&1; then
+    printf '%s' "${code}" | xclip -selection clipboard 2>/dev/null && copied=1
+elif command -v xsel >/dev/null 2>&1; then
+    printf '%s' "${code}" | xsel --clipboard --input 2>/dev/null && copied=1
+fi
+
+note="Copied to clipboard."
+[ "${copied}" -eq 1 ] || note="Copy it manually (clipboard tool unavailable)."
+zenity --info --title="Share: ${NAME}" --width=520 \
+    --text="Send this code to a friend (${note}):\n\n${code}\n\nKeep this machine on and the game loaded until they have loaded it." \
+    2>/dev/null || printf '%s\n' "${code}"

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# partyos-journal-snapshot - copy THIS boot's live journal to a timestamped dir on the USB
+# home so the PREVIOUS boot is readable after a reboot (RAM OS wipes the live journal each
+# boot). Machine-id-free: `journalctl --directory=<dir>` reads any journal regardless of id.
+# Runs every ~60s (timer) and once more on shutdown (oneshot). Best-effort; never blocks.
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[journal-snapshot] $*" > "${SER}" 2>/dev/null; echo "[journal-snapshot] $*"; }
+
+USB_JOURNAL=/mnt/usbhome/.partyos-journal
+KEEP=5   # number of per-boot snapshot dirs to retain (bounded disk on the slow stick)
+
+# USB must be mounted - if not, snapshotting is impossible this run (no persistent store).
+if ! mountpoint -q /mnt/usbhome 2>/dev/null; then
+    log "USB home not mounted - cannot snapshot this run (best-effort)"
+    exit 0
+fi
+mkdir -p "${USB_JOURNAL}" 2>/dev/null || { log "WARN cannot create ${USB_JOURNAL} - skip"; exit 0; }
+
+# SERIALIZE: on a slow stick a snapshot copy can outlast the 60s timer interval, so the next
+# tick would launch a SECOND rsync into the SAME per-boot dir - the two stack and saturate the
+# stick (load ~19, two concurrent rsyncs). A
+# non-blocking flock makes an overlapping tick SKIP this run instead of piling on. flock is
+# util-linux (always on the Arch target); guarded so a build/CI host without flock (or the e2e
+# test) just runs unserialized, and a failed lock-file open falls back to unserialized too.
+if command -v flock >/dev/null 2>&1 && exec 9>/run/partyos-journal-snapshot.lock 2>/dev/null; then
+    flock -n 9 2>/dev/null || { log "previous snapshot still running - skipping this tick (no stacking)"; exit 0; }
+fi
+
+# Locate the live journal directory journald actually writes (volatile /run on this RAM OS,
+# or /var/log if ever persistent). Pick the one that holds *.journal files for THIS boot.
+SRC=""
+for base in /run/log/journal /var/log/journal; do
+    [ -d "${base}" ] || continue
+    for d in "${base}"/*/; do
+        [ -d "${d}" ] || continue
+        if ls "${d}"*.journal >/dev/null 2>&1; then SRC="${d%/}"; break; fi
+    done
+    [ -n "${SRC}" ] && break
+done
+if [ -z "${SRC}" ]; then
+    log "no live *.journal found under /run or /var/log - nothing to snapshot yet"
+    exit 0
+fi
+
+# Stable per-BOOT destination: keyed on the systemd boot id so the 60s timer overwrites the
+# SAME dir all boot long (one dir per boot, not one per timer tick). Short boot id + a
+# first-seen timestamp make the dir human-sortable and unique across boots.
+BOOTID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '-' | cut -c1-12)"
+[ -n "${BOOTID}" ] || BOOTID="unknown$$"
+# Find an existing dir for this boot id (so repeated timer runs reuse it); else make a new one.
+DEST=""
+for existing in "${USB_JOURNAL}"/boot-*-"${BOOTID}"; do
+    [ -d "${existing}" ] && { DEST="${existing}"; break; }
+done
+if [ -z "${DEST}" ]; then
+    TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo 00000000-000000)"
+    DEST="${USB_JOURNAL}/boot-${TS}-${BOOTID}"
+fi
+mkdir -p "${DEST}" 2>/dev/null || { log "WARN cannot create ${DEST} - skip"; exit 0; }
+
+# Copy the journal files. rsync if present (incremental, only changed bytes - kind to the
+# slow USB); else cp. Bounded by timeout so a wedged stick can never freeze us.
+if command -v rsync >/dev/null 2>&1; then
+    timeout 30 rsync -a --inplace "${SRC}/" "${DEST}/" 2>/dev/null \
+        && log "snapshotted ${SRC} -> ${DEST} (rsync)" \
+        || log "WARN rsync snapshot to ${DEST} did not complete (non-fatal)"
+else
+    timeout 30 cp -af "${SRC}/." "${DEST}/" 2>/dev/null \
+        && log "snapshotted ${SRC} -> ${DEST} (cp)" \
+        || log "WARN cp snapshot to ${DEST} did not complete (non-fatal)"
+fi
+# Drop a marker so partyos-lastboot-log can show when this boot was last snapshotted.
+date '+%Y-%m-%d %H:%M:%S' > "${DEST}/.snapshot-time" 2>/dev/null || true
+
+# Prune to the last KEEP boot dirs (sort by name = chronological, newest last). Best-effort.
+mapfile -t _dirs < <(ls -1d "${USB_JOURNAL}"/boot-* 2>/dev/null | sort)
+_n=${#_dirs[@]}
+if [ "${_n}" -gt "${KEEP}" ]; then
+    _rm=$(( _n - KEEP ))
+    for _i in $(seq 0 $(( _rm - 1 ))); do
+        timeout 20 rm -rf "${_dirs[$_i]}" 2>/dev/null \
+            && log "pruned old snapshot ${_dirs[$_i]}" || true
+    done
+fi
+# Flush so the snapshot is durable on the stick even if a reboot follows immediately.
+timeout 15 sync -f "${DEST}" 2>/dev/null || sync 2>/dev/null || true
+exit 0

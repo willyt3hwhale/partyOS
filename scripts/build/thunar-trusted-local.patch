@@ -1,0 +1,29 @@
+Treat LOCAL .desktop launchers as trusted in Thunar.
+
+partyOS runs from a RAM/overlay home where gvfs metadata is "not supported", so
+thunar_g_vfs_metadata_is_supported() is FALSE and a launcher's Name= is never
+used (Thunar shows the raw "Foo.desktop" filename inside folders). OR-in
+g_file_is_native() so any local .desktop is trusted: shows Name= and launches
+without the "untrusted launcher" warning. g_file_is_native is already used in
+thunar_file_load, so no new include is needed.
+--- a/thunar/thunar-file.c
++++ b/thunar/thunar-file.c
+@@ -1058,7 +1058,7 @@ thunar_file_load (ThunarFile   *file,
+           preferences = thunar_preferences_get ();
+           g_object_get (preferences, "misc-display-launcher-name-as-filename", &launcher_name, NULL);
+           g_object_unref (preferences);
+-          if (thunar_g_vfs_metadata_is_supported () && xfce_g_file_is_trusted (file->gfile, NULL, NULL) && launcher_name == TRUE)
++          if ((g_file_is_native (file->gfile) || (thunar_g_vfs_metadata_is_supported () && xfce_g_file_is_trusted (file->gfile, NULL, NULL))) && launcher_name == TRUE)
+             {
+               g_free (file->display_name);
+
+@@ -3163,9 +3163,9 @@ thunar_file_can_execute (ThunarFile *file,
+
+   /* Additional security measure only applicable if gvfs is installed: */
+   /* Desktop files outside XDG_DATA_DIRS, need to be 'trusted'. */
+-  if (thunar_g_vfs_metadata_is_supported ())
++  if (!g_file_is_native (file_to_check->gfile) && thunar_g_vfs_metadata_is_supported ())
+     {
+       gboolean can_execute = xfce_g_file_is_trusted (file_to_check->gfile, NULL, NULL);
+       g_object_unref (file_to_check);
+       return can_execute;

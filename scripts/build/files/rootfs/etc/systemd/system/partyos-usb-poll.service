@@ -1,0 +1,12 @@
+[Unit]
+Description=partyOS - reconcile home stick mount state (missed-udev safety net)
+After=partyos-home-pull.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/partyos-usb-poll
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=cmd.exe
+Icon=utilities-terminal
+Exec=xfce4-terminal
+Terminal=false
+Categories=System;partyOS;

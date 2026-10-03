@@ -1,0 +1,47 @@
+// partyOS boot splash (plymouth script theme).
+// Teal Win95 background, centered partyOS logo, a live boot-status line in the
+// bottom-left (so the "log" stays visible), and "by LilWil" in the bottom-right.
+
+// --- teal Win95 background (#008080) ---
+Window.SetBackgroundTopColor(0.0, 0.50, 0.50);
+Window.SetBackgroundBottomColor(0.0, 0.50, 0.50);
+
+sw = Window.GetWidth();
+sh = Window.GetHeight();
+
+// --- centered logo ---
+logo.image = Image("logo.png");
+logo.sprite = Sprite(logo.image);
+logo.sprite.SetX(sw / 2 - logo.image.GetWidth()  / 2);
+logo.sprite.SetY(sh / 2 - logo.image.GetHeight() / 2);
+logo.sprite.SetZ(10);
+
+// --- "by LilWil" bottom-right corner ---
+// NB: no explicit font name - "Sans" etc need fontconfig (absent in the initramfs);
+// omitting it uses plymouth's bundled Plymouth.ttf so Image.Text never fails.
+byline.image  = Image.Text("by LilWil", 1.0, 1.0, 1.0);
+byline.sprite = Sprite(byline.image);
+byline.sprite.SetX(sw - byline.image.GetWidth()  - 18);
+byline.sprite.SetY(sh - byline.image.GetHeight() - 14);
+byline.sprite.SetZ(10);
+
+// --- live boot-status line, bottom-left (keeps the "log" visible) ---
+status.sprite = Sprite();
+status.sprite.SetZ(10);
+fun set_status(text) {
+    status.image = Image.Text(text, 0.85, 0.85, 0.85);
+    status.sprite.SetImage(status.image);
+    status.sprite.SetX(18);
+    status.sprite.SetY(sh - status.image.GetHeight() - 14);
+}
+set_status("Starting partyOS ...");
+
+// plymouth pushes boot messages here (services, fsck, etc.)
+Plymouth.SetMessageFunction(fun (text) { set_status(text); });
+Plymouth.SetUpdateStatusFunction(fun (text) { set_status(text); });
+
+// password prompt (in case anything ever asks) - keep it simple/centered.
+fun display_password_callback(prompt, bullets) {
+    set_status(prompt);
+}
+Plymouth.SetDisplayPasswordFunction(display_password_callback);

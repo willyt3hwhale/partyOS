@@ -1,0 +1,14 @@
+[Unit]
+Description=partyOS - add the 239.0.0.0/8 route for aria2 LPD and the 255.255.255.255/32 broadcast route
+# Run once the LAN interface is configured and routable so the address exists to derive
+# the iface from. The route add is idempotent, so re-running is harmless.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/partyos-lpd-route
+
+[Install]
+WantedBy=multi-user.target

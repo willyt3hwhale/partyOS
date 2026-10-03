@@ -1,0 +1,36 @@
+#!ipxe
+# partyOS EVICTION boot script (TEMPLATE) - RAM lifecycle / eviction.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1-9 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-9 (server/images/custom/), with the
+# SAME kernel/initramfs Step 2 RAM-boots, with the LANPARTY_HOME USB stick
+# attached (so the blob cache is persistent). The fetched automated script is
+# eviction-script.sh: it drives the BAKED partyos-ram (RAM lifecycle / eviction
+# manager) + partyos-app (whose install gate calls partyos-ram ensure-room),
+# loading blobs until RAM is tight, then launching one more that won't fit and
+# asserting an IDLE blob is evicted to make room while the IN-USE one is protected.
+
+echo ================================================
+echo partyOS RAM eviction - free RAM by unmounting blobs
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=eviction&status=boot&ip=${ip} ra || echo callback-skipped
+imgfree ra || echo continuing
+
+echo Loading custom desktop image into RAM (eviction)...
+# report_url= is read by eviction-script.sh + partyos-app for the catalog fetch +
+# HTTP callback (no hardcoded IP). Same boot machinery as steps 7/8.
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/eviction-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (eviction)...
+boot || goto failed
+
+:failed
+echo partyOS eviction boot failed

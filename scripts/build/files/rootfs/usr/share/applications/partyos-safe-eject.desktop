@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Eject My Stick
+Comment=Final sync + safely remove your home stick before leaving
+Icon=media-eject
+Exec=sudo -n /usr/local/bin/partyos-safe-eject
+Terminal=false
+Categories=System;partyOS;

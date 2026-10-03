@@ -1,0 +1,2 @@
+#!/bin/sh
+exec thunar "${HOME:-/home/gamer}/Desktop/.recycle-bin"

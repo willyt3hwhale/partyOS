@@ -1,0 +1,16 @@
+[Unit]
+Description=partyOS - start the participant's own services from their HOME folder
+DefaultDependencies=no
+# No systemd-udev-settle dep: it is redundant here (partyos-usbhome/identity, which we
+# already order After, own the home partition readiness) and deprecated (stalls real HW).
+After=local-fs.target partyos-usbhome.service partyos-identity.service partyos-home-pull.service
+Wants=partyos-identity.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/partyos-home-services
+
+[Install]
+WantedBy=multi-user.target

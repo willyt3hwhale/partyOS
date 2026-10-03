@@ -1,0 +1,11 @@
+[Unit]
+Description=partyOS - refresh app-store shortcuts periodically (self-heal + catalog updates)
+
+[Timer]
+OnBootSec=180s
+OnUnitActiveSec=180s
+AccuracySec=5s
+Unit=partyos-appstore-refresh.service
+
+[Install]
+WantedBy=timers.target

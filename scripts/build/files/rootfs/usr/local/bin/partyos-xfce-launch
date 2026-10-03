@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Start the gamer XFCE session ON the systemd --user bus (not an ephemeral
+# dbus-run-session), so user services + xdg-desktop-portal activate and modern
+# apps (GNOME/portal-using, e.g. the web browser) work. Linger (baked) starts
+# user@UID at boot; we also nudge it + wait for its bus.
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_CURRENT_DESKTOP=XFCE
+UID_N="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/${UID_N}"
+# Reach Xorg via the per-session MIT cookie (set by step3-script in the gamer's
+# runtime dir), NOT a host-based `xhost +local:` grant. Default to that file so the
+# whole XFCE session + its children (incl. the away-from-keyboard locker and sudo'd helpers, which
+# forward XAUTHORITY) authenticate with the cookie. Falls back to ~/.Xauthority for
+# the LightDM autologin path, which manages its own cookie there.
+export XAUTHORITY="${XAUTHORITY:-${XDG_RUNTIME_DIR}/partyos-Xauthority}"
+[ -r "${XAUTHORITY}" ] || export XAUTHORITY="${HOME}/.Xauthority"
+mkdir -p "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+# ensure the systemd --user instance + its bus are up (linger usually did this)
+systemctl start "user@${UID_N}.service" 2>/dev/null || true
+# Wait for the user bus to actually ANSWER, not merely for the socket FILE to exist.
+# The systemd --user manager creates /run/user/UID/bus early, before the bus is serving
+# name activations. If we adopt a half-up bus (export DBUS_SESSION_BUS_ADDRESS to it)
+# startxfce4 skips its own dbus-run-session fallback and launches xfce4-session against
+# a bus where xfconfd cannot activate -> the "unable to determine failsafe session name"
+# dialog. So we probe with a bounded ListNames and
+# only adopt the bus once it replies; otherwise we fall through to the guaranteed-clean
+# dbus-run-session path below, which always brings an activatable xfconfd.
+UBUS="${XDG_RUNTIME_DIR}/bus"
+bus_ok=0
+for _i in $(seq 1 30); do
+  if [ -S "${UBUS}" ] \
+     && DBUS_SESSION_BUS_ADDRESS="unix:path=${UBUS}" timeout 2 \
+          dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+          /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    bus_ok=1; break
+  fi
+  sleep 0.5
+done
+# Start the session after the boot home pull, so xfconfd reads the pulled Win95 panel
+# config and does not save the default layout. partyos-home-pull writes PULL_RAN on every
+# exit path. Wait up to ~5 min (600 x 0.5s), then start the desktop anyway.
+for _i in $(seq 1 600); do
+  [ -e /run/partyos-home-pull-ran ] && break
+  sleep 0.5
+done
+if [ "${bus_ok}" = 1 ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=${UBUS}"
+  dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR 2>/dev/null || true
+  if command -v startxfce4 >/dev/null 2>&1; then exec startxfce4; else exec xfce4-session; fi
+else
+  # no responsive user bus -> ephemeral bus (keeps the desktop + xfconfd working)
+  if command -v startxfce4 >/dev/null 2>&1; then exec dbus-run-session -- startxfce4
+  else exec dbus-run-session -- xfce4-session; fi
+fi

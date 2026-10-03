@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Windows Installer.exe
+Comment=setup.exe
+Icon=application-x-ms-dos-executable
+Exec=/usr/local/bin/partyos-win-installer
+Terminal=false
+Categories=System;partyOS;

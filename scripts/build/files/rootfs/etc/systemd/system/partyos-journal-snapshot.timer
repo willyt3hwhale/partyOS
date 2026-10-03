@@ -1,0 +1,13 @@
+[Unit]
+Description=partyOS - snapshot the journal to the USB every ~60s (diagnostics)
+
+[Timer]
+# First snapshot ~45s in (desktop is up by then), then every 60s. So even a hard-reset /
+# watchdog reboot loses at most ~60s of the journal we want to read back.
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=partyos-journal-snapshot.service
+
+[Install]
+WantedBy=timers.target

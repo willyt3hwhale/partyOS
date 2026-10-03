@@ -1,0 +1,11 @@
+[Unit]
+Description=partyOS - periodically drain the offline player-report queue
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=120s
+AccuracySec=5s
+Unit=partyos-report-flush.service
+
+[Install]
+WantedBy=timers.target

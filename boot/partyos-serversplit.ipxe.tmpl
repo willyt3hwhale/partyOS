@@ -1,0 +1,44 @@
+#!ipxe
+# partyOS server split boot script (TEMPLATE) - split netboot vs blob servers.
+# Rendered at serve time by scripts/vm/render-ipxe.sh, which substitutes BOTH
+# {{NETBOOT_URL}} (the boot-image server) and {{BLOB_URLS}} (the ordered, comma-
+# separated blob-server failover list). Reached automatically via the DHCP boot
+# filename, same as Steps 1-9 (no typed iPXE command).
+#
+# The split: the kernel/initramfs/squashfs (the BOOT IMAGE) come from the NETBOOT
+# server only. The game/tool blobs + catalog come from a SEPARATE blob-server URL
+# list - a DIFFERENT listener (and in production a different machine). The two
+# base-URLs are independent: {{BLOB_URLS}} is not derived from {{NETBOOT_URL}}.
+# serversplit-script.sh fetches the catalog + blobs from the blob URLs, trying
+# each in order (FAILOVER) until one answers.
+#
+# Boots the SAME custom XFCE image as Steps 3-9 (the 'gamer' user + curl), with
+# the SAME kernel/initramfs Step 2 RAM-boots. report_url= is the netboot/report
+# server; blob_urls= is the independent blob-server failover list.
+
+echo ================================================
+echo partyOS - Server Split (netboot vs blob)
+echo ================================================
+echo IP Address: ${ip}
+echo Netboot URL: {{NETBOOT_URL}}
+echo Blob URLs  : {{BLOB_URLS}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{NETBOOT_URL}}/report?step=serversplit&status=boot&ip=${ip} rs || echo callback-skipped
+imgfree rs || echo continuing
+
+echo Loading custom desktop image into RAM from the NETBOOT server...
+# archiso_http_srv -> the custom image dir on the NETBOOT server (boot image
+# only). copytoram pulls the whole sfs into RAM. console=ttyS0 mirrors to serial.
+# no_timer_check: QEMU q35+TCG timer-routing quirk. report_url= is the netboot/
+# report server; blob_urls= is the INDEPENDENT blob-server failover list the
+# in-guest serversplit-script.sh reads for its catalog + blob fetches.
+kernel {{NETBOOT_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{NETBOOT_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{NETBOOT_URL}}/boot/serversplit-script.sh report_url={{NETBOOT_URL}} blob_urls={{BLOB_URLS}} || goto failed
+
+echo Downloading initramfs from the NETBOOT server...
+initrd {{NETBOOT_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (server split)...
+boot || goto failed
+
+:failed
+echo partyOS server-split boot failed

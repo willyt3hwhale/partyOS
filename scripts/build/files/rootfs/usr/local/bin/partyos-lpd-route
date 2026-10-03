@@ -1,0 +1,95 @@
+#!/bin/bash
+# partyos-lpd-route - install the 239.0.0.0/8 multicast route aria2 LPD needs, on the
+# interface that carries the LAN address (the one aria2 binds LPD to). Idempotent.
+# It also installs a 255.255.255.255/32 route on the same interface. If DHCP gives no
+# gateway, then without a default route a sendto() to the limited broadcast
+# fails with ENETUNREACH. LAN game discovery (Warcraft III on UDP 6112) broadcasts
+# to 255.255.255.255, so without this route the game list stays empty.
+log(){ echo "partyos-lpd-route: $*"; }
+
+# Derive the LAN interface: the physical wired NIC that holds a global-scope IPv4
+# address AND has carrier (a live link). LPD is the ONLY peer discovery aria2 1.37
+# honours (the magnet x.pe is ignored), so landing this route on the wrong NIC - a
+# dead/no-carrier second port, or a slower link that came up first - silently kills
+# P2P: every client then falls back to hammering the server. So we are picky:
+#   1. only consider a real wired NIC that holds a global-scope IPv4 address;
+#   2. require carrier (operstate "up", or carrier==1) - a NIC with an address but no
+#      link is exactly the trap (aria2 binds it, the multicast never leaves);
+#   3. PREFER the iface that owns the default route / is the boot NIC (the one the
+#      kernel routes through), since that is the link the rest of the LAN traffic and
+#      the netboot already use; fall back to the first carrier-up addressed NIC.
+# Poll briefly so a NIC still negotiating carrier at boot gets a chance to come up.
+skip_iface(){  # true => not a candidate (virtual / loopback)
+  case "$1" in lo|docker*|veth*|br-*|virbr*|tap*|tun*|wg*) return 0;; *) return 1;; esac
+}
+has_carrier(){
+  local i="$1" op car
+  op="$(cat "/sys/class/net/${i}/operstate" 2>/dev/null || echo)"
+  car="$(cat "/sys/class/net/${i}/carrier" 2>/dev/null || echo)"
+  [ "${op}" = "up" ] || [ "${car}" = "1" ]
+}
+default_iface(){  # the iface the default route exits, if any (none on an offline LAN)
+  ip -o -4 route show default 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+addressed_ifaces(){  # all real NICs holding a global-scope IPv4 address
+  ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}'
+}
+pick_iface(){
+  local def cand=""
+  def="$(default_iface)"
+  # Prefer the default-route iface IF it is addressed + has carrier.
+  if [ -n "${def}" ] && ! skip_iface "${def}" && has_carrier "${def}" \
+      && addressed_ifaces | grep -qx "${def}"; then
+    printf '%s\n' "${def}"; return 0
+  fi
+  # Otherwise: first addressed wired NIC that actually has carrier.
+  for i in $(addressed_ifaces); do
+    skip_iface "${i}" && continue
+    has_carrier "${i}" || { [ -z "${cand}" ] && cand="${i}"; continue; }
+    printf '%s\n' "${i}"; return 0
+  done
+  # No carrier-up addressed NIC; surface the best addressed-but-no-carrier guess (if
+  # any) so the caller can log it loudly rather than silently picking nothing.
+  [ -n "${cand}" ] && { printf '%s\n' "${cand}"; return 1; }
+  return 1
+}
+IF=""
+for _ in $(seq 1 30); do
+  if IF="$(pick_iface)"; then break; fi   # rc=0 => a carrier-up addressed NIC
+  IF=""; sleep 0.5
+done
+if [ -z "${IF}" ]; then
+  # Last resort: re-run once accepting an addressed-but-no-carrier NIC so we at least
+  # install the route SOMEWHERE and log the degraded state LOUDLY (never fail silent).
+  IF="$(pick_iface || true)"
+fi
+if [ -z "${IF}" ]; then
+  log "WARN no LAN-addressed interface found after wait -> NO LPD multicast route added; aria2 LPD peer discovery DISABLED, peers come only from the tracker"
+  exit 0
+fi
+if ! has_carrier "${IF}"; then
+  log "WARN picked ${IF} but it has NO carrier (link down) -> LPD route may be on a dead link; P2P discovery likely degraded"
+fi
+
+# Idempotent add: ignore the route already existing ("File exists").
+add_route(){  # $1 = destination, $2 = purpose for the log
+  local dst="$1" why="$2"
+  if ip route show "${dst}" 2>/dev/null | grep -q "dev ${IF}"; then
+    log "route ${dst} dev ${IF} already present"; return 0
+  fi
+  if ip route add "${dst}" dev "${IF}" 2>/tmp/.lpd-route.err; then
+    log "added ${dst} dev ${IF} (${why})"
+  else
+    # "File exists" = a route appeared concurrently -> still success.
+    if grep -qi "File exists" /tmp/.lpd-route.err; then
+      log "${dst} dev ${IF} already existed"
+    else
+      log "failed to add ${dst} dev ${IF}: $(cat /tmp/.lpd-route.err)"
+    fi
+  fi
+  rm -f /tmp/.lpd-route.err 2>/dev/null
+}
+add_route 239.0.0.0/8 "aria2 LPD enabled"
+add_route 255.255.255.255/32 "limited broadcast for LAN game discovery"
+exit 0

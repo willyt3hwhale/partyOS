@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -u
+MNT=/mnt/usbhome
+SHARE=/mnt/share
+# SHARED mount lock - keep this literal IDENTICAL to USBHOME_MOUNT_LOCK in
+# partyos-sync-common.sh. This script is sysinit-early and does NOT source that file,
+# so the path is hardcoded here. The lock serializes the check-then-mount below
+# against the udev-coldplug partyos-usb-reinserted that races us for the same mount.
+USBHOME_MOUNT_LOCK="/run/partyos-usbhome-mount.lock"
+# IDEMPOTENT: udev coldplug replays an "add" at boot, which fires the ADD rule and
+# starts partyos-usb-reinserted - that mounts the home partition at /mnt/usbhome BEFORE
+# (or CONCURRENTLY WITH) this sysinit boot-mount runs. The device-match guard alone is
+# not atomic: both services can evaluate "not mounted" before either mounts, then both
+# mount, stacking two layers. So we wrap the whole check-then-mount in a flock on the
+# SHARED lock - the second arrival blocks, re-checks (now mounted), and skips. The lock
+# is bounded (-w 20) so a stuck holder can never wedge sysinit; worst case is a rare
+# double-mount, which umount_all on removal already drains.
+install -d "${MNT}"
+# The home partition has one of the home labels (see partyos-usb-labels.sh).
+# The USB home is required: partyOS never starts the desktop without the home stick mounted.
+# So this is a RETRY-UNTIL-MOUNTED loop, not a
+# timeout-then-give-up. Each ATTEMPT stays bounded (timeout 15 blkid / timeout 30 mount)
+# so a single slow/wedge-prone or D-state usb-storage syscall is killed and the loop
+# retries cleanly instead of one syscall freezing the loop uninterruptibly forever.
+# Between attempts we re-settle udev (the common intermittent case: the stick is still
+# enumerating and appears a second later) and sleep 2 to pace the loop (no CPU spin).
+# There is NO overall give-up: a genuinely-absent stick waits indefinitely - intended.
+# After a few failed attempts we surface a clear "insert your stick" message so an
+# absent stick reads as a prompt, not a mystery hang (plymouth if present, else tty1).
+# The service has NO TimeoutStartSec for the same reason (see the unit below).
+# user-facing prompt: plymouth splash covers boot; fall back to the console (tty1) if
+# the plymouth binary/daemon isn't up. Guarded with command -v so it's safe either way.
+usbhome_say() {
+    if command -v plymouth >/dev/null 2>&1; then
+        plymouth display-message --text="$1" 2>/dev/null && return 0
+    fi
+    echo "[partyOS] $1" > /dev/tty1 2>/dev/null || true
+}
+usbhome_say_clear() {
+    command -v plymouth >/dev/null 2>&1 && plymouth hide-message --text="$1" 2>/dev/null || true
+}
+# The accepted partition labels are an ordered list per partition (venue label
+# first, legacy label second), set on the kernel cmdline with a baked default.
+# partyos-usb-labels.sh resolves a label list to one device. If two sticks carry
+# the label, it picks the lowest partition UUID, so the choice is the same on
+# every boot.
+# shellcheck source=/dev/null
+. /usr/local/lib/partyos-usb-labels.sh
+resolve_home_dev() { partyos_resolve_label_dev home; }
+HOME_LABELS="$(partyos_usb_labels home | tr '\n' ' ' | sed 's/ $//')"
+SHARE_LABELS="$(partyos_usb_labels share | tr '\n' ' ' | sed 's/ $//')"
+# Critical section serialized on the SHARED mount lock (fd 8), scoped per-iteration to
+# exactly the check-then-mount: fd 8 closes on subshell exit, releasing the lock
+# immediately - nothing slow (no rsync/pull) runs under it. -w 20 bounds the wait so a
+# stuck holder never wedges the loop. The idempotency guard means if the racing
+# coldplug-reinsert path already mounted the home partition, we adopt it and break.
+_try=0
+while true; do
+    _try=$((_try + 1))
+    if (
+        flock -w 20 8 || echo "partyos-usbhome: WARN timed out on mount lock for ${MNT}, proceeding"
+        # The first home label found wins. With >1 stick on that label, the lowest UUID wins.
+        DEV="$(resolve_home_dev)"
+        if [ -n "${DEV}" ]; then
+            # RE-CHECK under the lock: if the racing reinsert path already mounted this exact
+            # device, adopt it and succeed - this is the whole point of serializing.
+            if mountpoint -q "${MNT}" 2>/dev/null && [ "$(findmnt -no SOURCE "${MNT}" 2>/dev/null | head -1)" = "${DEV}" ]; then
+                echo "partyos-usbhome: ${DEV} already mounted at ${MNT}, skipping"
+                exit 0
+            fi
+            # mounted on the wrong/stale device (or not at all): drain any stacked layers first.
+            if mountpoint -q "${MNT}" 2>/dev/null; then
+                echo "partyos-usbhome: ${MNT} mounted on wrong device, unmounting all"
+                for _i in 1 2 3 4 5 6 7 8 9 10; do
+                    mountpoint -q "${MNT}" 2>/dev/null || break
+                    umount -l "${MNT}" 2>/dev/null || umount -f "${MNT}" 2>/dev/null || break
+                done
+            fi
+            if timeout 30 mount -o rw,noatime "${DEV}" "${MNT}" 2>/dev/null || timeout 30 mount "${DEV}" "${MNT}" 2>/dev/null; then
+                echo "partyos-usbhome: mounted ${DEV} (label $(timeout 5 blkid -o value -s LABEL "${DEV}" 2>/dev/null)) at ${MNT} (rw)"
+                # A new venue stick has an EMPTY home partition (only lost+found). The
+                # steps below create the layout. partyos-home-pull then seeds home/ from
+                # the skel, and the first push writes the generation file.
+                if [ -z "$(ls -A "${MNT}" 2>/dev/null | grep -vx 'lost+found')" ]; then
+                    echo "partyos-usbhome: PARTYOS-USBHOME-FRESH ${DEV} is empty (only lost+found), creating the layout"
+                fi
+                install -d "${MNT}/.partyos-cache/games" 2>/dev/null || true
+                # .partyos-runcache holds the per-game Wine prefix copy (~3GB each) that
+                # proton blobs write at launch - it lives on the USB because the 4GB RAM
+                # overlay ENOSPCs after one prefix. The proton run.sh runs as the
+                # unprivileged desktop user (uid 1000), which cannot create a dir under
+                # the root-owned mount root, so pre-create it user-owned here (mirrors
+                # .partyos-cache/games). Outside home/ so the home --delete mirror never
+                # touches it. Without this the run.sh has no writable USB target and
+                # silently falls back to the RAM overlay (the ENOSPC this fixes).
+                install -d -o 1000 -g 1000 "${MNT}/.partyos-runcache" 2>/dev/null || \
+                    install -d "${MNT}/.partyos-runcache" 2>/dev/null || true
+                # .partyos-proton-envs holds the on-client wine "game envs" (a cloned
+                # wine prefix per env) that partyos-proton-env creates. Same story as
+                # .partyos-runcache: the engine runs as the unprivileged desktop user
+                # (uid 1000) and cannot mkdir under the root-owned mount root, so
+                # pre-create it user-owned here. Outside home/ so the home --delete
+                # mirror never touches the (large) prefixes.
+                install -d -o 1000 -g 1000 "${MNT}/.partyos-proton-envs" 2>/dev/null || \
+                    install -d "${MNT}/.partyos-proton-envs" 2>/dev/null || true
+                # home/ subdir backs the RAM /home/<user> (rsync'd). Keep config + blob
+                # cache at the partition ROOT, untouched by the home --delete mirror.
+                install -d "${MNT}/home" 2>/dev/null || true
+                exit 0
+            fi
+            echo "partyos-usbhome: WARN could not mount ${DEV} (attempt ${_try}), retrying"
+            exit 1
+        fi
+        echo "partyos-usbhome: no home partition (labels: ${HOME_LABELS}) yet (attempt ${_try}), waiting for stick"
+        exit 1
+    ) 8>"${USBHOME_MOUNT_LOCK}"; then
+        # mounted (or adopted an existing mount) - clear the prompt and move on.
+        usbhome_say_clear "Waiting for your USB home stick - please insert it..."
+        break
+    fi
+    # not mounted this attempt. Prompt the user every 5th iteration so an absent stick
+    # reads as "insert it", not a hang - but don't spam every 2s.
+    if [ $((_try % 5)) -eq 1 ]; then
+        usbhome_say "Waiting for your USB home stick - please insert it..."
+    fi
+    # re-probe in case the stick is still enumerating (the common intermittent case),
+    # then pace the loop. Both are bounded; the sleep 2 keeps CPU near-idle.
+    udevadm settle --timeout=5 2>/dev/null || true
+    sleep 2
+done
+# The cross-OS exFAT share (a share label), mounted in-session at ~/Shared via a
+# symlink to /mnt/share. exFAT has no unix ownership, so force uid/gid 1000 + a sane
+# umask so the desktop user owns it. Best-effort: a legacy 2-partition stick (no
+# share) or a missing exfat driver just skips - nothing depends on it.
+# Same SHARED mount lock (fd 8, scoped to this subshell) guards the share
+# check-then-mount against the racing reinsert path. Bounded -w 20, released on exit.
+(
+    flock -w 20 8 || echo "partyos-usbhome: WARN timed out on mount lock for ${SHARE}, proceeding"
+    SDEV="$(partyos_resolve_label_dev share)"
+    if [ -n "${SDEV}" ]; then
+        if mountpoint -q "${SHARE}" 2>/dev/null && [ "$(findmnt -no SOURCE "${SHARE}" 2>/dev/null | head -1)" = "${SDEV}" ]; then
+            echo "partyos-usbhome: ${SDEV} already mounted at ${SHARE}, skipping"
+        else
+            # mounted on the wrong/stale device (or not at all): drain any stacked layers first.
+            if mountpoint -q "${SHARE}" 2>/dev/null; then
+                echo "partyos-usbhome: ${SHARE} mounted on wrong device, unmounting all"
+                for _i in 1 2 3 4 5 6 7 8 9 10; do
+                    mountpoint -q "${SHARE}" 2>/dev/null || break
+                    umount -l "${SHARE}" 2>/dev/null || umount -f "${SHARE}" 2>/dev/null || break
+                done
+            fi
+            install -d "${SHARE}"
+            if timeout 30 mount -o rw,noatime,uid=1000,gid=1000,umask=0022 "${SDEV}" "${SHARE}" 2>/dev/null \
+               || timeout 30 mount "${SDEV}" "${SHARE}" 2>/dev/null; then
+                echo "partyos-usbhome: mounted ${SDEV} (label $(timeout 5 blkid -o value -s LABEL "${SDEV}" 2>/dev/null)) at ${SHARE} (exFAT share)"
+            else
+                # Keep the empty /mnt/share mountpoint as a present placeholder (do
+                # NOT rmdir it) so ~/Shared resolves to an empty dir instead of dangling.
+                echo "partyos-usbhome: WARN could not mount the share ${SDEV} (leaving empty placeholder)"
+            fi
+        fi
+    else
+        echo "partyos-usbhome: no share partition (labels: ${SHARE_LABELS}), no cross-OS share this boot"
+    fi
+) 8>"${USBHOME_MOUNT_LOCK}"
+exit 0

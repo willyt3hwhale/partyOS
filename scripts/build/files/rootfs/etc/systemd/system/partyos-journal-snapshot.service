@@ -1,0 +1,12 @@
+[Unit]
+Description=partyOS - snapshot the live journal to the USB (per-boot diagnostics)
+# The USB home must be mounted first (the snapshot destination).
+After=partyos-usbhome.service systemd-journald.service
+Wants=partyos-usbhome.service
+ConditionPathIsMountPoint=/mnt/usbhome
+
+[Service]
+Type=oneshot
+# Bounded so a slow/absent stick can NEVER hang the timer or boot - the script is best-effort.
+TimeoutStartSec=60
+ExecStart=/usr/local/bin/partyos-journal-snapshot

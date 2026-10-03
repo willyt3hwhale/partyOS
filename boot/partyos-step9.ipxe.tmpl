@@ -1,0 +1,42 @@
+#!ipxe
+# partyOS Step 9 boot script (TEMPLATE) - server boot scripts.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1-8 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-8 (server/images/custom/, which has
+# the 'gamer' user + curl), with the SAME kernel/initramfs Step 2 RAM-boots. The
+# only difference from Step 7/8 is the fetched automated-script: step9-script.sh,
+# which fetches + runs the SERVER-side per-boot script (server/boot-config.sh)
+# BEFORE bringing up the desktop, tolerating any failure (server down / non-zero
+# exit), then brings up the headless XFCE desktop. config_url= points at the
+# SEPARATE boot-script server (so the harness can kill JUST it, keeping the OS
+# server up to RAM-boot). boot_label= distinguishes the server-up vs server-down
+# boots for the harness; the script logic is the same.
+
+echo ================================================
+echo partyOS Step 9 - Server Boot Scripts
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=9&status=boot&ip=${ip} r9 || echo callback-skipped
+imgfree r9 || echo continuing
+
+echo Loading custom desktop image into RAM (Step 9 server boot scripts)...
+# archiso_http_srv -> the custom image dir (arch/x86_64/airootfs.sfs); copytoram
+# pulls the whole sfs into RAM. console=ttyS0 mirrors to the serial line the
+# harness scrapes. no_timer_check: QEMU q35+TCG timer-routing quirk. report_url=
+# is read by step9-script.sh for the server-script fetch + HTTP callback (no
+# hardcoded IP). boot_label= tells the script (and markers/callback) whether this
+# is the server-up or server-down boot.
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step9-script.sh report_url={{SERVER_URL}} config_url={{CONFIG_URL}} boot_label={{BOOT_LABEL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (server boot scripts)...
+boot || goto failed
+
+:failed
+echo partyOS Step 9 boot failed

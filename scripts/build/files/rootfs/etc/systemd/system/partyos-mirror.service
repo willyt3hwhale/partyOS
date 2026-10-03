@@ -1,0 +1,12 @@
+[Unit]
+Description=partyOS LAN pacman mirror setup
+After=network-online.target partyos-keyring-init.service
+Wants=network-online.target
+Requires=partyos-keyring-init.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=30s
+ExecStart=/usr/local/bin/partyos-mirror-setup
+[Install]
+WantedBy=multi-user.target

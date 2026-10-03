@@ -1,0 +1,10 @@
+[Unit]
+Description=partyOS - handle home stick removal of device %i (pause sync + notify)
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30s
+# %i is the MAJ:MIN of the removed partition. The udev rule 99-partyos-usbhome.rules
+# sets it. The handler unmounts only if %i is the device behind /mnt/usbhome.
+ExecStart=/usr/local/bin/partyos-usb-removed %i

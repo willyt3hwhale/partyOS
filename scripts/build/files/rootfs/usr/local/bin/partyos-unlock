@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# partyos-unlock - GUI front door for the hidden-game code-unlock feature.
+set -u
+toast() { notify-send -t 6000 "partyOS" "$1" 2>/dev/null || true; }
+# zenity reads --text as Pango markup. If the markup is not valid, zenity shows its
+# default text ("All updates are complete."). Escape &, < and > in all text.
+markup() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+code="$(zenity --entry --width=420 --title="partyOS - Enter a Code" \
+    --text="Enter a code to unlock hidden games:" 2>/dev/null)" || exit 0
+[ -n "${code}" ] || exit 0
+
+out="$(partyos-app unlock-code "${code}" 2>&1)"; rc=$?
+if [ "${rc}" = "0" ]; then
+    names="$(printf '%s\n' "${out}" | sed -n 's/.*PARTYOS-APP-UNLOCK-OK .*names=//p' | head -1)"
+    [ -n "${names}" ] || names="a game"
+    toast "Code accepted - unlocked: ${names}"
+    zenity --info --width=420 --title="partyOS - Unlocked" \
+        --text="$(markup "Code accepted.\n\nUnlocked: ${names}\n\nThe unlocked games are now in Apps & Games.")" 2>/dev/null || true
+else
+    toast "Invalid code - nothing unlocked."
+    zenity --error --width=420 --title="partyOS - Invalid Code" \
+        --text="That code did not match any hidden game.\n\nCheck the code and try again." 2>/dev/null || true
+fi

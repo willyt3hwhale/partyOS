@@ -1,0 +1,33 @@
+[Unit]
+Description=partyOS - mount the participant USB home (a home label, see partyos-usb-labels.sh)
+DefaultDependencies=no
+# No systemd-udev-settle dep - deprecated, and on real hardware it never drains in
+# its ~90-120s window, stalling sysinit + disordering late userspace (the xfce
+# failsafe-session dialog + network bring-up failure on a real-hardware test).
+# The ExecStart already has its own retry-until-mounted label lookup loop
+# (bounded `udevadm settle` between tries), so the global settle gate is redundant.
+# NOT replaced with a dev-disk-by-label-*.device dep either: that synthesized unit
+# never activated in-window on this archiso (tried, then reverted).
+Before=partyos-identity.service sysinit.target
+# Reboot-hang fix: with DefaultDependencies=no this unit has no implicit
+# ordering against shutdown, so a udev event during shutdown could re-activate its
+# INFINITE ExecStart mount-loop and wedge umount.target. Conflicts+Before pull it OUT
+# of the shutdown transaction: it is stopped (not restarted) when shutdown.target is
+# isolated, so its mount-loop can never re-trigger on the way down.
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No start timeout. The USB home is required, and ExecStart retries until the home
+# partition mounts. A TimeoutStartSec would stop that loop. We therefore leave it at the default
+# (infinity): the unit waits as long as it takes for the stick to appear. This is safe
+# from the D-state/wedge angle because each INNER mount attempt is bounded by
+# `timeout 30 mount` (and `timeout 15 blkid`), so no single syscall can freeze
+# uninterruptibly - the loop only ever WAITS (sleep 2 + udevadm settle between tries),
+# it never hangs. An absent stick prompts the user ("insert it") and keeps waiting.
+ExecStart=/usr/local/bin/partyos-usbhome
+
+[Install]
+WantedBy=sysinit.target

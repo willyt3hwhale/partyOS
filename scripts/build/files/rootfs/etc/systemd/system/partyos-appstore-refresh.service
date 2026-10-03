@@ -1,0 +1,7 @@
+[Unit]
+Description=partyOS - re-generate app-store shortcuts from the LAN catalog (timer-driven)
+After=network-online.target partyos-identity.service partyos-home-pull.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/partyos-appstore-refresh

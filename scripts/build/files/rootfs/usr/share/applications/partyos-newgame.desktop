@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=New Windows Game
+Comment=Install and play a Windows game in a wine env on your USB stick
+Icon=applications-other
+Exec=/usr/local/bin/partyos-newgame
+Terminal=false
+Categories=Game;partyOS;

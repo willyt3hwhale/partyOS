@@ -1,0 +1,17 @@
+#!/bin/bash
+cat <<'ART'
+                       _    OS
+   _ __   __ _ _ __| |_ _   _
+  | '_ \ / _` | '__| __| | | |
+  | |_) | (_| | |  | |_| |_| |
+  | .__/ \__,_|_|   \__|\__, |
+  |_|                   |___/   made by LilWil
+ART
+QUIPS=(
+  "Tech support: there is none. Try turning the LAN off and on again."
+  "If it breaks, that's a feature. - LilWil"
+  "Fuelled by Mountain Dew and questionable decisions."
+  "There is no cloud. There is only the guy in the corner with the server."
+  "100% hand-crafted bugs. Free of charge."
+)
+echo "${QUIPS[$((RANDOM % ${#QUIPS[@]}))]}"

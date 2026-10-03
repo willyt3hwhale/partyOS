@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<!-- partyOS portal (TEMPLATE). Rendered by scripts/deploy/render.sh -> portal/
+     index.html, substituting the deploy.conf addresses. Served at {{PXE_URL}}/portal
+     and cached locally on each client; the browser opens the local copy so the FAQ
+     and LAN service directory work even with the server busy/offline. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>partyOS - FAQ</title>
+<style>
+  body { background:#008080; color:#000; font-family:"MS Sans Serif",Tahoma,sans-serif;
+         font-size:13px; margin:0; padding:24px; }
+  .win { background:#c0c0c0; border:2px solid #fff; border-right-color:#404040;
+         border-bottom-color:#404040; max-width:760px; margin:0 auto 18px; padding:0; }
+  .title { background:linear-gradient(90deg,#000080,#1084d0); color:#fff; font-weight:bold;
+           padding:4px 8px; display:flex; justify-content:space-between; }
+  .body { padding:14px 18px; }
+  h1 { font-size:20px; margin:.2em 0; }
+  a { color:#000080; }
+  ul.links { list-style:none; padding:0; }
+  ul.links li { padding:6px 0; border-bottom:1px dotted #808080; }
+  .svc { font-weight:bold; }
+  .faq dt { font-weight:bold; margin-top:10px; }
+  .foot { text-align:center; color:#c0c0c0; font-size:11px; }
+  code { background:#fff; border:1px solid #808080; padding:0 3px; }
+</style>
+</head>
+<body>
+  <div class="win">
+    <div class="title"><span>Welcome to partyOS</span><span>_ &#9633; &#10005;</span></div>
+    <div class="body">
+      <h1>partyOS FAQ</h1>
+      <p>No internet here - just us. Everything below lives on the LAN.</p>
+    </div>
+  </div>
+
+  <div class="win">
+    <div class="title"><span>Network Neighborhood</span><span>_ &#9633; &#10005;</span></div>
+    <div class="body">
+      <ul class="links">
+        <li><span class="svc">NYET Messenger (IRC)</span> - server <code>{{IRC_SERVER}}</code>, channel <code>#auditorium</code></li>
+        <li><span class="svc">App Store</span> - the <b>Apps &amp; Games</b> folder on the desktop (Games / Internet / Creative / Tools subfolders)</li>
+        <li><span class="svc">Arch mirror</span> - <code>{{MIRROR_URL}}</code> (extra software, on demand)</li>
+        <li><span class="svc">Game blobs</span> - <code>{{BLOB_URL}}</code></li>
+        <li><span class="svc">Boot/report server</span> - <code>{{PXE_URL}}</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="win">
+    <div class="title"><span>FAQ</span><span>_ &#9633; &#10005;</span></div>
+    <div class="body">
+      <dl class="faq">
+        <dt>How do I install a game?</dt>
+        <dd>Open <b>Apps &amp; Games</b> on the desktop, then <b>Games</b>, and double-click one. It downloads from the LAN and launches.</dd>
+        <dt>Where are my files saved?</dt>
+        <dd>On your USB stick (your home directory). It syncs automatically; pull it only when told it is safe.</dd>
+        <dt>How do I chat?</dt>
+        <dd>Open <b>NYET Messenger</b> - it auto-connects to the LAN IRC server and joins <code>#auditorium</code>.</dd>
+        <dt>The internet does not work!</dt>
+        <dd>Correct. There is no internet. That is the point.</dd>
+        <dt>Who made this?</dt>
+        <dd><b>LilWil</b>. Solo. Should have slept more. If it breaks, that's a feature.
+        (Psst - try the Konami code on this page.)</dd>
+      </dl>
+    </div>
+  </div>
+
+  <p class="foot">partyOS - PXE-booted from RAM - {{PXE_URL}}<br>
+  made with love &amp; spite by LilWil</p>
+
+  <script>
+  // Easter egg: Konami code (up up down down left right left right B A) -> PARTY MODE.
+  (function(){
+    var seq=[38,38,40,40,37,39,37,39,66,65], pos=0;
+    document.addEventListener('keydown', function(e){
+      pos = (e.keyCode === seq[pos]) ? pos+1 : 0;
+      if (pos === seq.length){
+        pos = 0;
+        var on=true, n=0, iv=setInterval(function(){
+          document.body.style.filter = on ? 'hue-rotate(180deg) saturate(3)' : '';
+          on=!on; if(++n>12){clearInterval(iv); document.body.style.filter='';}
+        }, 180);
+        alert('PARTY MODE UNLOCKED!\n\npartyOS by LilWil. You found the secret.\nTouch grass... after the LAN.');
+      }
+    });
+  })();
+  </script>
+</body>
+</html>

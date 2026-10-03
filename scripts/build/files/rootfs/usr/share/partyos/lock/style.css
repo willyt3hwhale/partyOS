@@ -1,0 +1,9 @@
+/* partyOS Win95 "Welcome to Windows" locker - only the bits Chicago95 doesn't theme. */
+/* Teal #008080 fullscreen background. The locker occludes the wallpaper, so it must
+   paint its own teal or you'd see black/grey behind the dialog. */
+.lock-bg            { background-color: #008080; }
+/* Navy #000080 titlebar with white bold title text - the classic Win95 active title. */
+.win95-title        { background-color: #000080; }
+.win95-title-label  { color: #ffffff; font-weight: bold; }
+/* Tight cosmetic titlebar buttons (?/X): small raised faces, no extra padding. */
+.win95-titlebtn     { min-width: 16px; min-height: 14px; padding: 0; margin: 0; }

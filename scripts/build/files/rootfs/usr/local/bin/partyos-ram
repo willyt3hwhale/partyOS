@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# partyos-ram - partyOS RAM lifecycle / eviction manager.
+#
+# Responsibilities:
+#   * project a blob's launch-time RAM need (see required_mb),
+#   * compare against effective free RAM,
+#   * if it won't fit, decide what to unmount to make room (interactive prompt;
+#     non-interactive deterministic mode for tests), offering BOTH idle and
+#     in-use blobs but NEVER auto-evicting an in-use one,
+#   * safely unmount = drop the overlay + free the squashfs from RAM.
+#
+# Refcount model: a blob is "in use" while a launch holds a ref. partyos-app
+# brackets a run with `mark-busy NAME` ... `mark-idle NAME`. The refcount lives
+# at /run/partyos-ram/ref/<name> (integer; >0 = in use). Mount-only blobs are
+# idle (ref 0). idle vs in-use drives the eviction offer + protection.
+#
+# Effective free RAM: real `free -m` MemAvailable, UNLESS PARTYOS_FREE_MB is set
+# (test override, so a tight-RAM scenario is deterministic without huge games).
+#
+# Subcommands:
+#   free-mb                          effective free RAM (MB)
+#   project CATALOG NAME             echo "ram_min=<m> ram_max=<x> shm_mb=<s> required=<r>"
+#   mark-busy NAME / mark-idle NAME  refcount ++/-- (launch bracketing)
+#   refs [NAME]                      print refcount(s)
+#   state                            print mounted blobs with ref + state(idle|busy)
+#   fits CATALOG NAME                exit 0 if the blob's required <= free, else 1
+#   ensure-room CATALOG NAME GAMES_DIR
+#       The launch gate. If NAME already fits free RAM -> ok. Else prompt/decide
+#       which mounted blob(s) to evict (idle offered + auto-chosen first; in-use
+#       offered to the user but never auto-evicted) until NAME fits or nothing
+#       idle is left. Honours PARTYOS_RAM_NONINTERACTIVE=1 (auto-evict idle by
+#       LRU-ish order). Prints PARTYOS-RAM-* markers throughout.
+#   evict NAME GAMES_DIR             safe-unmount NAME (refuses if in use)
+#   cache-evict CACHE_DIR RESERVE_GB MAX_GB [KEEP]   trim the persistent USB
+#       blob cache: evict LRU (atime) <name>.squashfs until the stick keeps
+#       RESERVE_GB free and (if MAX_GB>0) total cached size stays under it. Never
+#       evicts KEEP, a mounted lower, or an in-use refcount. Best-effort floor.
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+
+REF_DIR="/run/partyos-ram/ref"
+MNT_BASE="/run/partyos-games"
+install -d "${REF_DIR}" 2>/dev/null || true
+
+# Serialize every read-modify-write of the refcount AND the evict busy-check so a
+# launch's `mark-busy` (read 0 -> write 1) cannot race an eviction's `is_busy` (read 0
+# -> evict) and yank a just-started game out from under the player. mark_busy/mark_idle
+# and the evict busy-gate all take THIS lock, so they never interleave. flock auto-
+# releases on fd close (subshell exit). Falls back to no-lock if flock is missing.
+REF_LOCK="/run/partyos-ram/refcount.lock"
+with_ref_lock() {  # with_ref_lock <cmd...> : run cmd while holding the refcount lock
+    if command -v flock >/dev/null 2>&1; then
+        ( flock -w 10 8 || true; "$@" ) 8>"${REF_LOCK}"
+    else
+        "$@"
+    fi
+}
+
+# --- effective free RAM (MB).
+# Real path: /proc/meminfo MemAvailable - a real eviction (umount of the squashfs
+# lower) actually returns RAM to the kernel, so a re-read reflects it.
+# Test path: PARTYOS_FREE_MB sets a deterministic BASE free figure (so a tight
+# scenario does not need multi-GB real games). Because umounting a tiny dummy
+# squashfs does not move /proc/meminfo by ram_max, the manager CREDITS the freed
+# blob's ram_max to the effective free figure in test mode - modelling the RAM the
+# blob WOULD have occupied. The credit accumulates in FREED_FILE across evicts.
+FREED_FILE="/run/partyos-ram/freed_mb"
+freed_credit() { [ -f "${FREED_FILE}" ] && cat "${FREED_FILE}" 2>/dev/null || echo 0; }
+add_freed() { local c; c="$(freed_credit)"; echo "$(( c + ${1:-0} ))" > "${FREED_FILE}"; }
+free_mb() {
+    if [ -n "${PARTYOS_FREE_MB:-}" ]; then printf '%s\n' "$(( PARTYOS_FREE_MB + $(freed_credit) ))"; return; fi
+    local kb
+    kb="$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)"
+    [ -n "${kb}" ] || kb="$(awk '/^MemFree:/{print $2; exit}' /proc/meminfo 2>/dev/null)"
+    [ -n "${kb}" ] || kb=0
+    printf '%s\n' "$(( kb / 1024 ))"
+}
+
+# --- catalog parse (line-oriented: the catalog has one field per line) --------
+_block() {
+    local catalog="$1" name="$2"
+    awk -v want="${name}" '
+        /\{/ { buf=""; inb=1 }
+        inb { buf = buf $0 "\n" }
+        /"name":[[:space:]]*"/ { line=$0; sub(/.*"name":[[:space:]]*"/,"",line); sub(/".*/,"",line); cur=line }
+        /\}/ { if (inb && cur==want) { printf "%s", buf; exit } inb=0 }
+    ' "${catalog}"
+}
+_val() {
+    local block="$1" key="$2"
+    printf '%s\n' "${block}" \
+      | grep -oE "\"${key}\":[[:space:]]*(\"[^\"]*\"|[0-9]+)" | head -1 \
+      | sed -E "s/\"${key}\":[[:space:]]*//; s/^\"//; s/\"$//"
+}
+ram_min_of() { local b; b="$(_block "$1" "$2")"; local v; v="$(_val "${b}" ram_min)"; printf '%s\n' "${v:-0}"; }
+ram_max_of() { local b; b="$(_block "$1" "$2")"; local v; v="$(_val "${b}" ram_max)"; printf '%s\n' "${v:-0}"; }
+# shm_mb = the /dev/shm prefix copy a proton blob's run.sh makes at launch
+# (prefix-template size + 1GB headroom). build-proton-blob.sh writes it.
+shm_mb_of() { local b; b="$(_block "$1" "$2")"; local v; v="$(_val "${b}" shm_mb)"; printf '%s\n' "${v:-0}"; }
+# overlay = 1 when the blob's run.sh OVERLAYS the read-only prefix-template with a small
+# delta upper on the USB stick (build-proton-blob.sh) instead of copying the ~3GB prefix
+# into /dev/shm/RAM. For such blobs the RAM cost is the game working set + headroom.
+# Boolean field (true/1) in the catalog row; _val only matches quoted/numeric, so match
+# the JSON bool directly.
+overlay_of() {
+    local b; b="$(_block "$1" "$2")"
+    printf '%s' "${b}" | grep -qE '"overlay"[[:space:]]*:[[:space:]]*(true|1)' && echo 1 || echo 0
+}
+
+# proton = 1 when the blob is a WINE/Proton game (wc3, flatout2, haloce, protonenv). ONLY
+# these copy/overlay a wine prefix and can incur a /dev/shm charge. Native games (ncdc,
+# supertuxkart, xonotic, ...) run their binary straight from the squashfs under bwrap - no
+# prefix, no /dev/shm copy - so they must NOT be charged the legacy 4GB prefix-copy estimate.
+proton_of() {
+    local b; b="$(_block "$1" "$2")"
+    printf '%s' "${b}" | grep -qE '"proton"[[:space:]]*:[[:space:]]*(true|1)' && echo 1 || echo 0
+}
+
+# Runtime/DXVK safety headroom (MB): the game process + DXVK shader cache + X working
+# set on TOP of the game's own working set. Conservative fixed margin; override for tuning.
+RUNTIME_HEADROOM_MB="${PARTYOS_RUNTIME_HEADROOM_MB:-1024}"
+
+# Locate the on-disk squashfs for a blob (USB cache first, then RAM cache). Used by
+# the shm fallback and to size the squashfs RAM cost.
+blob_squashfs_path() {
+    local name="$1" d
+    for d in /mnt/usbhome/.partyos-cache/games /var/cache/partyos/games "${RAM_CACHE:-/var/cache/partyos/games}"; do
+        [ -f "${d}/${name}.squashfs" ] && { printf '%s\n' "${d}/${name}.squashfs"; return 0; }
+    done
+    return 1
+}
+blob_squashfs_mb() {
+    local p; p="$(blob_squashfs_path "$1")" || { echo 0; return; }
+    local mb; mb="$(du -sm "${p}" 2>/dev/null | cut -f1)"
+    case "${mb}" in ''|*[!0-9]*) mb=0;; esac
+    printf '%s\n' "${mb}"
+}
+
+# effective_shm_mb CATALOG NAME: the /dev/shm need.
+#   1. catalog/meta shm_mb if present.
+#   2. Else, for a proton blob: max(ram_max, on-disk squashfs MB, 4096).
+effective_shm_mb() {
+    local catalog="$1" name="$2"
+    # Overlay blobs make no /dev/shm copy.
+    [ "$(overlay_of "${catalog}" "${name}")" = 1 ] && { echo 0; return; }
+    # A declared shm_mb always wins, regardless of the proton flag.
+    local s; s="$(shm_mb_of "${catalog}" "${name}")"
+    if [ "${s:-0}" -gt 0 ] 2>/dev/null; then printf '%s\n' "${s}"; return; fi
+    # Native (non-proton) blobs have no wine prefix and make no /dev/shm copy.
+    [ "$(proton_of "${catalog}" "${name}")" != 1 ] && { echo 0; return; }
+    local rmax sq; rmax="$(ram_max_of "${catalog}" "${name}")"; sq="$(blob_squashfs_mb "${name}")"
+    local est=4096
+    [ "${rmax:-0}" -gt "${est}" ] 2>/dev/null && est="${rmax}"
+    [ "${sq:-0}"   -gt "${est}" ] 2>/dev/null && est="${sq}"
+    printf '%s\n' "${est}"
+}
+
+# required_mb CATALOG NAME: the new RAM this launch consumes.
+#   = shm prefix copy  +  runtime/DXVK headroom  +  squashfs RAM cost
+# The squashfs term is the compressed on-disk size, a lower bound. It is 0 if the
+# blob is not on disk.
+required_mb() {
+    local catalog="$1" name="$2"
+    # Overlay and native blobs make no /dev/shm prefix copy. Their cost is
+    # max(ram_min, 1024) + runtime headroom.
+    if [ "$(overlay_of "${catalog}" "${name}")" = 1 ] || [ "$(proton_of "${catalog}" "${name}")" != 1 ]; then
+        local ws; ws="$(ram_min_of "${catalog}" "${name}")"
+        case "${ws}" in ''|*[!0-9]*) ws=0;; esac
+        [ "${ws}" -ge 1024 ] || ws=1024
+        printf '%s\n' "$(( ws + RUNTIME_HEADROOM_MB ))"
+        return
+    fi
+    local shm sq; shm="$(effective_shm_mb "${catalog}" "${name}")"; sq="$(blob_squashfs_mb "${name}")"
+    printf '%s\n' "$(( shm + RUNTIME_HEADROOM_MB + sq ))"
+}
+
+# --- refcount -----------------------------------------------------------------
+ref_of()  { local f="${REF_DIR}/$1"; [ -f "${f}" ] && cat "${f}" 2>/dev/null || echo 0; }
+ref_set() { echo "$2" > "${REF_DIR}/$1"; }
+# The RMW (read ref, +/-1, write back) MUST be atomic against a concurrent
+# eviction's busy-check, or a launch can read refs=0 just as an evictor also reads 0 and
+# the game gets unmounted out from under the player. with_ref_lock serializes all three.
+_mark_busy() {
+    local n="$1" r; r="$(ref_of "${n}")"; r=$((r+1)); ref_set "${n}" "${r}"
+    say "PARTYOS-RAM-BUSY name=${n} refs=${r}"
+}
+_mark_idle() {
+    local n="$1" r; r="$(ref_of "${n}")"; r=$((r-1)); [ "${r}" -lt 0 ] && r=0; ref_set "${n}" "${r}"
+    say "PARTYOS-RAM-IDLE name=${n} refs=${r}"
+}
+mark_busy() { with_ref_lock _mark_busy "$1"; }
+mark_idle() { with_ref_lock _mark_idle "$1"; }
+is_busy() { [ "$(ref_of "$1")" -gt 0 ]; }
+
+# --- mounted-blob discovery (a blob is "mounted" if its games/<n> overlay is up)
+# We learn the set of mounted blobs from the lowerdir mounts under MNT_BASE.
+mounted_blobs() {
+    local b
+    for b in "${MNT_BASE}"/*; do
+        [ -d "${b}" ] || continue
+        case "${b}" in *.rw) continue;; esac
+        local n; n="$(basename "${b}")"
+        mountpoint -q "${b}" 2>/dev/null && printf '%s\n' "${n}"
+    done
+}
+
+# --- safe unmount: drop the overlay + free the squashfs lower (frees RAM) ------
+# Refuses an in-use blob unless FORCE=1 (the user explicitly chose it).
+# The busy-check + the actual teardown run under with_ref_lock so a concurrent
+# mark-busy (a launch claiming this blob) cannot land BETWEEN "is_busy says idle" and
+# the umount - which would unmount a game the player just started. `umount -l` is lazy
+# (non-blocking), so holding the lock through it cannot wedge another mark/evict.
+_evict_locked() {
+    local name="$1" games="$2" force="${3:-0}"
+    local dest="${games}/${name}" lower="${MNT_BASE}/${name}" scratch="${MNT_BASE}/${name}.rw"
+    if is_busy "${name}" && [ "${force}" != "1" ]; then
+        say "PARTYOS-RAM-PROTECT name=${name} refs=$(ref_of "${name}") (in use - not evicted)"
+        return 2
+    fi
+    umount "${dest}"    2>/dev/null || umount -l "${dest}"    2>/dev/null || true
+    umount "${lower}"   2>/dev/null || umount -l "${lower}"   2>/dev/null || true   # frees squashfs from RAM
+    umount "${scratch}" 2>/dev/null || umount -l "${scratch}" 2>/dev/null || true   # frees tmpfs upper
+    ref_set "${name}" 0
+    if mountpoint -q "${dest}" 2>/dev/null; then
+        say "PARTYOS-RAM ERROR ${name} still mounted after evict"; return 1
+    fi
+    say "PARTYOS-RAM-EVICTED name=${name} (overlay dropped, squashfs freed from RAM)"
+    return 0
+}
+evict() { with_ref_lock _evict_locked "$@"; }
+
+# --- the launch gate ----------------------------------------------------------
+# ensure-room CATALOG NAME GAMES_DIR: make NAME fit free RAM, evicting if needed.
+ensure_room() {
+    local catalog="$1" name="$2" games="$3"
+    local rmin rmax shm req free
+    rmin="$(ram_min_of "${catalog}" "${name}")"; rmax="$(ram_max_of "${catalog}" "${name}")"
+    shm="$(effective_shm_mb "${catalog}" "${name}")"
+    # Gate on required_mb. ram_min is only logged.
+    req="$(required_mb "${catalog}" "${name}")"
+    free="$(free_mb)"
+    say "PARTYOS-RAM-CHECK name=${name} ram_min=${rmin}MB ram_max=${rmax}MB shm_mb=${shm}MB required=${req}MB free=${free}MB"
+    if [ "${free}" -ge "${req}" ]; then
+        say "PARTYOS-RAM-FITS name=${name} (free=${free}MB >= required=${req}MB) no eviction needed"
+        return 0
+    fi
+    local short=$(( req - free ))
+    say "PARTYOS-RAM-SHORTFALL name=${name} need=${req}MB free=${free}MB short=${short}MB - eviction required"
+
+    # Build the candidate list: idle blobs first (offered + auto-evictable),
+    # then in-use ones (offered to the user, never auto-evicted).
+    local idle=() busy=() b
+    while IFS= read -r b; do
+        [ -n "${b}" ] || continue
+        [ "${b}" = "${name}" ] && continue
+        if is_busy "${b}"; then busy+=("${b}"); else idle+=("${b}"); fi
+    done < <(mounted_blobs)
+    say "PARTYOS-RAM-OFFER idle=$(IFS=,; echo "${idle[*]:-}") in_use=$(IFS=,; echo "${busy[*]:-}")"
+
+    local noninteractive="${PARTYOS_RAM_NONINTERACTIVE:-0}"
+    local chosen=""
+    if [ "${noninteractive}" = "1" ]; then
+        # Deterministic test path: auto-evict IDLE blobs (oldest cache atime first)
+        # until NAME fits. Never auto-evicts an in-use blob.
+        if [ "${#idle[@]}" -eq 0 ]; then
+            say "PARTYOS-RAM-NOROOM name=${name} (no idle blob to evict; in-use protected)"
+            return 1
+        fi
+        # order idle by squashfs lower atime (LRU-ish), oldest first
+        local ordered
+        ordered="$(for b in "${idle[@]}"; do printf '%s\t%s\n' "$(stat -c %X "${MNT_BASE}/${b}" 2>/dev/null || echo 0)" "${b}"; done | sort -n | cut -f2)"
+        local ev
+        while IFS= read -r ev; do
+            [ -n "${ev}" ] || continue
+            if evict "${ev}" "${games}" 0; then
+                chosen="${chosen}${chosen:+,}${ev}"
+                add_freed "$(ram_max_of "${catalog}" "${ev}")"   # credit the RAM the blob held (test model)
+            fi
+            free="$(free_mb)"
+            say "PARTYOS-RAM-AFTER-EVICT freed_via=${ev} free=${free}MB"
+            [ "${free}" -ge "${req}" ] && break
+        done <<< "${ordered}"
+    else
+        # Interactive: present the menu (idle + in-use), let the user choose.
+        echo "Loading ${name} needs ~${req}MB (shm ${shm}MB + headroom + squashfs; max ${rmax}MB); only ${free}MB free."
+        echo "Unmount a blob to free RAM (in-use blobs are marked - unmounting one quits it):"
+        local i=1; local menu=()
+        for b in "${idle[@]}"; do echo "  ${i}) ${b}   [idle]"; menu+=("${b}"); i=$((i+1)); done
+        for b in "${busy[@]}"; do echo "  ${i}) ${b}   [IN USE]"; menu+=("${b}"); i=$((i+1)); done
+        echo "  0) cancel (do not launch ${name})"
+        local sel; read -r -p "choice> " sel || sel=0
+        if [ "${sel}" = "0" ] || [ -z "${sel}" ]; then
+            say "PARTYOS-RAM-CANCEL name=${name} (user declined eviction)"; return 1
+        fi
+        # Reject non-numeric / out-of-range input. Without this, garbage (a typo)
+        # made $((sel-1)) evaluate to -1, and menu[-1] selects the LAST entry - in-use
+        # blobs are appended last - so a mistyped choice force-evicted a running game.
+        case "${sel}" in ''|*[!0-9]*) say "PARTYOS-RAM-CANCEL invalid selection"; return 1;; esac
+        if [ "${sel}" -lt 1 ] || [ "${sel}" -gt "${#menu[@]}" ]; then
+            say "PARTYOS-RAM-CANCEL invalid selection"; return 1
+        fi
+        local pick="${menu[$((sel-1))]:-}"
+        [ -n "${pick}" ] || { say "PARTYOS-RAM-CANCEL invalid selection"; return 1; }
+        # The user can pick an in-use blob -> force-evict (their explicit choice).
+        if evict "${pick}" "${games}" 1; then chosen="${pick}"; add_freed "$(ram_max_of "${catalog}" "${pick}")"; fi
+        free="$(free_mb)"
+    fi
+
+    free="$(free_mb)"
+    if [ "${free}" -ge "${req}" ]; then
+        say "PARTYOS-RAM-ROOM-MADE name=${name} evicted=${chosen} free=${free}MB (>= required=${req}MB)"
+        return 0
+    fi
+    say "PARTYOS-RAM-NOROOM name=${name} evicted=${chosen:-none} free=${free}MB still < required=${req}MB"
+    return 1
+}
+
+# --- USB blob-cache disk eviction --------------------------------------
+# cache-evict CACHE_DIR RESERVE_GB MAX_GB [KEEP]
+# Trim the persistent USB blob cache (CACHE_DIR holds <name>.squashfs files) so
+# the stick keeps RESERVE_GB free (df floor) and, if MAX_GB>0, total cached size
+# stays under it (du cap). Evicts least-recently-used blobs by atime (get_blob
+# touch -a's on every HIT/download). NEVER evicts KEEP (the just-downloaded blob),
+# a blob whose squashfs lower is mounted, or a blob with a live refcount.
+cache_size_mb() {  # total MB of *.squashfs in the cache dir
+    local dir="$1" t=0 f sz
+    for f in "${dir}"/*.squashfs; do
+        [ -f "${f}" ] || continue
+        sz="$(du -m "${f}" 2>/dev/null | awk '{print $1}')"; case "${sz}" in ''|*[!0-9]*) sz=0;; esac
+        t=$(( t + sz ))
+    done
+    printf '%s\n' "${t}"
+}
+df_free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2{print $4}'; }
+cache_protected() {  # 0 (true) if blob NAME must not be evicted
+    local name="$1"
+    mountpoint -q "${MNT_BASE}/${name}" 2>/dev/null && return 0
+    [ "$(ref_of "${name}")" -gt 0 ] && return 0
+    return 1
+}
+cache_evict() {
+    local dir="$1" reserve_gb="${2:-0}" max_gb="${3:-0}" keep="${4:-}"
+    [ -d "${dir}" ] || { say "PARTYOS-RAM-CACHE-CHECK dir=${dir} (absent, nothing to evict)"; return 0; }
+    case "${reserve_gb}" in ''|*[!0-9]*) reserve_gb=0;; esac
+    case "${max_gb}" in     ''|*[!0-9]*) max_gb=0;; esac
+    local reserve_mb=$(( reserve_gb * 1024 )) max_mb=$(( max_gb * 1024 ))
+    local free used; free="$(df_free_mb "${dir}")"; case "${free}" in ''|*[!0-9]*) free=0;; esac
+    used="$(cache_size_mb "${dir}")"
+    say "PARTYOS-RAM-CACHE-CHECK dir=${dir} free=${free}MB reserve=${reserve_mb}MB cached=${used}MB max=${max_mb}MB"
+
+    # Build the LRU-ordered candidate list (oldest atime first), skipping KEEP and
+    # currently-protected blobs (mounted lower or live refcount).
+    local cand f name atime
+    cand="$(for f in "${dir}"/*.squashfs; do
+        [ -f "${f}" ] || continue
+        name="$(basename "${f}" .squashfs)"
+        [ "${name}" = "${keep}" ] && continue
+        cache_protected "${name}" && { say "PARTYOS-RAM-CACHE-PROTECT name=${name} (mounted/in-use - kept)" >&2; continue; }
+        # An in-flight download (aria2 .aria2 control file or get_blob .dl marker) is a
+        # partial being written by a CONCURRENT install - never evict it (would delete
+        # the partial out from under the other download).
+        if [ -e "${f}.aria2" ] || [ -e "${f}.dl" ]; then
+            say "PARTYOS-RAM-CACHE-PROTECT name=${name} (download in flight - kept)" >&2; continue
+        fi
+        atime="$(stat -c %X "${f}" 2>/dev/null || echo 0)"
+        printf '%s\t%s\n' "${atime}" "${name}"
+    done | sort -n | cut -f2)"
+
+    local evicted=0 sz w
+    while IFS= read -r name; do
+        [ -n "${name}" ] || continue
+        # Re-read the REAL free/used from df each round - never trust a simulated
+        # counter. A still-open seeder fd (or any other writer) can make an estimate
+        # lie, so the floor must be judged against actual on-disk space.
+        free="$(df_free_mb "${dir}")"; case "${free}" in ''|*[!0-9]*) free=0;; esac
+        used="$(cache_size_mb "${dir}")"
+        # Stop once BOTH constraints are satisfied: free >= reserve AND used <= cap.
+        local need=0
+        [ "${reserve_mb}" -gt 0 ] && [ "${free}" -lt "${reserve_mb}" ] && need=1
+        [ "${max_mb}" -gt 0 ] && [ "${used}" -gt "${max_mb}" ] && need=1
+        [ "${need}" -eq 0 ] && break
+        f="${dir}/${name}.squashfs"
+        sz="$(du -m "${f}" 2>/dev/null | awk '{print $1}')"; case "${sz}" in ''|*[!0-9]*) sz=0;; esac
+        # stop seeding a blob we're about to delete (seed only while cached).
+        # unlink frees no blocks while a process still holds the fd open, so the
+        # seed must close the file first. The one client aria2c: remove the entry
+        # over RPC (partyos-aria2rpc waits until aria2 closed the file). A stray
+        # standalone aria2c (a load-url download): SIGTERM, poll ~2s, then SIGKILL.
+        /usr/local/bin/partyos-aria2rpc remove "${name}" "${dir}" >/dev/null 2>&1 || true
+        pkill -f "aria2c.*[ /]${name}\.squashfs\.torrent" 2>/dev/null || true
+        w=0
+        while pgrep -f "aria2c.*[ /]${name}\.squashfs\.torrent" >/dev/null 2>&1; do
+            [ "${w}" -ge 20 ] && { pkill -KILL -f "aria2c.*[ /]${name}\.squashfs\.torrent" 2>/dev/null || true; sleep 0.2; break; }
+            w=$(( w + 1 )); sleep 0.1
+        done
+        rm -f "${f}" "${f}.torrent" "${f}.aria2" 2>/dev/null || true
+        sync 2>/dev/null || true
+        evicted=$(( evicted + 1 ))
+        say "PARTYOS-RAM-CACHE-EVICTED name=${name} freed~${sz}MB"
+    done <<< "${cand}"
+
+    # Final verdict from a FRESH df read (not a simulated counter): report a breach if
+    # the floor still isn't met (only protected or KEEP blobs remain - soft floor).
+    free="$(df_free_mb "${dir}")"; case "${free}" in ''|*[!0-9]*) free=0;; esac
+    used="$(cache_size_mb "${dir}")"
+    if [ "${reserve_mb}" -gt 0 ] && [ "${free}" -lt "${reserve_mb}" ]; then
+        say "PARTYOS-RAM-CACHE-LOW dir=${dir} free=${free}MB < reserve=${reserve_mb}MB (protected/KEEP blobs pin the stick) evicted=${evicted}"
+        return 0
+    fi
+    say "PARTYOS-RAM-CACHE-DONE dir=${dir} free=${free}MB cached=${used}MB evicted=${evicted}"
+    return 0
+}
+
+cmd="${1:-}"; shift || true
+case "${cmd}" in
+    free-mb)     free_mb;;
+    project)     printf 'ram_min=%s ram_max=%s shm_mb=%s required=%s\n' "$(ram_min_of "$1" "$2")" "$(ram_max_of "$1" "$2")" "$(effective_shm_mb "$1" "$2")" "$(required_mb "$1" "$2")";;
+    mark-busy)   mark_busy "$1";;
+    mark-idle)   mark_idle "$1";;
+    refs)        if [ $# -ge 1 ]; then echo "$(ref_of "$1")"; else for f in "${REF_DIR}"/*; do [ -f "$f" ] && echo "$(basename "$f")=$(cat "$f")"; done; fi;;
+    state)       while IFS= read -r b; do [ -n "$b" ] || continue; local_r="$(ref_of "$b")"; st=idle; [ "${local_r}" -gt 0 ] && st=busy; echo "${b} refs=${local_r} state=${st}"; done < <(mounted_blobs);;
+    fits)        req="$(required_mb "$1" "$2")"; f="$(free_mb)"; [ "${f}" -ge "${req}" ];;
+    ensure-room) ensure_room "$1" "$2" "$3";;
+    evict)       evict "$1" "$2" "${3:-0}";;
+    cache-evict) cache_evict "$1" "${2:-0}" "${3:-0}" "${4:-}";;
+    *)           echo "usage: partyos-ram {free-mb|project|mark-busy|mark-idle|refs|state|fits|ensure-room|evict|cache-evict} ..." >&2; exit 2;;
+esac

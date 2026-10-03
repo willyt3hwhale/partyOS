@@ -1,0 +1,35 @@
+#!ipxe
+# partyOS APP-STORE boot script (TEMPLATE) - the app-store / launcher UX over the
+# blob catalog. Rendered at serve time by scripts/vm/render-ipxe.sh
+# ({{SERVER_URL}} -> harness SERVER_URL). Reached automatically via the DHCP boot
+# filename, same as Steps 1-9 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-9 (server/images/custom/), with the
+# SAME kernel/initramfs Step 2 RAM-boots, with the LANPARTY_HOME USB stick
+# attached (so the app-store blob cache is persistent). The fetched automated
+# script is appstore-script.sh: it drives the BAKED partyos-app backend
+# (list / install / launch / installed / remove + install-launch) and asserts the
+# baked App Store launcher + per-blob .desktop shortcuts are present.
+
+echo ================================================
+echo partyOS App Store - launcher over the blob catalog
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=appstore&status=boot&ip=${ip} ra || echo callback-skipped
+imgfree ra || echo continuing
+
+echo Loading custom desktop image into RAM (app-store)...
+# report_url= is read by appstore-script.sh + partyos-app for the catalog fetch +
+# HTTP callback (no hardcoded IP). Same boot machinery as steps 7/8.
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/appstore-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (app-store)...
+boot || goto failed
+
+:failed
+echo partyOS app-store boot failed

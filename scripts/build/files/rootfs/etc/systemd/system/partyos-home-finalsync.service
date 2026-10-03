@@ -1,0 +1,19 @@
+[Unit]
+Description=partyOS - final home->USB push on shutdown
+After=local-fs.target partyos-home-pull.service
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# the slow shutdown push runs in ExecStop, so bound it with TimeoutStopSec;
+# better to lose a few seconds of un-synced data than hang shutdown forever.
+TimeoutStartSec=45s
+TimeoutStopSec=45s
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/partyos-sync-home
+
+[Install]
+WantedBy=multi-user.target

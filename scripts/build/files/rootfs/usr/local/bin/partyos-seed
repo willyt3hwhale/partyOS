@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# partyos-seed - seed verified game blobs into a USB stick's partyOS blob cache.
+#
+# Usage:
+#   partyos-seed [--catalog <path|url>] <name> <blobfile> [<cache_dir>]
+#       Verify <blobfile>'s sha256 against catalog row <name>, then place it as
+#       <cache_dir>/<name>.squashfs (a zero-download HIT on next click).
+#   partyos-seed [--catalog <path|url>] --all <blobdir> [<cache_dir>]
+#       For every blob row in the catalog, if <blobdir>/<name>.squashfs exists and
+#       verifies, seed it. Skips rows whose blob file is missing.
+#
+# cache_dir defaults to the mounted USB home's cache (/mnt/usbhome/.partyos-cache/
+# games); pass it explicitly when seeding a stick mounted elsewhere.
+# An empty catalog sha256 (placeholder) means NO verification is possible
+# - the blob is seeded with a logged warning rather than silently trusted.
+set -u
+
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+die() { echo "partyos-seed: $*" >&2; exit 1; }
+
+DEFAULT_CACHE="/mnt/usbhome/.partyos-cache/games"
+
+# --- resolve + fetch the catalog ---------------------------------------------
+# Precedence: --catalog arg -> PARTYOS_SERVER env -> report_url= cmdline. The
+# operator station is usually offline next to the stick, so a local path is the
+# common case; a URL is fetched with curl.
+CATALOG_SRC=""
+resolve_catalog() {
+    local src="${CATALOG_SRC}"
+    if [ -z "${src}" ]; then
+        if [ -n "${PARTYOS_SERVER:-}" ]; then src="${PARTYOS_SERVER}/server/games/catalog.json"
+        else
+            local rb=""
+            for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+            [ -n "${rb}" ] && src="${rb}/server/games/catalog.json"
+        fi
+    fi
+    [ -n "${src}" ] || die "no catalog (pass --catalog <path|url>, set PARTYOS_SERVER, or boot with report_url=)"
+    local out
+    case "${src}" in
+        http://*|https://*)
+            out="$(mktemp "${TMPDIR:-/tmp}/partyos-seed-cat.XXXXXX")" || die "mktemp failed"
+            curl -fsS --max-time 30 -o "${out}" "${src}" || { rm -f "${out}"; die "catalog fetch failed: ${src}"; }
+            printf '%s' "${out}";;
+        *)
+            [ -s "${src}" ] || die "catalog not found: ${src}"
+            printf '%s' "${src}";;
+    esac
+}
+
+# --- catalog parse (same per-block approach as partyos-ram) -------------------
+_block() {
+    local catalog="$1" name="$2"
+    awk -v want="${name}" '
+        /\{/ { buf=""; inb=1 }
+        inb { buf = buf $0 "\n" }
+        /"name":[[:space:]]*"/ { line=$0; sub(/.*"name":[[:space:]]*"/,"",line); sub(/".*/,"",line); cur=line }
+        /\}/ { if (inb && cur==want) { printf "%s", buf; exit } inb=0 }
+    ' "${catalog}"
+}
+_val() {
+    local block="$1" key="$2"
+    printf '%s\n' "${block}" \
+      | grep -oE "\"${key}\":[[:space:]]*(\"[^\"]*\"|[0-9]+)" | head -1 \
+      | sed -E "s/\"${key}\":[[:space:]]*//; s/^\"//; s/\"$//"
+}
+# every blob row's name (source=blob only): isolate the games array, then pair
+# each name with the nearest following source so pkg rows are excluded.
+blob_names() {
+    local catalog="$1"
+    awk '/"games"[[:space:]]*:/{f=1} f' "${catalog}" \
+      | grep -oE '"(name|source)":[[:space:]]*"[^"]*"' \
+      | sed -E 's/.*"(name|source)":[[:space:]]*"([^"]*)".*/\1=\2/' \
+      | awk -F= '
+          $1=="name"   { n=$2 }
+          $1=="source" { if ($2=="blob" && n!="") print n; n="" }
+        '
+}
+
+# --- seed one verified blob ---------------------------------------------------
+# seed_one CATALOG NAME BLOBFILE CACHE_DIR -> 0 seeded, 1 failed/skipped
+seed_one() {
+    local catalog="$1" name="$2" src="$3" cache="$4"
+    [ -s "${src}" ] || { say "PARTYOS-SEED-SKIP name=${name} (blob file missing: ${src})"; return 1; }
+    local blk sha; blk="$(_block "${catalog}" "${name}")"
+    [ -n "${blk}" ] || { say "PARTYOS-SEED-SKIP name=${name} (no catalog row)"; return 1; }
+    local source; source="$(_val "${blk}" source)"
+    if [ "${source}" != "blob" ]; then
+        say "PARTYOS-SEED-SKIP name=${name} (source=${source:-?}, not a blob row)"; return 1
+    fi
+    sha="$(_val "${blk}" sha256)"
+    if [ -z "${sha}" ]; then
+        say "PARTYOS-SEED-WARN name=${name} (catalog sha256 empty - seeding UNVERIFIED)"
+    else
+        local got; got="$(sha256sum "${src}" 2>/dev/null | awk '{print $1}')"
+        if [ "${got}" != "${sha}" ]; then
+            say "PARTYOS-SEED-REJECT name=${name} (sha mismatch: got ${got:-none} want ${sha})"; return 1
+        fi
+    fi
+    install -d "${cache}" 2>/dev/null || { say "PARTYOS-SEED-ERROR cannot create cache dir ${cache}"; return 1; }
+    local dest="${cache}/${name}.squashfs" tmp="${cache}/${name}.squashfs.seed.$$"
+    cp -f "${src}" "${tmp}" 2>/dev/null || { say "PARTYOS-SEED-ERROR copy failed name=${name}"; rm -f "${tmp}"; return 1; }
+    mv -f "${tmp}" "${dest}"; sync
+    say "PARTYOS-SEED-OK name=${name} dest=${dest} bytes=$(wc -c < "${dest}" | tr -d ' ')$([ -z "${sha}" ] && echo ' (unverified)')"
+    return 0
+}
+
+# --- arg parse ----------------------------------------------------------------
+MODE="one"; ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --catalog) shift; CATALOG_SRC="${1:-}";;
+        --all)     MODE="all";;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+        --) shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done; break;;
+        -*) die "unknown option: $1";;
+        *)  ARGS+=("$1");;
+    esac
+    shift || true
+done
+
+CATALOG="$(resolve_catalog)"
+
+if [ "${MODE}" = "all" ]; then
+    BLOBDIR="${ARGS[0]:-}"; CACHE="${ARGS[1]:-${DEFAULT_CACHE}}"
+    [ -n "${BLOBDIR}" ] || die "usage: partyos-seed [--catalog <c>] --all <blobdir> [<cache_dir>]"
+    [ -d "${BLOBDIR}" ] || die "blob dir not found: ${BLOBDIR}"
+    say "PARTYOS-SEED-ALL blobdir=${BLOBDIR} cache=${CACHE} catalog=${CATALOG}"
+    n=0; ok=0
+    while IFS= read -r name; do
+        [ -n "${name}" ] || continue
+        n=$((n+1))
+        seed_one "${CATALOG}" "${name}" "${BLOBDIR}/${name}.squashfs" "${CACHE}" && ok=$((ok+1))
+    done < <(blob_names "${CATALOG}")
+    say "PARTYOS-SEED-ALL-DONE seeded=${ok}/${n} cache=${CACHE}"
+    exit 0
+fi
+
+NAME="${ARGS[0]:-}"; BLOBFILE="${ARGS[1]:-}"; CACHE="${ARGS[2]:-${DEFAULT_CACHE}}"
+[ -n "${NAME}" ] && [ -n "${BLOBFILE}" ] || die "usage: partyos-seed [--catalog <c>] <name> <blobfile> [<cache_dir>]"
+seed_one "${CATALOG}" "${NAME}" "${BLOBFILE}" "${CACHE}"

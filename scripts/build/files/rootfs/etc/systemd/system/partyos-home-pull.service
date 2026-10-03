@@ -1,0 +1,18 @@
+[Unit]
+Description=partyOS - boot pull of the USB home into RAM (seed + --delete mirror)
+DefaultDependencies=no
+After=local-fs.target partyos-usbhome.service partyos-identity.service
+Wants=partyos-identity.service
+Before=display-manager.service partyos-home-sync.timer
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bounded start timeout: on timeout the unit is killed and boot continues with a
+# RAM-only home. rsync --timeout=20 aborts a stalled stick, so 120s is a budget for slow
+# progress. --delete-delay keeps an interrupted pull non-destructive.
+TimeoutStartSec=120
+ExecStart=/usr/local/bin/partyos-home-pull
+
+[Install]
+WantedBy=multi-user.target

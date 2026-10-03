@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=partyOS venue certificates
+Comment=Import the venue CA and the client certificate into the browser stores
+Exec=/usr/local/bin/partyos-trust-setup --user
+X-XFCE-Autostart-enabled=true
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

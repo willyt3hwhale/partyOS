@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# partyos-proton-env - per-user wine "game envs" on the USB home (install once, play all
+# weekend). Subcommands: create | run-exe | set-exe | play | list | remove | gen-tiles.
+# On-disk layout, per env, under ENVROOT=/mnt/usbhome/.partyos-proton-envs/<name>/:
+#   prefix/           the writable WINEPREFIX (clone of the base blob prefix-template)
+#   prefix/.partyos-prefix-ready   marker (skips the run.sh fallback re-seed)
+#   env.meta          name=<slug>  title=<free text>  exe=<path under prefix/>  created=<epoch>
+set -u
+
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+# say  -> serial + stdout (a status marker the hardware test greps). mlog -> serial +
+# stderr (keeps `list` stdout clean for the GUI parser). err -> stderr + best-effort zenity.
+say()  { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+mlog() { echo "$*" > "${SER}" 2>/dev/null; echo "$*" >&2; }
+err() {
+    echo "PARTYOS-PENV ERROR $*" > "${SER}" 2>/dev/null || true
+    echo "PARTYOS-PENV ERROR $*" >&2
+    if [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+        zenity --error --width=460 --title="partyOS - New Windows Game" --text="$*" >/dev/null 2>&1 || true
+    fi
+}
+
+# --- resolve the desktop user + games dir EXACTLY like partyos-app -------------
+# (the base-env blob mounts at ${GAMES_DIR}/protonenv; the engine usually runs AS this
+# user already, but resolve independently so a headless/over-ssh invocation also works).
+APP_USER="gamer"
+[ -r /run/partyos-username ] && APP_USER="$(tr -d '[:space:]' < /run/partyos-username)"
+[ -n "${APP_USER}" ] || APP_USER="gamer"
+id "${APP_USER}" >/dev/null 2>&1 || APP_USER="gamer"
+HOME_DIR="$(getent passwd "${APP_USER}" | cut -d: -f6)"; [ -n "${HOME_DIR}" ] || HOME_DIR="/home/${APP_USER}"
+GAMES_DIR="${HOME_DIR}/games"
+
+USBHOME="/mnt/usbhome"
+ENVROOT="${USBHOME}/.partyos-proton-envs"
+BASE_RUN="${GAMES_DIR}/protonenv/bin/run.sh"
+
+# envs require the USB home (persistence). Bail clearly if it is not usable.
+require_usbhome() {
+    if [ ! -d "${USBHOME}" ]; then
+        err "your USB stick (${USBHOME}) is not available - a game env needs it to save your game."
+        return 1
+    fi
+    if ! install -d "${ENVROOT}" 2>/dev/null || [ ! -w "${ENVROOT}" ]; then
+        err "cannot write to your USB stick (${ENVROOT}) - is it mounted read-write?"
+        return 1
+    fi
+    return 0
+}
+
+# slug rule: lowercase, [a-z0-9_-] only, non-empty.
+valid_name() {
+    case "$1" in
+        ""|*[!a-z0-9_-]*) return 1;;
+        *) return 0;;
+    esac
+}
+
+# read a key from env.meta (first match): meta_get FILE KEY
+meta_get() {
+    [ -r "$1" ] || return 1
+    sed -n "s/^$2=//p" "$1" | head -1
+}
+
+# ensure the base proton-env blob is mounted (so BASE_RUN + the prefix-template exist).
+# partyos-app self-escalates to root for ensure-baseenv (it mounts squashfs/overlay); the
+# desktop user has passwordless sudo, so a plain call re-execs under sudo -n internally.
+ensure_base() {
+    [ -f "${BASE_RUN}" ] && return 0
+    mlog "PARTYOS-PENV ensuring base proton-env blob is mounted..."
+    if ! /usr/local/bin/partyos-app ensure-baseenv >&2; then
+        err "could not prepare the base wine runtime (ensure-baseenv failed)."
+        return 1
+    fi
+    if [ ! -f "${BASE_RUN}" ]; then
+        err "base wine runtime missing after mount (${BASE_RUN})."
+        return 1
+    fi
+    return 0
+}
+
+# run a program inside an env via the base blob's parameterized launcher. Forwards the X
+# session so the wine virtual-desktop window appears. Used by BOTH run-exe (installer/
+# patcher) and play. _run_in_env DIR EXE [args...]
+_run_in_env() {
+    local dir="$1" exe="$2"; shift 2
+    ensure_base || return 1
+    # GPU env of the launch (PRIME render offload or DRI_PRIME), see partyos-gpu-env.
+    local -a gpu=()
+    [ -x /usr/local/bin/partyos-gpu-env ] && mapfile -t gpu < <(DISPLAY="${DISPLAY:-:0}" \
+        XAUTHORITY="${XAUTHORITY:-${HOME:-${HOME_DIR}}/.Xauthority}" /usr/local/bin/partyos-gpu-env 2>/dev/null)
+    PARTYOS_ENV_PREFIX="${dir}/prefix" \
+    PARTYOS_RUN_EXE="${exe}" \
+    PARTYOS_RUN_ARGS="$*" \
+    PARTYOS_RUN_CWD="${RUN_CWD:-}" \
+    DISPLAY="${DISPLAY:-:0}" \
+    XAUTHORITY="${XAUTHORITY:-${HOME:-${HOME_DIR}}/.Xauthority}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        env "${gpu[@]}" bash "${BASE_RUN}"
+}
+
+cmd_create() {
+    local name="$1" title="${2:-$1}"
+    valid_name "${name}" || { err "invalid env name '${name}' - use lowercase letters, digits, - and _."; return 2; }
+    require_usbhome || return 1
+    local dir="${ENVROOT}/${name}"
+    [ -e "${dir}" ] && { err "an env named '${name}' already exists."; return 2; }
+    ensure_base || return 1
+    local tpl="${GAMES_DIR}/protonenv/opt/prefix-template"
+    [ -d "${tpl}" ] || { err "base wine prefix template missing (${tpl})."; return 1; }
+    install -d "${dir}" || { err "cannot create env dir ${dir}."; return 1; }
+    # clone the pristine prefix. The blob mount is world-readable ro; the user owns ENVROOT.
+    mlog "PARTYOS-PENV cloning pristine prefix for '${name}' (can take a minute on USB)..."
+    if ! cp -a "${tpl}" "${dir}/prefix"; then
+        err "failed to clone the wine prefix into ${dir}/prefix."
+        rm -rf "${dir}" 2>/dev/null || true
+        return 1
+    fi
+    touch "${dir}/prefix/.partyos-prefix-ready" 2>/dev/null || true
+    {
+        printf 'name=%s\n'    "${name}"
+        printf 'title=%s\n'   "${title}"
+        printf 'exe=\n'
+        printf 'created=%s\n' "$(date +%s)"
+    } > "${dir}/env.meta"
+    say "PARTYOS-PENV-CREATED name=${name} prefix=${dir}/prefix"
+    return 0
+}
+
+cmd_run_exe() {
+    local name="$1"; shift
+    local exe="$1"; shift
+    valid_name "${name}" || { err "invalid env name '${name}'."; return 2; }
+    local dir="${ENVROOT}/${name}"
+    [ -d "${dir}/prefix" ] || { err "env '${name}' does not exist - create it first."; return 2; }
+    say "PARTYOS-PENV-RUN name=${name} exe=${exe}"
+    _run_in_env "${dir}" "${exe}" "$@"
+}
+
+cmd_set_exe() {
+    local name="$1" exe="$2"
+    valid_name "${name}" || { err "invalid env name '${name}'."; return 2; }
+    local dir="${ENVROOT}/${name}"
+    [ -d "${dir}/prefix" ] || { err "env '${name}' does not exist."; return 2; }
+    local pfx="${dir}/prefix"
+    # canonicalize to an absolute path, then require it under the env prefix and STORE it
+    # RELATIVE to the prefix so the env stays relocatable.
+    local abs
+    abs="$(cd "$(dirname "${exe}")" 2>/dev/null && printf '%s/%s' "$(pwd)" "$(basename "${exe}")")" || abs="${exe}"
+    case "${abs}" in
+        "${pfx}/"*) ;;
+        *) err "that program is not inside this env - pick a .exe under the env's drive_c."; return 2;;
+    esac
+    [ -f "${abs}" ] || { err "no such program: ${exe}"; return 2; }
+    local rel="${abs#"${pfx}/"}"
+    # record the exe's containing folder (relative to the prefix) as the working dir so a
+    # PORTABLE game launches with CWD = its own folder (finds sibling assets/DLLs). For an
+    # installed game this is its install dir - same as run.sh's default, so no behaviour
+    # change for the installer path.
+    local cwd_rel; cwd_rel="$(dirname "${rel}")"; [ "${cwd_rel}" = "." ] && cwd_rel=""
+    local tmp="${dir}/env.meta.tmp"
+    { grep -v -e '^exe=' -e '^cwd=' "${dir}/env.meta" 2>/dev/null; printf 'exe=%s\n' "${rel}"; printf 'cwd=%s\n' "${cwd_rel}"; } > "${tmp}" \
+        && mv "${tmp}" "${dir}/env.meta"
+    say "PARTYOS-PENV-EXE-SET name=${name} exe=${rel} cwd=${cwd_rel}"
+    return 0
+}
+
+# import a PORTABLE game (a single .exe, or a folder containing the game) INTO the env's
+# drive_c game area so the env stays self-contained (mirrors the installed case). Echoes
+# the imported path on stdout (the GUI captures it): for a folder, the imported folder;
+# for a single .exe, the imported .exe. No base blob needed - it is a plain copy.
+cmd_import() {
+    local name="$1" src="$2"
+    valid_name "${name}" || { err "invalid env name '${name}'."; return 2; }
+    require_usbhome || return 1
+    local dir="${ENVROOT}/${name}"
+    [ -d "${dir}/prefix" ] || { err "env '${name}' does not exist - create it first."; return 2; }
+    [ -e "${src}" ] || { err "no such file or folder: ${src}"; return 2; }
+    local destbase="${dir}/prefix/drive_c/game"
+    install -d "${destbase}" 2>/dev/null || { err "cannot create the game area in the env (${destbase})."; return 1; }
+    local base imported
+    base="$(basename "${src}")"
+    imported="${destbase}/${base}"
+    # idempotent re-import: drop an existing same-named item first.
+    [ -e "${imported}" ] && { mlog "PARTYOS-PENV replacing existing ${imported}"; rm -rf "${imported}" 2>/dev/null || true; }
+    if [ -d "${src}" ]; then
+        mlog "PARTYOS-PENV importing folder '${base}' into env '${name}' (copying, can take a moment on USB)..."
+    else
+        mlog "PARTYOS-PENV importing program '${base}' into env '${name}'..."
+    fi
+    if ! cp -a "${src}" "${imported}"; then
+        err "failed to copy your game into the env (${imported})."
+        rm -rf "${imported}" 2>/dev/null || true
+        return 1
+    fi
+    mlog "PARTYOS-PENV-IMPORTED name=${name} path=${imported}"
+    printf '%s\n' "${imported}"
+    return 0
+}
+
+cmd_play() {
+    local name="$1"
+    valid_name "${name}" || { err "invalid env name '${name}'."; return 2; }
+    local dir="${ENVROOT}/${name}"
+    [ -d "${dir}/prefix" ] || { err "env '${name}' does not exist."; return 2; }
+    local rel; rel="$(meta_get "${dir}/env.meta" exe)"
+    [ -n "${rel}" ] || { err "no game program chosen for '${name}' yet - choose its .exe first."; return 2; }
+    local exe="${dir}/prefix/${rel}"
+    [ -f "${exe}" ] || { err "the chosen program is missing: ${exe}"; return 2; }
+    # working dir = the exe's recorded folder (portable games MUST run from their folder).
+    local cwd_rel; cwd_rel="$(meta_get "${dir}/env.meta" cwd)"
+    local RUN_CWD=""; [ -n "${cwd_rel}" ] && RUN_CWD="${dir}/prefix/${cwd_rel}"
+    say "PARTYOS-PENV-PLAY name=${name}"
+    _run_in_env "${dir}" "${exe}"
+}
+
+cmd_list() {
+    require_usbhome || return 1
+    local n=0 d name title exe state
+    for d in "${ENVROOT}"/*/; do
+        [ -d "${d}" ] || continue
+        [ -f "${d}env.meta" ] || continue
+        name="$(meta_get "${d}env.meta" name)"; [ -n "${name}" ] || name="$(basename "${d}")"
+        title="$(meta_get "${d}env.meta" title)"; [ -n "${title}" ] || title="${name}"
+        exe="$(meta_get "${d}env.meta" exe)"
+        state="no-exe"; [ -n "${exe}" ] && state="ready"
+        # machine-readable rows on stdout (the GUI parses these); marker goes to stderr.
+        printf '%s\t%s\t%s\n' "${name}" "${title}" "${state}"
+        n=$((n+1))
+    done
+    mlog "PARTYOS-PENV-LIST n=${n}"
+    return 0
+}
+
+cmd_remove() {
+    local name="$1"
+    valid_name "${name}" || { err "invalid env name '${name}'."; return 2; }
+    local dir="${ENVROOT}/${name}"
+    [ -d "${dir}" ] || { err "env '${name}' does not exist."; return 2; }
+    # the play tile is named by title - read it BEFORE deleting env.meta.
+    local title; title="$(meta_get "${dir}/env.meta" title)"; [ -n "${title}" ] || title="${name}"
+    rm -rf "${dir}" 2>/dev/null || true
+    local fname; fname="$(printf '%s' "${title}" | tr '/' '-')"
+    rm -f "${HOME_DIR}/Desktop/.apps/Games/${fname}.desktop" 2>/dev/null || true
+    say "PARTYOS-PENV-REMOVED name=${name}"
+    return 0
+}
+
+# gen-tiles: one play tile per env that HAS an exe set, into the Apps & Games Games folder.
+# Re-run after the app-store wipe-and-rebuild so per-env tiles survive every boot.
+cmd_gen_tiles() {
+    local gamesdir="${HOME_DIR}/Desktop/.apps/Games"
+    [ -d "${ENVROOT}" ] || { say "PARTYOS-PENV-TILES n=0"; return 0; }
+    install -d "${gamesdir}" 2>/dev/null || true
+    local n=0 d name title exe fname tile
+    for d in "${ENVROOT}"/*/; do
+        [ -d "${d}" ] || continue
+        [ -f "${d}env.meta" ] || continue
+        name="$(meta_get "${d}env.meta" name)"; [ -n "${name}" ] || name="$(basename "${d}")"
+        exe="$(meta_get "${d}env.meta" exe)"
+        [ -n "${exe}" ] || continue   # no play tile until a game .exe is chosen
+        title="$(meta_get "${d}env.meta" title)"; [ -n "${title}" ] || title="${name}"
+        fname="$(printf '%s' "${title}" | tr '/' '-')"
+        tile="${gamesdir}/${fname}.desktop"
+        # title comes from the player's env.meta (untrusted). Write it (and name) via
+        # printf '%s' as data, so a game titled `Super $mash` or one with quotes/
+        # backticks can never be shell-expanded or injected into the generated tile.
+        {
+            printf '%s\n' '[Desktop Entry]'
+            printf '%s\n' 'Type=Application'
+            printf 'Name=%s\n' "${title}"
+            printf 'Comment=partyOS - play your Windows game (%s)\n' "${name}"
+            printf 'Exec=/usr/local/bin/partyos-proton-env play %s\n' "${name}"
+            printf 'Path=%s\n' "${HOME_DIR}"
+            printf '%s\n' 'Terminal=false'
+            printf '%s\n' 'Icon=applications-other'
+            printf '%s\n' 'Categories=Game;partyOS;'
+        } > "${tile}"
+        chmod +x "${tile}" 2>/dev/null || true
+        n=$((n+1))
+    done
+    say "PARTYOS-PENV-TILES n=${n}"
+    return 0
+}
+
+cmd="${1:-}"; shift || true
+case "${cmd}" in
+    create)    [ $# -ge 1 ] || { err "usage: create <name> [title]"; exit 2; }; cmd_create "$@";;
+    run-exe)   [ $# -ge 2 ] || { err "usage: run-exe <name> <exe-path> [args...]"; exit 2; }; cmd_run_exe "$@";;
+    set-exe)   [ $# -ge 2 ] || { err "usage: set-exe <name> <exe-path>"; exit 2; }; cmd_set_exe "$1" "$2";;
+    import)    [ $# -ge 2 ] || { err "usage: import <name> <src-path>"; exit 2; }; cmd_import "$1" "$2";;
+    play)      [ $# -ge 1 ] || { err "usage: play <name>"; exit 2; }; cmd_play "$1";;
+    list)      cmd_list;;
+    remove)    [ $# -ge 1 ] || { err "usage: remove <name>"; exit 2; }; cmd_remove "$1";;
+    gen-tiles) cmd_gen_tiles;;
+    *)         echo "usage: partyos-proton-env {create <name> [title]|run-exe <name> <exe> [args]|set-exe <name> <exe>|import <name> <src>|play <name>|list|remove <name>|gen-tiles}" >&2; exit 2;;
+esac

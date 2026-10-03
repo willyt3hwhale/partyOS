@@ -1,0 +1,17 @@
+[Unit]
+Description=partyOS - apply fully-explicit static network from user.conf, else DHCP
+# Need the USB home mounted (user.conf lives there); usbhome runs at sysinit, before
+# networkd. Order ourselves BEFORE the link is configured via network-pre.target so a
+# static client's drop-in is in place when networkd starts -> it never DHCPs (no
+# grabbed+abandoned pool lease). networkd ships After=network-pre.target.
+After=partyos-usbhome.service
+Wants=network-pre.target
+Before=network-pre.target display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/partyos-staticip-setup
+
+[Install]
+WantedBy=multi-user.target

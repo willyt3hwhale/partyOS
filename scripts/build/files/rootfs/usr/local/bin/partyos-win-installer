@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# The "Windows Installer.exe" gag. Asks, fake-installs, fails. Nothing real.
+zenity --question --title="Windows Installer" --width=440 \
+  --text="Install Microsoft Windows over partyOS?\n\nThis will permanently delete all your games and savegames." \
+  --ok-label="Install now" --cancel-label="Cancel" || exit 0
+( for i in $(seq 1 100); do echo "${i}"; echo "# Copying Windows files... ${i}%"; sleep 0.02; done ) | \
+  zenity --progress --title="Windows Installer" --width=440 --auto-close --no-cancel --percentage=0
+zenity --error --title="Setup failed - 0xC0DEBABE" --width=460 \
+  --text="partyOS refused to be overwritten.\n\nNice try. Now get back to gaming."

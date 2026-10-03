@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# partyos-sync-home - push RAM /home/<user> -> p2:/home (--delete mirror), run by
+# the every-45s timer + the finalsync-on-shutdown unit. Guards:
+#   - paused (USB removed) / ro USB -> no-op.
+#   (c) NO-OP until the boot pull wrote /run/partyos-home-pull-done.
+#   (b) refuse to --delete the USB home if RAM /home/<user> is empty.
+#   (d) if the stick's generation is NEWER than ours (replugged from another box),
+#       do NOT push; the reinsert handler runs a pull instead.
+# On push: --delete mirror, chown to uid 1000, advance the generation counter.
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[home-sync] $*" > "${SER}" 2>/dev/null; echo "[home-sync] $*"; }
+. /usr/local/lib/partyos-sync-common.sh
+
+[ -e "${PAUSE_FLAG}" ] && { log "sync PAUSED (USB removed); skipping"; exit 0; }
+[ -e "${RO_FLAG}" ]    && { log "sync DISABLED (USB read-only); skipping"; exit 0; }
+# (c) push gated on the boot pull baseline.
+[ -e "${PULL_DONE}" ]  || { log "boot pull not done yet; skipping push (gate)"; exit 0; }
+# PULL-IN-PROGRESS gate: a boot pull or a reinsert generation-guard pull is mid-copy into
+# the RAM home. Pushing now would --delete-mirror a PARTIAL RAM home back over the stick,
+# clobbering the very pull that is running. Stand down until the pull clears its marker.
+[ -e "${PULL_INPROGRESS}" ] && { log "home pull in progress; skipping push (gate)"; exit 0; }
+mountpoint -q "${MNT}" || { log "USB not mounted at ${MNT}; skipping sync"; exit 0; }
+is_rw || { log "USB at ${MNT} is read-only; skipping sync"; exit 0; }
+
+# (b) never --delete-mirror an empty RAM home onto the stick.
+if dir_empty "${HOME_DIR}"; then
+    log "ERROR RAM ${HOME_DIR} empty; refusing to --delete USB home"
+    exit 0
+fi
+
+install -d "${USB_HOME}"
+# (d) GENERATION GUARD. The USERNAME MOUNT GATE guarantees a mounted stick is this box's own,
+# so the only non-push verdicts are standdown (the SAME user's stick came back strictly newer
+# from another of their rigs) and corrupt. An EQUAL gen is our own steady-state re-mirror -> a
+# normal push (no cross-box tie, no box-id, no authoritative branch). Single integer compare.
+my_gen="$(gen_mine)"
+read -r stick_status stick_gen <<<"$(gen_read_status "${STATE_FILE}")"
+# OWN INTERRUPTED COMMIT: the stick is ahead of this box, but the pending marker says that
+# THIS boot wrote that generation (a push killed after gen_write, before gen_baseline). The
+# stick then holds our own completed mirror, not a newer home. Adopt its generation and push
+# again. Without this the guard stood down for the rest of the boot and the home stopped
+# saving.
+if [ "${stick_status}" = "ok" ] && [ "${stick_gen}" -gt "${my_gen}" ] 2>/dev/null \
+   && gen_own_pending "${stick_gen}"; then
+    log "PARTYOS-HOME-PUSH-RESUME stick generation ${stick_gen} > mine ${my_gen} is this boot's own interrupted push; adopting it and pushing again"
+    gen_baseline "${stick_gen}"
+    my_gen="${stick_gen}"
+fi
+verdict="$(gen_decide "${my_gen}" "${stick_status}" "${stick_gen}")"
+case "${verdict}" in
+    standdown)
+        # stick strictly newer -> a newer copy of THIS user's home (their own stick from
+        # another of their rigs); the reinsert handler pulls it. Do NOT push over it.
+        log "stick generation ${stick_gen} > mine ${my_gen}; standing down (reinsert handler will pull)"
+        exit 0
+        ;;
+    corrupt)
+        # Stick gen present but UNREADABLE (e.g. yanked mid-write). Treat as UNKNOWN,
+        # NOT 0: do NOT --delete-mirror over the stick - that could erase real newer data
+        # hiding behind a corrupt counter. The stick is PRESERVED simply by NOT pushing (its
+        # content is left byte-untouched); no backup - the .partyos-conflict copy-aside was
+        # removed in favour of --delete-delay. Bail; a later boot/reinsert re-reads the counter.
+        log "PARTYOS-SYNC-GEN-CORRUPT stick generation unreadable (mine ${my_gen}); NOT pushing (stick left untouched, no backup)"
+        exit 0
+        ;;
+esac
+# verdict == push: stick older/fresh, OR an EQUAL-gen tick (our own steady-state re-mirror -
+# the mount gate guarantees the stick is ours, so there is no cross-box tie to resolve). Fall
+# through to the normal --delete-delay push below.
+
+# PUSH-IN-PROGRESS marker + --delete-delay (shutdown SIGKILL protection). The finalsync
+# ExecStop push can be SIGKILLed mid-transfer on a slow/big stick. rsync's default
+# delete-during removes stick files BEFORE the matching transfers complete, so a killed
+# push leaves a partial stick carrying an untouched, valid-looking generation that the
+# next boot mirrors in as truth. --delete-delay defers ALL deletions until every transfer
+# has completed, so an interrupted push has deleted NOTHING. Belt-and-suspenders: drop a
+# marker on the stick BEFORE the push and clear it only on a COMPLETED push - if this push
+# is killed the marker survives to the next boot. The pull logs it and continues, because
+# its --delete-delay pull is non-destructive. partyos-safe-eject refuses to eject while
+# the marker is set.
+# The marker holds "<boot_id> <new_gen>" (see gen_own_pending). Only the marker is flushed:
+# a global `sync` also waits for every other dirty page on the box (game downloads on the
+# same stick) and made one push take minutes.
+# --fsync: rsync flushes each file it writes, so the mirror is on the stick before the
+# counter says it is complete. It flushes only the files of this push.
+new_gen=$(( my_gen + 1 ))
+push_mark_pending "${new_gen}"
+rsync -a --delete-delay --fsync --timeout=20 "${RSYNC_EX[@]}" "${HOME_DIR}/" "${USB_HOME}/"
+rc=$?
+# Reboot-hang fix: bound the chown -R. This runs in the finalsync ExecStop
+# at shutdown; an unbounded chown -R over a large home on a slow USB could overrun
+# TimeoutStopSec and hang reboot. timeout caps it - ownership is already correct from
+# the per-pull/push chowns, so a capped chown loses nothing material.
+timeout 20 chown -R "${UIDGID}:${UIDGID}" "${USB_HOME}" 2>/dev/null || true
+# (d) DATA-SAFETY GATE (mirror of the boot pull's rc 0/24 gate ~partyos-home-pull):
+# only advance the generation when the push actually COMPLETED. rc=0 is a clean
+# mirror; rc=24 is "some source files vanished mid-transfer" (benign - everything that
+# still existed was copied). ANY other rc (a --timeout=20 stall on a slow stick,
+# ENOSPC on a full stick, an I/O error) means the stick is only a PARTIAL mirror.
+# Stamping it "newest" anyway would poison every other box's generation guard into
+# trusting the incomplete stick over its own good copy, AND make this box's next boot
+# pull the partial home as truth. So on a failed push leave BOTH counters untouched
+# (the stick keeps its old, still-consistent generation) and log loudly; the 45s timer
+# retries, and a persistent failure never advances the counter.
+# COMMIT ORDER: stick counter, then the RAM counter, then remove the marker. A kill between
+# any two steps is recovered by the next push (equal generations push again; a stick one
+# ahead with this boot's marker is adopted above). No global `sync` in this path.
+if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 24 ]; then
+    gen_write "${new_gen}"
+    gen_baseline "${new_gen}"
+    rm -f "${PUSH_INPROGRESS}" 2>/dev/null || true   # push COMPLETED -> clear the marker
+    log "push rc=${rc} generation=${new_gen} ($(date '+%H:%M:%S'))"
+else
+    # leave PUSH_INPROGRESS set: this push did NOT complete. The marker stays until a
+    # later push completes.
+    log "PARTYOS-HOME-PUSH-INCOMPLETE push rc=${rc}; NOT advancing the generation, LEAVING the push-in-progress marker (stick suspect) ($(date '+%H:%M:%S'))"
+fi
+exit "${rc}"

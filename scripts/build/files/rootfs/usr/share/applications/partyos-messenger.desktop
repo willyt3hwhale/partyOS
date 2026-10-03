@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NYET Messenger
+GenericName=LAN Chat
+Comment=Chat on the LAN IRC server (installed on first use)
+Exec=/usr/local/bin/partyos-launch messenger
+Icon=internet-group-chat
+Terminal=false
+NoDisplay=true
+Categories=Network;InstantMessaging;

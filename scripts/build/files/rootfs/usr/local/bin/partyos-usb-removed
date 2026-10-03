@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+. /usr/local/lib/partyos-sync-common.sh
+EVENT_LOG="/run/partyos-hotplug.log"
+
+# MUTUAL HOTPLUG lock (fd 7): serialize against partyos-usb-reinserted so a fast
+# yank-replug can't interleave the two handlers into a device-present/mount-gone/PAUSE-set
+# stranded state. Bounded wait: worst case (a wedged holder) proceed with a WARN rather
+# than hang - our TimeoutStartSec is the outer net. Held (fd stays open) for the whole body.
+exec 7>"${HOTPLUG_LOCK}"
+flock -w 20 7 || echo "PARTYOS-USB-REMOVED WARN timed out on hotplug lock, proceeding unserialized" > "${SER}" 2>/dev/null || true
+
+# SAME-STICK GATE. Unmount only if the device behind ${MNT} is really gone.
+# $1 is the MAJ:MIN of the removed partition (the udev rule starts
+# partyos-usb-removed@MAJ:MIN.service). partyos-usb-poll starts the unit without $1.
+#  - With $1: continue only if $1 is a device mounted at ${MNT}. The removal of a
+#    different stick with a home label must not unmount this stick.
+#  - Without $1: continue only if no device mounted at ${MNT} is still in sysfs.
+# If nothing is mounted at ${MNT}, continue as before (pause the sync).
+REMOVED_DEV="${1:-}"
+HOME_DEVS="$(mount_majmins "${MNT}" | tr '\n' ' ')"
+if [ -n "${HOME_DEVS}" ]; then
+    if [ -n "${REMOVED_DEV}" ]; then
+        case " ${HOME_DEVS}" in
+            *" ${REMOVED_DEV} "*) ;;
+            *) say "PARTYOS-USB-REMOVED-IGNORED removed device ${REMOVED_DEV} is not the home stick at ${MNT} (${HOME_DEVS% })"
+               exit 0;;
+        esac
+    elif mounted_dev_present "${MNT}"; then
+        say "PARTYOS-USB-REMOVED-IGNORED the home stick at ${MNT} (${HOME_DEVS% }) is still present"
+        exit 0
+    fi
+fi
+
+echo "$(date '+%H:%M:%S') removed" >> "${EVENT_LOG}" 2>/dev/null || true
+# Pause first so any in-flight/next timer tick is a no-op.
+: > "${PAUSE_FLAG}"
+systemctl stop partyos-home-sync.timer 2>/dev/null || true
+# Kill any push that's MID-rsync (it holds the mount; umount -l would only detach it
+# lazily while it writes a now-vanished device). Heals on reinsert regardless.
+# Two-step: the wrapper bash AND the rsync CHILD it spawned. Killing only the wrapper
+# leaves the rsync running - its argv is `rsync ... ${USB_HOME}/`, not
+# `partyos-sync-home`, so it never matched and kept the mount pinned. Match the rsync by
+# its USB-home destination path so we hit exactly the push writing THIS stick.
+pkill -f /usr/local/bin/partyos-sync-home 2>/dev/null || true
+pkill -f "rsync.* ${USB_HOME}/" 2>/dev/null || true
+# The backing device is gone; drop the stale mountpoints. Unmount ALL stacked
+# layers (a coldplug/boot-mount race can leave the same device mounted twice; a
+# single umount -l drops only the top layer, leaving the stick half-released).
+umount_all "${MNT}"
+# Flush + cleanly drain the exFAT share (device is already gone on a surprise pull,
+# so the fsck inside is skipped - it only runs on the graceful safe-eject path).
+share_unmount_clean "${SHARE}"
+say "PARTYOS-USB-REMOVED home stick removed - sync paused"
+/usr/local/bin/partyos-usb-notify removed "Home stick removed - sync paused. Replug to resume; don't lose it!"

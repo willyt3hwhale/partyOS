@@ -1,0 +1,63 @@
+#!/bin/bash
+# Restore the partyOS Win95 single bottom Start bar if the first session clobbered it.
+SKEL="/usr/share/partyos/home-skel"
+PCX="${HOME}/.config/xfce4/xfconf/xfce-perchannel-xml"
+PDIR="${HOME}/.config/xfce4/panel"
+SENT="${PDIR}/.partyos-panel-done"
+[ -e "${SENT}" ] && exit 0            # player owns the panel after the first session
+[ -n "${DISPLAY}" ] || export DISPLAY=:0
+ME="$(id -un)"
+SKEL_XML="${SKEL}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+SKEL_WM="${SKEL}/.config/xfce4/panel/whiskermenu-1.rc"
+[ -f "${SKEL_XML}" ] || exit 0        # no baked Win95 config to enforce -> bail (no seal)
+
+# Win95 signature: exactly ONE panel AND a whiskermenu (Start) plugin. The default clobber
+# is TWO panels (top bar + bottom dock) with no whiskermenu. Query xfconf (the authoritative
+# LIVE state), not the on-disk xml, which xfconfd may not have flushed yet.
+win95_now() {
+  local np hs p
+  np="$(xfconf-query -c xfce4-panel -p /panels -l 2>/dev/null | grep -cE '^/panels/panel-[0-9]+$')"
+  [ "${np}" = 1 ] || return 1
+  hs=1
+  for p in $(xfconf-query -c xfce4-panel -p /plugins -l 2>/dev/null | sed -n 's#^\(/plugins/plugin-[0-9]\+\)$#\1#p'); do
+    [ "$(xfconf-query -c xfce4-panel -p "$p" 2>/dev/null)" = whiskermenu ] && return 0
+  done
+  return 1
+}
+
+# Wait (bounded) for xfce4-panel to have started this session so we read the layout it
+# actually settled on. If it never starts, retry next boot (no seal).
+started=0
+for _ in $(seq 1 30); do
+  if pgrep -u "${ME}" -x xfce4-panel >/dev/null 2>&1 \
+     && xfconf-query -c xfce4-panel -p /panels -l >/dev/null 2>&1; then started=1; break; fi
+  sleep 1
+done
+[ "${started}" = 1 ] || exit 0
+
+if win95_now; then
+  : > "${SENT}"                       # ordering fix held - player owns the panel now
+  exit 0
+fi
+
+# CLOBBERED: re-apply the baked Win95 perchannel xml. xfconfd caches the channel in memory
+# and rewrites the xml on change, so overwriting the file alone is lost (xfconfd writes its
+# stale cache back on exit). So quit the panel, drop xfconfd's cache, install the skel
+# config, then relaunch the panel - it re-activates xfconfd, which re-reads the fresh Win95
+# xml. Same daemon-owns-the-file discipline partyos-desktop-layout uses for xfdesktop.
+install -d "${PCX}" "${PDIR}"
+xfce4-panel --quit >/dev/null 2>&1 || pkill -u "${ME}" -x xfce4-panel 2>/dev/null || true
+pkill -u "${ME}" -x xfconfd 2>/dev/null || true
+sleep 1
+cp -f "${SKEL_XML}" "${PCX}/xfce4-panel.xml" 2>/dev/null || true
+[ -f "${SKEL_WM}" ] && cp -f "${SKEL_WM}" "${PDIR}/whiskermenu-1.rc" 2>/dev/null || true
+sync
+setsid xfce4-panel >/dev/null 2>&1 &
+
+# Seal only once the panel came back as the single Win95 bar, so a half-applied first boot
+# retries next time instead of locking in a broken layout.
+for _ in $(seq 1 15); do
+  if win95_now; then : > "${SENT}"; break; fi
+  sleep 1
+done
+exit 0

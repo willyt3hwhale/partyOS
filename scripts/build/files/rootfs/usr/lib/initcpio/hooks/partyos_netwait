@@ -1,0 +1,54 @@
+#!/usr/bin/ash
+# partyOS: wait for NIC carrier before archiso runs DHCP. Cold-boot NICs +
+# switch STP link late; klibc ipconfig sends DHCP immediately and would miss the
+# lease. Best-effort: never blocks boot past the timeout.
+run_hook() {
+    # mkinitcpio's parse_cmdline (run by init BEFORE any run_hook) exports every
+    # key=value on the kernel cmdline as a shell variable - this is the documented
+    # mkinitcpio idiom archiso itself uses (archiso_pxe_common reads ${ip}). There is
+    # NO `getarg` under mkinitcpio (that is a dracut helper), so read the vars directly.
+    # No ip= on the cmdline => not a netboot => nothing to wait for.
+    [ -n "${ip:-}" ] || return 0
+    # DNS for a server hostname: iPXE passes the DNS server of its lease as
+    # partyos_dns= (the static ip= handoff cannot carry it). Write it here, before
+    # archiso_pxe_common. That hook only overwrites resolv.conf when ipconfig got a
+    # DNS server, and with the static ip= it gets none.
+    case "${partyos_dns:-}" in
+        ''|0.0.0.0) ;;
+        *) echo "nameserver ${partyos_dns}" > /etc/resolv.conf
+           msg ":: partyOS: DNS server ${partyos_dns} (from the iPXE lease)";;
+    esac
+    local _wait_max _waited _dev _carrier _up
+    _wait_max="${netwait:-30}"              # seconds; override with netwait= cmdline
+    # sanitise: a missing/garbage netwait= must never wedge the bounded wait.
+    case "${_wait_max}" in ''|*[!0-9]*) _wait_max=30;; esac
+    msg ":: partyOS: bringing NICs up, waiting up to ${_wait_max}s for link..."
+    # bring every wired ethernet interface administratively up so carrier reads true
+    for _dev in /sys/class/net/*; do
+        [ -e "${_dev}" ] || continue
+        case "${_dev##*/}" in lo|sit*|bonding_masters) continue;; esac
+        # wireless ifaces have a /wireless or /phy80211 dir - skip them
+        [ -e "${_dev}/wireless" ] && continue
+        [ -e "${_dev}/phy80211" ] && continue
+        ip link set "${_dev##*/}" up 2>/dev/null
+    done
+    _waited=0
+    while [ "${_waited}" -lt "${_wait_max}" ]; do
+        for _dev in /sys/class/net/*; do
+            [ -e "${_dev}" ] || continue
+            case "${_dev##*/}" in lo|sit*|bonding_masters) continue;; esac
+            [ -e "${_dev}/wireless" ] && continue
+            [ -e "${_dev}/phy80211" ] && continue
+            _carrier="$(cat "${_dev}/carrier" 2>/dev/null || echo 0)"
+            if [ "${_carrier}" = "1" ]; then
+                msg ":: partyOS: link up on ${_dev##*/} after ${_waited}s"
+                return 0
+            fi
+        done
+        sleep 1
+        _waited=$((_waited + 1))
+    done
+    msg ":: partyOS: WARN no carrier after ${_wait_max}s - proceeding to DHCP anyway"
+    return 0
+}
+# vim: set ft=sh:

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# partyos-loadurl - GUI front door for the Load-from-URL share-code feature.
+set -u
+
+while :; do
+    code="$(zenity --entry --width=520 --title="partyOS - Load Game from URL" \
+        --text="Paste the share code your friend sent you:" 2>/dev/null)" || exit 0
+    [ -n "${code}" ] || exit 0
+    case "${code}" in
+        magnet:\?*) break;;
+        *) zenity --error --width=420 --title="partyOS - Load from URL" \
+             --text="That does not look like a partyOS share code.\n\nIt must start with: magnet:?" 2>/dev/null || true;;
+    esac
+done
+
+# Pull the name + source IP out of the magnet query for the confirmation dialog.
+query="${code#magnet:\?}"
+name=""; ip=""
+oldifs="${IFS}"; IFS='&'
+for kv in ${query}; do
+    case "${kv}" in
+        dn=*)   name="${kv#dn=}";;
+        x.pe=*) ip="${kv#x.pe=}"; ip="${ip%%:*}";;
+    esac
+done
+IFS="${oldifs}"
+name="${name//%20/ }"
+[ -n "${name}" ] || name="(unknown)"
+[ -n "${ip}" ] || ip="(unknown)"
+
+# SECURITY: loading a peer blob means downloading and RUNNING code that peer built.
+# Name the source and require an explicit confirmation before any download.
+zenity --question --width=460 --title="Load from a peer?" \
+    --text="This will download and RUN \"${name}\" from ${ip}.\n\nOnly load codes from people you trust - a share code proves the bytes are intact, not that they are safe.\n\nContinue?" \
+    2>/dev/null || exit 0
+
+# Run the engine behind a pulsing progress dialog. The engine logs progress to the
+# serial console; the GUI just shows activity until it returns.
+( partyos-app load-url "${code}" >/tmp/partyos-loadurl.$$.log 2>&1; echo $? >/tmp/partyos-loadurl.$$.rc ) &
+worker=$!
+( echo "# Starting ${name}..."; while kill -0 "${worker}" 2>/dev/null; do echo "# Downloading and verifying ${name}..."; sleep 1; done ) | \
+    zenity --progress --pulsate --auto-close --no-cancel --width=460 \
+        --title="partyOS - Loading ${name}" --text="Starting ${name}..." 2>/dev/null || true
+wait "${worker}" 2>/dev/null || true
+rc="$(cat /tmp/partyos-loadurl.$$.rc 2>/dev/null || echo 1)"
+rm -f /tmp/partyos-loadurl.$$.rc 2>/dev/null || true
+
+if [ "${rc}" = "0" ]; then
+    zenity --info --width=420 --title="partyOS - Loaded" \
+        --text="${name} loaded and launched." 2>/dev/null || true
+else
+    zenity --error --width=460 --title="partyOS - Load failed" \
+        --text="Could not load ${name}.\n\nLog:\n$(tail -5 /tmp/partyos-loadurl.$$.log 2>/dev/null)" 2>/dev/null || true
+fi
+rm -f /tmp/partyos-loadurl.$$.log 2>/dev/null || true

@@ -1,0 +1,24 @@
+[Unit]
+Description=partyOS - tear down game/seed procs + USB game overlays before unmount
+DefaultDependencies=no
+Conflicts=shutdown.target
+# Our teardown (seeder kill + game-overlay/loop unmount) must run BEFORE finalsync's
+# home push and the generic unmount pass, so the USB blob cache is unpinned and the
+# game overlays are gone before the home is rsynced and before umount.target runs.
+# systemd stops units in REVERSE order, so an ExecStop that must fire before another
+# unit stops needs After= that unit (NOT Before=) - same idiom as the journal-snapshot
+# -shutdown unit. Before= is kept only for the shutdown/umount *targets*. After=
+# local-fs.target keeps it up through the session so its ExecStop fires late.
+After=local-fs.target partyos-usbhome.service partyos-home-finalsync.service
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+# Bounded: never let the teardown itself hang the shutdown.
+TimeoutStopSec=30s
+ExecStop=/usr/local/bin/partyos-shutdown-teardown
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Add every cached blob to the one client aria2c (partyos-seeder.service ExecStartPost).
+# partyos-app resolves the desktop user and its cache dir. Runs as root.
+exec /usr/local/bin/partyos-app seed-cached

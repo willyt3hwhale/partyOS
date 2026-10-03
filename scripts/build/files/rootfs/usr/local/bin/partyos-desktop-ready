@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Emitted by an XFCE autostart entry when the player desktop session is up.
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+report_base=""
+for p in $(< /proc/cmdline); do
+  case "$p" in report_url=*) report_base="${p#*=}";; esac
+done
+# No server parameter: fail loudly. The desktop still comes up; only the report is lost.
+[ -n "${report_base}" ] || { m="PARTYOS-DESKTOP-READY-NO-SERVER: no report_url= on /proc/cmdline"; echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true; }
+
+# Give X/compositor a moment to actually paint a frame before we claim "ready".
+sleep 4
+# The session user comes from /run/partyos-username (partyos-identity-setup writes it from
+# internyet.env). Do not use a fixed name. If the file is missing, use the user of this process.
+me="$(tr -d '[:space:]' < /run/partyos-username 2>/dev/null || true)"
+[ -n "${me}" ] || me="$(id -un)"
+say "PARTYOS-STEP3-DESKTOP-READY xfce session up user=${me} display=${DISPLAY:-none}"
+# Record the running session/driver bits for evidence. These are the HEADLESS
+# session-active proofs the harness asserts on (no GPU screendump needed):
+#  - an xfce4-session process is running for the session user
+#  - an X server (Xorg-dummy or Xvfb) is up on the DISPLAY
+ses="${XDG_CURRENT_DESKTOP:-unknown}"
+# An XFCE session is "active" if any core component is running: the session
+# manager, the window manager, or the panel (startxfce4 vs xfce4-session differ).
+if pgrep -u "${me}" -x xfce4-session >/dev/null 2>&1 || \
+   pgrep -u "${me}" -x xfwm4 >/dev/null 2>&1 || \
+   pgrep -u "${me}" -x xfce4-panel >/dev/null 2>&1; then
+  xfproc=yes
+else
+  xfproc=no
+fi
+xsrv="$(pgrep -x Xorg >/dev/null 2>&1 && echo Xorg || { pgrep -x Xvfb >/dev/null 2>&1 && echo Xvfb || echo none; })"
+glr="$(command -v glxinfo >/dev/null 2>&1 && glxinfo 2>/dev/null | grep -m1 'OpenGL renderer' || echo 'glxinfo-absent')"
+say "PARTYOS-STEP3-SESSION-ACTIVE session=${ses} xfce4-session=${xfproc} xserver=${xsrv}"
+say "PARTYOS-STEP3 ${glr}"
+# derive-report-status: report HONESTLY - status=ok&desktop=ready ONLY when a session
+# component is up AND an X server is running. A black seat (Xorg/XFCE never came up) must
+# NOT report green; it reports status=degraded&desktop=notready so the server log reflects
+# reality (the fleet-verify success matcher still keys off status=ok = a truly-up seat).
+if [ "${xfproc}" = yes ] && [ "${xsrv}" != none ]; then
+  rstatus=ok; rdesktop=ready
+else
+  rstatus=degraded; rdesktop=notready
+fi
+# end-derive-report-status
+curl -s --max-time 5 \
+  "${report_base}/report?step=3&status=${rstatus}&desktop=${rdesktop}&user=${me}&session=${ses}&xfce=${xfproc}&xserver=${xsrv}" \
+  >/dev/null 2>&1 || say "callback-failed (non-fatal)"
+
+# Heartbeats so the harness can confirm the desktop STAYS up (and as a generous
+# window for the QMP screendump to be captured).
+i=0
+while [ "$i" -lt 30 ]; do
+  sleep 3; i=$((i+1))
+  say "PARTYOS-STEP3-ALIVE desktop heartbeat ${i}"
+done

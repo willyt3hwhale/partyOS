@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# partyos-identity-setup - resolve the desktop account from the stick and make the
+# system log in as it. Runs once per boot from partyos-identity.service, ordered
+# After the USB-home mount and Before display-manager.service.
+#
+# IDENTITY SOURCE: the venue writes `internyet.env` on the shared exFAT
+# partition (a share label, see partyos-usb-labels.sh; mounted at /mnt/share). That file is the primary
+# source. The legacy `.partyos` on the ext4 home partition is the FALLBACK, so an
+# old stick still boots.
+#   USERNAME <- INTERNYET_USER_NAME
+#   HOSTNAME <- INTERNYET_DEFAULT_FQDN (the full FQDN, see internyet_node_name;
+#               the first label is the short alias in /etc/hosts)
+#
+# Steps:
+#   1. Read the user name from internyet.env, else USERNAME= from .partyos.
+#      Validate (^[a-z_][a-z0-9_-]*$, <=32 chars). Missing file / absent key /
+#      invalid value -> fall back to 'gamer' (fully backward compatible).
+#   2. Ensure the account exists at FIXED uid/gid 1000 (create if absent; if a
+#      different name already holds 1000, rename it to the resolved name).
+#   3. Passwordless sudo (wheel group + /etc/sudoers.d NOPASSWD) - user owns the
+#      machine, no security boundary.
+#   4. Home = /home/<name> (the USB-synced home dir).
+#   5. Rewrite LightDM autologin-user=<name> BEFORE lightdm starts.
+#   6. Resolve + set the HOSTNAME. INTERNYET_DEFAULT_FQDN wins, then an explicit
+#      HOSTNAME= in .partyos (validated RFC1123-ish); else DERIVE
+#      <username>-<machine-suffix> where machine-suffix
+#      is the first 4 hex chars of a hash of the primary NIC MAC (stable per box,
+#      so it both identifies the player AND distinguishes their multiple rigs);
+#      else (no username) partyos-<machine-suffix>.
+# Emits the resolved name to /run/partyos-username + the hostname to
+# /run/partyos-hostname so boot scripts can reuse them.
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+log() { echo "[identity] $*" > "${SER}" 2>/dev/null; echo "[identity] $*"; }
+
+# Best-effort HTTP callback for identity outcome, so a rename failure is
+# visible to the boot reporter (not just the serial log). report_url is read
+# from /proc/cmdline (same mechanism partyos-desktop-ready uses); absent -> log
+# PARTYOS-IDENTITY-SETUP-NO-SERVER and skip. Always returns 0 - the report is diagnostic, never fatal.
+partyos_identity_report() {
+    local status="$1" user="$2" detail="${3:-}"
+    local base=""
+    # Use `cat`, not $(< /proc/cmdline 2>/dev/null). The redirect breaks the bash
+    # $(< file) fast path, so the result is always empty and the report is skipped.
+    for p in $(cat /proc/cmdline 2>/dev/null); do
+        case "$p" in report_url=*) base="${p#*=}";; esac
+    done
+    if [ -z "${base}" ]; then
+        local m="PARTYOS-IDENTITY-SETUP-NO-SERVER: no report_url= on /proc/cmdline, identity report skipped"; echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+        return 0
+    fi
+    curl -s --max-time 5 \
+        "${base}/report?step=identity&status=${status}&user=${user}&detail=${detail}" \
+        >/dev/null 2>&1 || true
+    return 0
+}
+
+MNT="/mnt/usbhome"
+SHARE_MNT="/mnt/share"
+DEFAULT_USER="gamer"
+UIDGID=1000
+
+# shellcheck source=/dev/null
+source /usr/local/bin/partyos-cfg
+# shellcheck source=/dev/null
+source /usr/local/lib/partyos-internyet.sh
+# shellcheck source=/dev/null
+source /usr/local/lib/partyos-usb-labels.sh
+
+# --- machine suffix: 4 hex chars derived from the primary NIC MAC ------------
+# Stable per machine across boots (the MAC does not change), so it identifies the
+# physical rig. The same player's stick on a different box gets a different
+# suffix - that is the point (tell their rigs apart). Falls back to a
+# machine-id-derived value, then 0000, if no MAC is readable.
+partyos_machine_suffix() {
+    local mac="" iface
+    # First non-loopback iface with a usable MAC (skip all-zero).
+    for iface in $(ls /sys/class/net 2>/dev/null); do
+        [ "${iface}" = "lo" ] && continue
+        local a; a="$(cat "/sys/class/net/${iface}/address" 2>/dev/null || true)"
+        [ -n "${a}" ] && [ "${a}" != "00:00:00:00:00:00" ] && { mac="${a}"; break; }
+    done
+    local seed="${mac}"
+    [ -n "${seed}" ] || seed="$(cat /etc/machine-id 2>/dev/null || true)"
+    [ -n "${seed}" ] || { echo "0000"; return; }
+    printf '%s' "${seed}" | sha256sum 2>/dev/null | cut -c1-4
+}
+
+# --- 1. locate + (if needed) mount the stick read-only to read .partyos ------
+# The USB-home mount service normally has it at /mnt/usbhome already; if not,
+# mount it ourselves read-only just long enough to parse the config. We never
+# rely on it being writable here.
+own_mount=0
+if ! mountpoint -q "${MNT}"; then
+    # Bound blkid + mount with `timeout` so a slow/wedge-prone stick bails rather than
+    # blocking display-manager (the unit-level TimeoutStartSec=30 is the real backstop).
+    DEV="$(partyos_resolve_label_dev home)"
+    if [ -n "${DEV}" ]; then
+        install -d "${MNT}"
+        if timeout 15 mount -o ro "${DEV}" "${MNT}" 2>/dev/null; then own_mount=1; fi
+    fi
+fi
+CFG_FILE="${MNT}/.partyos"
+
+# --- 1b. locate the shared exFAT partition (a share label) -------------------
+# partyos-usbhome normally has it at /mnt/share already. If not, mount it
+# read-only long enough to read internyet.env, exactly as we do for the home.
+own_share=0
+if ! mountpoint -q "${SHARE_MNT}"; then
+    SDEV="$(partyos_resolve_label_dev share)"
+    if [ -n "${SDEV}" ]; then
+        install -d "${SHARE_MNT}"
+        if timeout 15 mount -o ro "${SDEV}" "${SHARE_MNT}" 2>/dev/null; then own_share=1; fi
+    fi
+fi
+ENV_FILE="$(internyet_env_file "${SHARE_MNT}")"
+[ -n "${ENV_FILE}" ] && log "identity from ${ENV_FILE}" || log "no internyet.env on the share -> legacy .partyos fallback"
+
+# --- 2. resolve + validate the username (fallback gamer) ---------------------
+# INTERNYET_USER_NAME is primary; .partyos USERNAME= is the legacy fallback.
+raw=""
+raw_source="internyet.env"
+if [ -n "${ENV_FILE}" ]; then
+    raw="$(internyet_get INTERNYET_USER_NAME "${ENV_FILE}" 2>/dev/null || true)"
+fi
+if [ -z "${raw}" ]; then
+    raw="$(partyos_cfg USERNAME "${CFG_FILE}" 2>/dev/null || true)"
+    raw_source=".partyos"
+fi
+USERNAME="${DEFAULT_USER}"
+if [ -n "${raw}" ]; then
+    if [ "${#raw}" -le 32 ] && printf '%s' "${raw}" | grep -qE '^[a-z_][a-z0-9_-]*$'; then
+        USERNAME="${raw}"
+        log "USERNAME from ${raw_source}: '${USERNAME}'"
+    else
+        log "invalid USERNAME '${raw}' in ${raw_source} -> falling back to '${DEFAULT_USER}'"
+    fi
+elif [ -n "${ENV_FILE}" ] || [ -r "${CFG_FILE}" ]; then
+    log "no user name in ${raw_source} -> using '${DEFAULT_USER}'"
+else
+    log "no identity file on stick -> using '${DEFAULT_USER}'"
+fi
+
+# Publish the env file path as a HINT for the services that run after us
+# (userconf, trust). Only when the share mount is not ours to drop: a path under a
+# mount we are about to release would be stale. Those services call
+# internyet_env_file() themselves, so the hint is an optimisation, never a
+# requirement. The path is published, never the contents - the file holds secrets.
+rm -f /run/partyos-internyet-env 2>/dev/null || true
+if [ -n "${ENV_FILE}" ] && [ "${own_share}" -eq 0 ]; then
+    printf '%s' "${ENV_FILE}" > /run/partyos-internyet-env
+fi
+
+# unmount if we mounted it ourselves (leave the real mount service in charge).
+[ "${own_mount}" -eq 1 ] && timeout 15 umount "${MNT}" 2>/dev/null || true
+[ "${own_share}" -eq 1 ] && timeout 15 umount "${SHARE_MNT}" 2>/dev/null || true
+
+HOME_DIR="/home/${USERNAME}"
+
+# --- 3. ensure the account exists at FIXED uid/gid 1000 ----------------------
+# Whoever currently owns uid 1000 (the baked 'gamer' by default).
+cur_user="$(getent passwd ${UIDGID} | cut -d: -f1 || true)"
+if [ "${cur_user}" = "${USERNAME}" ]; then
+    log "account '${USERNAME}' already holds uid ${UIDGID}"
+elif [ -n "${cur_user}" ]; then
+    # Reuse uid/gid 1000 by RENAMING the existing account to the resolved name and
+    # pointing its home at /home/${USERNAME}. We do NOT use `usermod -m` to migrate
+    # the baked /home/gamer tree: the live home CONTENT now comes from
+    # partyos-home-pull (USB seed/pull) or the baked skel in RAM, NOT from the
+    # template landing in the live home. -m would also fail/odd-behave when the
+    # target home already exists. The account just needs the right name + -d.
+    log "renaming uid-${UIDGID} account '${cur_user}' -> '${USERNAME}' (home from pull/seed)"
+    groupmod -n "${USERNAME}" "${cur_user}" 2>/dev/null || true
+    usermod -l "${USERNAME}" -d "${HOME_DIR}" "${cur_user}" 2>/dev/null || true
+elif id "${USERNAME}" >/dev/null 2>&1; then
+    log "account '${USERNAME}' exists (uid $(id -u "${USERNAME}"))"
+else
+    log "creating account '${USERNAME}' at uid/gid ${UIDGID}"
+    groupadd -g "${UIDGID}" "${USERNAME}" 2>/dev/null || true
+    useradd -m -u "${UIDGID}" -g "${UIDGID}" -s /bin/bash \
+        -G wheel,video,audio,network -d "${HOME_DIR}" "${USERNAME}" 2>/dev/null \
+        || useradd -m -u "${UIDGID}" -s /bin/bash -G wheel,video,audio,network \
+               -d "${HOME_DIR}" "${USERNAME}" 2>/dev/null || true
+fi
+
+# RECONCILE the resolved name against the account that ACTUALLY exists.
+# The rename/create above are all best-effort (`|| true`): a failed `usermod -l`
+# (account busy, name collision, ...) silently leaves uid ${UIDGID} owned by the
+# OLD name (e.g. 'gamer') while every downstream config below (sudoers, LightDM
+# autologin-user, linger, home owner) is about to be written for the INTENDED
+# ${USERNAME}. That mismatch -> LightDM autologin points at a non-existent user
+# -> no desktop, no error. Re-query who really holds uid ${UIDGID} now and bind
+# the rest of this script to THAT actual name. A no-op/failed rename then
+# degrades to "logs in as the existing account" instead of "no desktop at all".
+actual_user="$(getent passwd ${UIDGID} | cut -d: -f1 || true)"
+if [ -z "${actual_user}" ]; then
+    # uid ${UIDGID} has NO account (create path failed too). There is no
+    # consistent autologin we can synthesize here - fail LOUD rather than write
+    # configs for a user that does not exist.
+    log "PARTYOS-IDENTITY-FAIL no account owns uid ${UIDGID} after setup (intended='${USERNAME}')"
+    partyos_identity_report "fail" "${USERNAME}" "no-account-uid-${UIDGID}"
+    exit 1
+fi
+if [ "${actual_user}" != "${USERNAME}" ]; then
+    # The rename did not take. Re-point every downstream config at the account
+    # that actually exists so autologin still works (against the old name).
+    log "PARTYOS-IDENTITY-RENAME-FAILED intended='${USERNAME}' actual='${actual_user}' -> using actual for autologin"
+    partyos_identity_report "rename-failed" "${actual_user}" "intended=${USERNAME}"
+    USERNAME="${actual_user}"
+    HOME_DIR="/home/${USERNAME}"
+fi
+# Apply an OPTIONAL per-player password. The crypt hash lives on the USB home
+# (/mnt/usbhome/.partyos-passwd, one line) so it survives the RAM /etc reset; we reapply
+# it to the freshly-reset /etc/shadow every boot, BEFORE the session starts. No file or
+# an invalid hash -> passwordless kiosk (the party default). NOPASSWD sudo lives in
+# sudoers.d, NOT shadow, so partyos-app's `sudo -n` is unaffected either way.
+PWHASH="$(head -1 /mnt/usbhome/.partyos-passwd 2>/dev/null | tr -d '[:space:]')"
+if [ -n "${PWHASH}" ] && printf '%s' "${PWHASH}" | grep -qE '^\$(y|6|7|2[aby])\$'; then
+    usermod -p "${PWHASH}" "${USERNAME}" 2>/dev/null \
+        && log "applied per-player password from USB (lockscreen enabled)" \
+        || { log "usermod -p failed -> passwordless fallback"; passwd -d "${USERNAME}" 2>/dev/null || true; }
+else
+    passwd -d "${USERNAME}" 2>/dev/null || true
+fi
+
+# home dir + ownership. The CONTENT is filled by partyos-home-pull (runs After us):
+# seed an empty USB home from the baked skel, then --delete-mirror it into RAM. We
+# only guarantee the empty dir + ownership exist here.
+install -d "${HOME_DIR}"
+chown "${USERNAME}:${USERNAME}" "${HOME_DIR}" 2>/dev/null || \
+    chown "${UIDGID}:${UIDGID}" "${HOME_DIR}" 2>/dev/null || true
+
+# ~/Shared -> /mnt/share (the p3 exFAT cross-OS share). A symlink (not a real dir)
+# so it points at the mount; the home rsync EXCLUDES 'Shared', so the --delete
+# mirror never recurses into the share or deletes it.
+# Guarantee the symlink target ALWAYS exists so ~/Shared never dangles. /mnt/share
+# is the bare mountpoint dir; when no share is mounted (legacy stick, or after the
+# stick is pulled) it stays an EMPTY present dir, so ~/Shared resolves to an (empty) dir
+# instead of a broken link. install -d is idempotent and leaves a live mount untouched.
+install -d /mnt/share 2>/dev/null || true
+if [ ! -e "${HOME_DIR}/Shared" ] || [ -L "${HOME_DIR}/Shared" ]; then
+    ln -sfn /mnt/share "${HOME_DIR}/Shared" 2>/dev/null || true
+    chown -h "${USERNAME}:${USERNAME}" "${HOME_DIR}/Shared" 2>/dev/null \
+        || chown -h "${UIDGID}:${UIDGID}" "${HOME_DIR}/Shared" 2>/dev/null || true
+fi
+
+# autologin group (LightDM autologin needs it).
+groupadd -f autologin 2>/dev/null || true
+gpasswd -a "${USERNAME}" autologin 2>/dev/null || true
+gpasswd -a "${USERNAME}" wheel 2>/dev/null || true
+
+# systemd linger for the RESOLVED user so its per-user instance (the session bus)
+# starts at boot. The image bakes linger/gamer; after a rename that name is stale,
+# so (re)create it for ${USERNAME} and drop a stale gamer one if we renamed.
+install -d /var/lib/systemd/linger 2>/dev/null || true
+: > "/var/lib/systemd/linger/${USERNAME}" 2>/dev/null || true
+[ "${USERNAME}" != "gamer" ] && rm -f /var/lib/systemd/linger/gamer 2>/dev/null || true
+
+# --- 4. passwordless sudo (user owns the machine) ----------------------------
+install -d -m 0750 /etc/sudoers.d
+cat > /etc/sudoers.d/99-partyos <<SUDO
+# partyOS - the player owns this machine; passwordless sudo for the desktop user.
+%wheel ALL=(ALL:ALL) NOPASSWD: ALL
+${USERNAME} ALL=(ALL:ALL) NOPASSWD: ALL
+SUDO
+chmod 0440 /etc/sudoers.d/99-partyos
+
+# --- 5. rewrite LightDM autologin to the resolved user (before lightdm) ------
+install -d /etc/lightdm
+cat > /etc/lightdm/lightdm.conf <<LDM
+[Seat:*]
+autologin-user=${USERNAME}
+autologin-session=xfce
+autologin-user-timeout=0
+user-session=xfce
+greeter-session=lightdm-gtk-greeter
+LDM
+
+# --- 6. resolve + apply the HOSTNAME -----------------------------------------
+# Order: INTERNYET_DEFAULT_FQDN, then an explicit HOSTNAME= in .partyos if it
+# validates (RFC1123-ish: ^[a-z0-9][a-z0-9-]*$, <=63, lowercase). Otherwise
+# DERIVE it from the username + the per-machine suffix. With no username either,
+# partyos-<suffix>.
+SUFFIX="$(partyos_machine_suffix)"
+HOSTNAME_RESOLVED=""
+hn_source="derived"
+FQDN=""
+SHORT_HOST=""
+
+# INTERNYET_DEFAULT_FQDN wins. It is a DOTTED name ("deck.player1.p.nyet").
+# Many FQDNs can share the first label ("deck"). Thus the hostname is the FULL FQDN:
+#   * full FQDN -> /etc/hostname + hostnamectl (see internyet_node_name).
+#   * first label ("deck") -> the short alias in /etc/hosts on 127.0.1.1.
+# If the FQDN is longer than 64 characters, the hostname is the first label.
+if [ -n "${ENV_FILE}" ]; then
+    fq_raw="$(internyet_get INTERNYET_DEFAULT_FQDN "${ENV_FILE}" 2>/dev/null || true)"
+    if [ -n "${fq_raw}" ] && internyet_valid_fqdn "${fq_raw}"; then
+        FQDN="$(printf '%s' "${fq_raw}" | tr '[:upper:]' '[:lower:]')"
+        SHORT_HOST="$(internyet_short_host "${FQDN}")"
+        HOSTNAME_RESOLVED="$(internyet_node_name "${FQDN}")"
+        if [ -n "${HOSTNAME_RESOLVED}" ]; then
+            hn_source="internyet-fqdn"
+            log "HOSTNAME from INTERNYET_DEFAULT_FQDN: '${HOSTNAME_RESOLVED}' (alias '${SHORT_HOST}')"
+        elif [ -n "${SHORT_HOST}" ]; then
+            HOSTNAME_RESOLVED="${SHORT_HOST}"
+            hn_source="internyet-short"
+            log "INTERNYET_DEFAULT_FQDN '${FQDN}' is longer than 64 chars -> hostname is the first label '${SHORT_HOST}'"
+        else
+            log "INTERNYET_DEFAULT_FQDN '${fq_raw}' has no usable first label -> deriving instead"
+            FQDN=""
+        fi
+    elif [ -n "${fq_raw}" ]; then
+        log "invalid INTERNYET_DEFAULT_FQDN '${fq_raw}' -> deriving instead"
+    fi
+fi
+
+hn_raw="$(partyos_cfg HOSTNAME "${CFG_FILE}" 2>/dev/null || true)"
+if [ -z "${HOSTNAME_RESOLVED}" ] && [ -n "${hn_raw}" ]; then
+    if [ "${#hn_raw}" -le 63 ] && printf '%s' "${hn_raw}" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
+        HOSTNAME_RESOLVED="${hn_raw}"
+        hn_source="explicit"
+        log "HOSTNAME from .partyos: '${HOSTNAME_RESOLVED}'"
+    else
+        log "invalid HOSTNAME '${hn_raw}' in .partyos -> deriving instead"
+    fi
+fi
+if [ -z "${HOSTNAME_RESOLVED}" ]; then
+    if [ "${USERNAME}" = "${DEFAULT_USER}" ] && [ "${raw}" = "" ]; then
+        # No username on the stick -> generic partyos-<suffix>.
+        HOSTNAME_RESOLVED="partyos-${SUFFIX}"
+    else
+        # Sanitize the username part to valid hostname chars (lowercase, strip).
+        uhn="$(printf '%s' "${USERNAME}" | tr '[:upper:]_' '[:lower:]-' \
+                 | tr -cd 'a-z0-9-' | sed -E 's/^-+//; s/-+$//')"
+        [ -n "${uhn}" ] || uhn="partyos"
+        HOSTNAME_RESOLVED="${uhn}-${SUFFIX}"
+    fi
+    log "HOSTNAME derived (${hn_source}, suffix=${SUFFIX}): '${HOSTNAME_RESOLVED}'"
+fi
+# Apply: /etc/hostname is the source of truth; hostnamectl/hostname set it live.
+echo "${HOSTNAME_RESOLVED}" > /etc/hostname
+hostname "${HOSTNAME_RESOLVED}" 2>/dev/null || true
+hostnamectl set-hostname "${HOSTNAME_RESOLVED}" 2>/dev/null || true
+echo "${HOSTNAME_RESOLVED}" > /run/partyos-hostname
+
+# /etc/hosts carries the FULL name so `hostname -f` resolves to the venue FQDN.
+# The 127.0.1.1 line is the Debian/Arch convention for a machine with a dotted
+# name on a DHCP address: FQDN first, then the short alias. We rewrite only our
+# own managed line, so a hand-edited /etc/hosts keeps its other entries.
+[ -n "${FQDN}" ] || FQDN="${HOSTNAME_RESOLVED}"
+printf '%s' "${FQDN}" > /run/partyos-fqdn
+if [ -w /etc/hosts ] || [ ! -e /etc/hosts ]; then
+    {
+        grep -v '[[:space:]]# partyos-identity$' /etc/hosts 2>/dev/null || true
+        if [ -n "${SHORT_HOST}" ] && [ "${SHORT_HOST}" != "${FQDN}" ]; then
+            printf '127.0.1.1\t%s %s\t# partyos-identity\n' "${FQDN}" "${SHORT_HOST}"
+        else
+            printf '127.0.1.1\t%s\t# partyos-identity\n' "${FQDN}"
+        fi
+    } > /etc/hosts.partyos-new 2>/dev/null \
+        && mv -f /etc/hosts.partyos-new /etc/hosts 2>/dev/null || true
+    rm -f /etc/hosts.partyos-new 2>/dev/null || true
+fi
+
+# publish the resolved name for boot scripts (step3/4/5 read this).
+echo "${USERNAME}" > /run/partyos-username
+
+# ASSERT the end state is self-consistent before we hand off to LightDM:
+# the autologin user (LightDM autologin-user / /run/partyos-username == ${USERNAME})
+# must be an account that actually exists and owns the home we configured. If any
+# of that does not hold we log LOUD (the rename/reconcile above should have made
+# it hold; this is the backstop) - the marker tells a diagnostician exactly what
+# is inconsistent instead of a silent blank screen.
+ldm_user="$(awk -F= '/^autologin-user=/{print $2}' /etc/lightdm/lightdm.conf 2>/dev/null | head -1)"
+home_owner="$(stat -c '%U' "${HOME_DIR}" 2>/dev/null || true)"
+if id "${USERNAME}" >/dev/null 2>&1 \
+   && [ "${ldm_user}" = "${USERNAME}" ] \
+   && { [ "${home_owner}" = "${USERNAME}" ] || [ -z "${home_owner}" ]; }; then
+    log "PARTYOS-IDENTITY-OK user=${USERNAME} uid=$(id -u "${USERNAME}" 2>/dev/null) home=${HOME_DIR} home_owner=${home_owner:-?} autologin=${ldm_user} hostname=${HOSTNAME_RESOLVED}"
+    partyos_identity_report "ok" "${USERNAME}" "uid=$(id -u "${USERNAME}" 2>/dev/null)"
+else
+    log "PARTYOS-IDENTITY-INCONSISTENT user=${USERNAME} exists=$(id "${USERNAME}" >/dev/null 2>&1 && echo y || echo n) autologin=${ldm_user} home=${HOME_DIR} home_owner=${home_owner:-?}"
+    partyos_identity_report "inconsistent" "${USERNAME}" "autologin=${ldm_user},owner=${home_owner:-none}"
+fi
+exit 0

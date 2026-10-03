@@ -1,0 +1,87 @@
+#!/bin/bash
+# partyos-staticip-setup - apply a fully-explicit static network from user.conf, or
+# leave plain DHCP. TWO modes, nothing in between:
+#   STATIC_IP set  -> full static: Address (+optional Gateway/DNS) from the config, and
+#                     NO DHCP is ever run on the link (the drop-in is laid down before
+#                     systemd-networkd configures it, via network-pre.target - so we
+#                     never grab+abandon a pool lease we don't control).
+#   STATIC_IP unset -> plain DHCP: drop any stale static profile, let 20-ethernet DHCP.
+# The party LAN's DHCP server is not ours, so there are no reservations - a player who
+# wants a fixed address sets the WHOLE network here. Off-subnet routing (Gateway/DNS)
+# is optional: an offline LAN party needs neither (mDNS handles discovery).
+MNT=/mnt/usbhome
+CFG="${MNT}/user.conf"
+DROP=/etc/systemd/network/10-partyos-static.network
+log(){ echo "partyos-staticip: $*"; }
+getk(){ grep -E "^${1}=" "${CFG}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]'; }
+valid_ip(){ printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+
+STATIC_IP="$(getk STATIC_IP)"; GATEWAY="$(getk GATEWAY)"; DNS="$(getk DNS)"
+
+# no static config -> plain DHCP (drop any stale static profile) and exit. Runs before
+# networkd, so removing the drop-in here means networkd comes up clean on DHCP.
+if [ -z "${STATIC_IP}" ]; then
+  if [ -e "${DROP}" ]; then rm -f "${DROP}"; fi
+  log "no STATIC_IP -> DHCP"; exit 0
+fi
+
+# parse Address[/prefix] (prefix defaults to /24)
+addr="${STATIC_IP%/*}"; prefix=24
+[ "${STATIC_IP}" != "${addr}" ] && prefix="${STATIC_IP#*/}"
+case "${prefix}" in ''|*[!0-9]*) prefix=24;; esac
+valid_ip "${addr}" || { log "invalid STATIC_IP '${STATIC_IP}' -> DHCP"; rm -f "${DROP}" 2>/dev/null; exit 0; }
+if [ -n "${GATEWAY}" ] && ! valid_ip "${GATEWAY}"; then log "invalid GATEWAY '${GATEWAY}' -> ignored"; GATEWAY=""; fi
+if [ -n "${DNS}" ] && ! valid_ip "${DNS}"; then log "invalid DNS '${DNS}' -> ignored"; DNS=""; fi
+
+# Pick the wired interface that actually has LINK (a cable plugged in). With more than
+# one NIC (e.g. a second onboard port, or wired+wifi) we must bind the static config to
+# the CONNECTED one. We run BEFORE networkd while links are still administratively down,
+# so carrier isn't readable yet - bring each physical en*/eth* candidate up ourselves,
+# then poll carrier and take the first that reports link.
+cands=""
+for n in /sys/class/net/*; do
+  ifn="$(basename "${n}")"
+  case "${ifn}" in en*|eth*) ;; *) continue;; esac
+  [ -e "${n}/device" ] || continue                        # physical only (skip virtual)
+  [ "$(cat "${n}/type" 2>/dev/null)" = "1" ] || continue  # ARPHRD_ETHER
+  cands="${cands}${cands:+ }${ifn}"
+  ip link set "${ifn}" up 2>/dev/null || true             # so carrier becomes readable
+done
+IF=""
+for _ in $(seq 1 20); do
+  for ifn in ${cands}; do
+    [ "$(cat "/sys/class/net/${ifn}/carrier" 2>/dev/null)" = "1" ] && { IF="${ifn}"; break; }
+  done
+  [ -n "${IF}" ] && break
+  sleep 0.5
+done
+# No NIC reported a carrier (cable out, or a driver that won't report pre-config): use
+# the lone candidate if there's exactly one, else don't guess between several - DHCP.
+if [ -z "${IF}" ]; then
+  set -- ${cands}
+  if [ "$#" = 1 ]; then IF="$1"; log "no carrier seen; single wired NIC -> using ${IF}"
+  else log "no wired link among [${cands:-none}] -> leaving DHCP"; rm -f "${DROP}" 2>/dev/null; exit 0; fi
+fi
+log "selected linked interface ${IF}"
+
+{
+  echo "[Match]"
+  echo "Name=${IF}"
+  echo ""
+  echo "[Network]"
+  echo "DHCP=no"
+  echo "IPv6AcceptRA=no"   # full static = ONLY the configured address (no RA/DHCPv6 auto-config)
+  echo "Address=${addr}/${prefix}"
+  [ -n "${GATEWAY}" ] && echo "Gateway=${GATEWAY}"
+  if   [ -n "${DNS}" ];     then echo "DNS=${DNS}"
+  elif [ -n "${GATEWAY}" ]; then echo "DNS=${GATEWAY}"; fi
+  echo "MulticastDNS=yes"
+} > "${DROP}"
+# If networkd is somehow already up (manual re-run after boot), nudge it; on the normal
+# boot path networkd hasn't started yet and reads the drop-in fresh, so no DHCP happens.
+if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+  networkctl reload 2>/dev/null || true
+  networkctl reconfigure "${IF}" 2>/dev/null || systemctl restart systemd-networkd 2>/dev/null || true
+fi
+log "static ${IF} -> ${addr}/${prefix} gw=${GATEWAY:-none} dns=${DNS:-${GATEWAY:-none}}"
+exit 0

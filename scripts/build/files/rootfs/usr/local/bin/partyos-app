@@ -1,0 +1,1795 @@
+#!/usr/bin/env bash
+# partyos-app - the partyOS app-store BACKEND (CLI). Every GUI/shortcut path calls
+# this, so the headless test and a real click exercise the same code.
+#
+# Catalog source (the LAN): server base resolved in this order:
+#   1. PARTYOS_SERVER env
+#   2. SERVER_BASE= in /etc/partyos/appstore.conf
+#   3. report_url= on /proc/cmdline (how every other partyOS boot script learns it)
+#   4. none: log PARTYOS-APP-NO-SERVER and leave SERVER_BASE empty
+# The catalog is server/games/catalog.json.
+#
+# Cache: a downloaded blob is kept under
+# <usbhome>/.partyos-cache/games/<name>.squashfs when the
+# home partition of the stick is mounted rw (survives reboot), else /var/cache/partyos/
+# games (RAM, transient). install() checks the cache first (HIT = no download).
+#
+# "installed" = the blob is mounted (squashfs ro lower + tmpfs overlay upper) at
+# ~<user>/games/<name>. remove() drops the overlay.
+set -u
+
+# Privileged subcommands (mount squashfs/overlay, write /run + /var/cache + /var/lib)
+# need root. The desktop launchers run us as the player, so re-exec via passwordless
+# sudo - carrying the player's X session through so cmd_launch can hand the app back
+# to their display (sudo's env_reset would otherwise drop DISPLAY/XAUTHORITY).
+case "${1:-}" in
+  install|reinstall|install-launch|remove|uncache|clear-cache|load-url|ensure-baseenv|seed-cached)
+    if [ "$(id -u)" -ne 0 ]; then
+      exec sudo -n \
+        PARTYOS_RUN_USER="$(id -un)" \
+        PARTYOS_DISPLAY="${DISPLAY:-}" \
+        PARTYOS_XAUTHORITY="${XAUTHORITY:-${HOME:-}/.Xauthority}" \
+        PARTYOS_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+        "$0" "$@"
+    fi
+    ;;
+esac
+
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+say() { echo "$*" > "${SER}" 2>/dev/null; echo "$*"; }
+
+# --- resolve the desktop user (dynamic identity) + their games dir -----------
+APP_USER="gamer"
+[ -r /run/partyos-username ] && APP_USER="$(tr -d '[:space:]' < /run/partyos-username)"
+[ -n "${APP_USER}" ] || APP_USER="gamer"
+id "${APP_USER}" >/dev/null 2>&1 || APP_USER="gamer"
+HOME_DIR="$(getent passwd "${APP_USER}" | cut -d: -f6)"; [ -n "${HOME_DIR}" ] || HOME_DIR="/home/${APP_USER}"
+GAMES_DIR="${HOME_DIR}/games"
+
+# --- resolve the server base (the LAN) ---------------------------------------
+server_base() {
+    [ -n "${PARTYOS_SERVER:-}" ] && { printf '%s' "${PARTYOS_SERVER}"; return; }
+    if [ -r /etc/partyos/appstore.conf ]; then
+        local b; b="$(grep -E '^SERVER_BASE=' /etc/partyos/appstore.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+        [ -n "${b}" ] && { printf '%s' "${b}"; return; }
+    fi
+    local rb=""
+    # NB: `cat`, not $(< file 2>...): the 2>/dev/null breaks bash's $(< file)
+    # fast-path (it becomes an empty command -> empty output -> wrong fallback).
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in report_url=*) rb="${p#*=}";; esac; done
+    [ -n "${rb}" ] && { printf '%s' "${rb}"; return; }
+    # No server parameter: fail loudly. Never dial a guessed address.
+    local m="PARTYOS-APP-NO-SERVER: no report_url= on /proc/cmdline and no SERVER_BASE= in /etc/partyos/appstore.conf"
+    echo "${m}" >&2; logger -t partyos -p user.err "${m}" 2>/dev/null || true
+    return 1
+}
+SERVER_BASE="$(server_base)"
+
+# --- HTTPS: pinned-CA curl args for an https target ------------------
+# The POST-BOOT runtime fetches (catalog/blobs/torrents, the operator config hook,
+# the portal, per-app config templates) move to HTTPS verified against the partyOS CA
+# baked at /etc/partyos/ca.pem. cacert_args URL echoes "--cacert /etc/partyos/ca.pem"
+# ONLY when URL is https:// (and the file exists) - so a still-HTTP target (e.g. the
+# single-box fallback to report_url=, which stays HTTP) is untouched. Used at the blob_fetch choke points and the standalone runtime curls.
+PARTYOS_CA=/etc/partyos/ca.pem
+cacert_args() {
+    case "$1" in
+        https://*) [ -r "${PARTYOS_CA}" ] && printf '%s' "--cacert ${PARTYOS_CA}";;
+    esac
+}
+
+# --- resolve the blob/catalog server LIST (server-split, ordered failover) -
+# A split deploy (render.sh emits blob_urls= - an ORDERED, comma-separated failover
+# list - on the cmdline when the blob set differs from PXE_SERVER) serves the catalog,
+# blobs and .torrents off dedicated host(s). Precedence for the list:
+#   1. blob_urls=URL1,URL2,...   the ordered failover list (the new canonical param)
+#   2. blob_url=URL              the legacy singular param -> a 1-element list
+#   3. report_url= (SERVER_BASE) the common single-box deploy (no blob param emitted)
+# Single-element list = today's behaviour exactly (one base, no failover overhead).
+blob_bases() {
+    local urls="" one=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in
+        blob_urls=*) urls="${p#*=}";;
+        blob_url=*)  one="${p#*=}";;
+    esac; done
+    [ -n "${urls}" ] && { printf '%s' "${urls}"; return; }
+    [ -n "${one}" ]  && { printf '%s' "${one}";  return; }
+    printf '%s' "${SERVER_BASE}"
+}
+# Split the CSV into an ordered array of blob base-URLs (BLOB_BASES). BLOB_BASE keeps
+# pointing at the FIRST base for log lines / single-use messages; the actual fetches
+# go through blob_fetch (below), which tries each base in order.
+IFS=',' read -r -a BLOB_BASES <<< "$(blob_bases)"
+BLOB_BASE="${BLOB_BASES[0]:-${SERVER_BASE}}"
+CATALOG_URL="${BLOB_BASE}/server/games/catalog.json"
+
+# blob_fetch REL OUT [curl-args...] -> try each blob base in order; the first that
+# answers writes OUT and wins. Sets BLOB_WON to the winning base-URL on success and
+# BLOB_DID_FAILOVER=1 if an earlier base in the list did not answer. Returns 1 if NO
+# base answered. A single-element BLOB_BASES (today's case) behaves exactly like one
+# curl (loop runs once, no failover). The report channel does NOT route through here.
+BLOB_WON=""
+BLOB_DID_FAILOVER=0
+blob_fetch() {
+    local rel="$1" out="$2"; shift 2
+    local skipped="" base
+    BLOB_WON=""
+    for base in "${BLOB_BASES[@]}"; do
+        [ -n "${base}" ] || continue
+        # Pin the partyOS CA when this base is https (per-base, so a mixed/
+        # transition list with one http base still works); curl ignores it for http.
+        if curl -fsS $(cacert_args "${base}") "$@" -o "${out}" "${base}/${rel}" 2>/dev/null; then
+            BLOB_WON="${base}"
+            if [ -n "${skipped}" ]; then
+                BLOB_DID_FAILOVER=1
+                say "PARTYOS-APP-FAILOVER from=${skipped} to=${base} (blob URL did not answer)"
+            fi
+            return 0
+        fi
+        skipped="${base}"
+    done
+    return 1
+}
+
+MNT="/mnt/usbhome"
+RAM_CACHE="/var/cache/partyos/games"
+MNT_BASE="/run/partyos-games"
+STATE_DIR="/var/lib/partyos/apps"
+
+# --- USB blob-cache budget ---------------------------------------------
+# Read the cmdline knobs render.sh threads on (blob_cache_reserve_gb= keeps that
+# many GB free on the stick; blob_cache_max_gb= caps total cached size, 0=off).
+# Defaults match deploy.conf so an un-rendered/older boot still behaves sanely.
+cmdline_kv() {
+    local key="$1" v=""
+    for p in $(cat /proc/cmdline 2>/dev/null); do case "$p" in "${key}="*) v="${p#*=}";; esac; done
+    printf '%s' "${v}"
+}
+cache_reserve_gb() { local v; v="$(cmdline_kv blob_cache_reserve_gb)"; case "${v}" in ''|*[!0-9]*) v=8;; esac; printf '%s' "${v}"; }
+cache_max_gb()     { local v; v="$(cmdline_kv blob_cache_max_gb)";     case "${v}" in ''|*[!0-9]*) v=0;; esac; printf '%s' "${v}"; }
+# blob_seeding=off turns seeding off. Any other value, or none, means on. A client
+# seeds a blob until cache eviction removes it.
+seeding_enabled()  { [ "$(cmdline_kv blob_seeding)" != off ]; }
+# Per-client upload cap for seeding. aria2 value: 0 = unlimited, or a rate like 5M / 500K.
+seed_up_limit()    { local v; v="$(cmdline_kv blob_seed_up_limit)"; case "${v}" in ''|*[!0-9KMkm]*) v=0;; esac; printf '%s' "${v}"; }
+
+# --- P2P (torrent) helpers ---------------------------------------------
+# fetch_torrent NAME BLOBPATH CDIR -> echo a local .torrent path (cached) or empty.
+# The server serves <blob>.torrent next to the blob; we cache it beside the blob so
+# the bounded seeder can reuse it on later launches.
+# Fetch the current torrent first; use the cached one only if the server is unreachable.
+# A repacked blob has a new info-hash, and a stale torrent joins the old swarm.
+fetch_torrent() {
+    local name="$1" blobpath="$2" cdir="$3"
+    command -v aria2c >/dev/null 2>&1 || return 1
+    local tc="${cdir}/${name}.squashfs.torrent"
+    if blob_fetch "${blobpath}.torrent" "${tc}.tmp" --max-time 15; then
+        mv -f "${tc}.tmp" "${tc}" 2>/dev/null && { printf '%s' "${tc}"; return 0; }
+    fi
+    rm -f "${tc}.tmp" 2>/dev/null
+    # Server unreachable: fall back to a cached torrent if we have one (offline best-effort).
+    [ -s "${tc}" ] && { printf '%s' "${tc}"; return 0; }
+    return 1
+}
+# torrent_infohash FILE - print the hex BitTorrent info-hash (sha1 of the bencoded info
+# dict) of a .torrent, or NOTHING on failure. The tracker `announce` lives OUTSIDE the
+# info dict, so two torrents that differ ONLY by an added announce share this hash (same
+# swarm) - which is exactly what lets refresh_torrent swap a stale torrent safely.
+torrent_infohash() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$1" <<'PY' 2>/dev/null
+import sys, hashlib
+try:
+    d=open(sys.argv[1],"rb").read()
+except OSError:
+    sys.exit(0)
+i=d.find(b"4:infod")
+if i<0: sys.exit(0)
+start=i+6
+def skip(d,p):
+    c=d[p:p+1]
+    if c in (b"d",b"l"):
+        p+=1
+        while d[p:p+1]!=b"e":
+            if c==b"d": p=skip(d,p); p=skip(d,p)
+            else: p=skip(d,p)
+        return p+1
+    if c==b"i": return d.find(b"e",p)+1
+    if c.isdigit():
+        co=d.find(b":",p); return co+1+int(d[p:co])
+    raise ValueError
+try:
+    print(hashlib.sha1(d[start:skip(d,start)]).hexdigest())
+except Exception:
+    sys.exit(0)
+PY
+}
+# refresh_torrent NAME BLOBPATH CDIR - on a cache-HIT, PREFER the FRESH server .torrent so a
+# stick that cached the blob BEFORE the tracker announce was added re-announces to the
+# tracker. get_blob returns on a cache-HIT WITHOUT
+# calling fetch_torrent, so an already-cached announce-less .torrent is otherwise never
+# refreshed and the stick stays off the tracker (only LPD co-swarms it on-LAN). Adding a
+# tracker announce lives OUTSIDE the info dict, so the info-hash is UNCHANGED - swapping the
+# torrent keeps the SAME swarm and costs a few KB. SAFETY GATES:
+#   * needs a server BLOBPATH to re-fetch from; the load-url share-code path stages a torrent
+#     with NO server URL (empty blobpath), so skip it - never clobber a staged torrent.
+#   * only swap when the fresh torrent's info-hash MATCHES the cached one. A DIFFERENT
+#     info-hash means a different (repacked / re-pieced) blob - never silently swap that.
+#   * best-effort: any fetch/parse failure leaves the cached torrent untouched.
+refresh_torrent() {
+    local name="$1" blobpath="$2" cdir="$3"
+    [ -n "${blobpath}" ] || return 0
+    command -v aria2c >/dev/null 2>&1 || return 0
+    local tor="${cdir}/${name}.squashfs.torrent"
+    [ -s "${tor}" ] || return 0
+    local fresh="${tor}.fresh"
+    if ! blob_fetch "${blobpath}.torrent" "${fresh}" --max-time 15 || [ ! -s "${fresh}" ]; then
+        rm -f "${fresh}" 2>/dev/null || true; return 0
+    fi
+    local ih_old ih_new
+    ih_old="$(torrent_infohash "${tor}")"
+    ih_new="$(torrent_infohash "${fresh}")"
+    if [ -n "${ih_new}" ] && [ "${ih_new}" = "${ih_old}" ] && ! cmp -s "${tor}" "${fresh}"; then
+        if mv -f "${fresh}" "${tor}" 2>/dev/null; then
+            say "PARTYOS-APP-TORRENT-REFRESH name=${name} (same info-hash, refreshed .torrent for tracker announce)"
+            # aria2c keeps the old announce list in memory. Take the entry out, so
+            # the next start_seed adds it again with the fresh tracker.
+            a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+        fi
+    else
+        rm -f "${fresh}" 2>/dev/null || true
+    fi
+    return 0
+}
+# --- the one client aria2c (partyos-seeder.service) -----------------------------
+# One aria2c seeds every cached blob and does every catalog download. It has
+# JSON-RPC on loopback. partyos-aria2rpc is the client. PARTYOS_ARIA2RPC lets a
+# test put a mock in its place. One process means one I/O stream to the USB stick.
+# Before, 11 per-blob seeders re-hashed their blobs at boot at the same time and
+# saturated a USB 2.0 stick.
+ARIA2RPC="${PARTYOS_ARIA2RPC:-/usr/local/bin/partyos-aria2rpc}"
+a2() { "${ARIA2RPC}" "$@"; }
+# a2_up - make sure the aria2c answers. If it does not (for example after
+# safe-eject stopped it), start the service. Return 1 if it stays down.
+a2_up() {
+    a2 ping >/dev/null 2>&1 && return 0
+    if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl start --no-block partyos-seeder.service >/dev/null 2>&1 || true
+    fi
+    a2 wait "${PARTYOS_ARIA2_WAIT:-30}" >/dev/null 2>&1
+}
+
+# start_seed NAME CDIR - seed a blob we hold, without limit, in the one aria2c.
+# The blob seeds until it is evicted (partyos-ram removes it over RPC). There
+# is NO hash check at start: the blob passed sha256 at install time. No-op if
+# seeding is off (blob_seeding=off), the torrent or blob is missing, or the
+# blob is already in aria2c (a finished download keeps seeding in its entry).
+start_seed() {
+    local name="$1" cdir="$2"
+    seeding_enabled || return 0
+    local tor="${cdir}/${name}.squashfs.torrent"; [ -s "${tor}" ] || return 0
+    [ -s "${cdir}/${name}.squashfs" ] || return 0
+    # Only seed a COMPLETE blob. A .aria2 control file or a .dl marker means the
+    # download is not finished. Peers must never get incomplete content.
+    if [ -e "${cdir}/${name}.squashfs.aria2" ] || [ -e "${cdir}/${name}.squashfs.dl" ]; then
+        say "PARTYOS-APP-SEED-SKIP name=${name} reason=incomplete"
+        return 0
+    fi
+    if ! a2_up; then
+        say "PARTYOS-APP-SEED-SKIP name=${name} reason=aria2-rpc-down"
+        return 0
+    fi
+    a2 find "${name}" "${cdir}" >/dev/null 2>&1 && return 0
+    local gid err
+    if gid="$(a2 add "${tor}" "${cdir}" seed 2>&1)"; then
+        say "PARTYOS-APP-SEED-START name=${name} gid=${gid} seed=forever verify=skip"
+    else
+        err="${gid}"
+        say "PARTYOS-APP-SEED-SKIP name=${name} reason=rpc-add-failed (${err})"
+    fi
+    return 0
+}
+
+# cache_devstat CDIR - print the /sys stat file of the block device that holds
+# CDIR. Field 7 of the file is the count of sectors written. Prints nothing for
+# a RAM cache (tmpfs). PARTYOS_DL_DEVSTAT names another file (tests).
+cache_devstat() {
+    if [ -n "${PARTYOS_DL_DEVSTAT:-}" ]; then printf '%s' "${PARTYOS_DL_DEVSTAT}"; return 0; fi
+    local src; src="$(findmnt -no SOURCE --target "$1" 2>/dev/null | head -1)"; src="${src##*/}"
+    [ -n "${src}" ] && [ -r "/sys/class/block/${src}/stat" ] && printf '%s' "/sys/class/block/${src}/stat"
+    return 0
+}
+
+# p2p_download NAME CDIR TORRENT - download a blob in the one aria2c and wait.
+# Returns 0 when the file is complete. On failure it sets DL_REASON to the real
+# cause (the aria2 error code and message, or the stall numbers) and returns 1.
+# The partial and its .aria2 control file stay, so a retry resumes.
+# The entry keeps seeding after it completes (seed-ratio 0 in the aria2c).
+# On success DL_GID is the gid of the entry. blob_settle asks aria2c about it.
+DL_REASON=""
+DL_GID=""
+p2p_download() {
+    local name="$1" cdir="$2" tor="$3"
+    local stall="${PARTYOS_BT_STOP_TIMEOUT:-600}" poll="${PARTYOS_DL_POLL:-2}"
+    DL_REASON=""; DL_GID=""
+    # While the RPC is silent: the write count of the cache device, and the start
+    # of the silent time. A real wedge (the stick stops) fails at silent_max.
+    local devstat wsec last_wsec="" t_silent="" silent_max="${PARTYOS_RPC_SILENT_MAX:-1800}"
+    local t_prog="${SECONDS}" blk last_blk=0 ping busy=0
+    devstat="$(cache_devstat "${cdir}")"
+    wsec="$(awk '{print $7}' "${devstat:-/nonexistent}" 2>/dev/null)"
+    case "${wsec}" in ''|*[!0-9]*) ;; *) last_wsec="${wsec}";; esac
+    blk="$(du -k "${cdir}/${name}.squashfs" 2>/dev/null | cut -f1)"
+    case "${blk}" in ''|*[!0-9]*) ;; *) last_blk="${blk}";; esac
+    t_silent="${SECONDS}"
+    # A retry can start while the stick still writes for the download of an
+    # earlier try. Then the RPC of the one aria2c is silent for minutes. Use the
+    # rule of the poll loop below: a timed-out ping means that aria2c is alive,
+    # and the writes of the cache device are progress. Another ping error (for
+    # example a refused connection) means that aria2c does not run: fail at once.
+    a2_up || while :; do
+        ping="$(a2 ping 2>&1)" && break
+        case "${ping}" in
+            *"timed out"*) ;;
+            *)  DL_REASON="the client aria2c (partyos-seeder.service) does not answer on RPC (${ping})"
+                return 1;;
+        esac
+        [ "${busy}" -eq 1 ] || { say "PARTYOS-APP-DL-RPC-BUSY name=${name} (${ping}) - waiting for the stick"; busy=1; }
+        blk="$(du -k "${cdir}/${name}.squashfs" 2>/dev/null | cut -f1)"
+        if [ "${blk:-0}" -gt "${last_blk}" ] 2>/dev/null; then last_blk="${blk}"; t_prog="${SECONDS}"; fi
+        wsec="$(awk '{print $7}' "${devstat:-/nonexistent}" 2>/dev/null)"
+        case "${wsec}" in ''|*[!0-9]*) ;;
+            *) [ -n "${last_wsec}" ] && [ "${wsec}" -gt "${last_wsec}" ] && t_prog="${SECONDS}"
+               last_wsec="${wsec}";;
+        esac
+        if [ $(( SECONDS - t_silent )) -ge "${silent_max}" ]; then
+            DL_REASON="the aria2 RPC did not answer for $(( SECONDS - t_silent ))s (limit ${silent_max}s) before the download: ${ping}"
+            return 1
+        fi
+        if [ $(( SECONDS - t_prog )) -ge "${stall}" ]; then
+            DL_REASON="the aria2 RPC did not answer for $(( SECONDS - t_prog ))s before the download, and the stick did not write: ${ping}"
+            return 1
+        fi
+        sleep "${poll}"
+    done
+    t_silent=""
+    local gid="" out rc t_add="${SECONDS}" ih
+    # A retry: aria2c can still run the download of an earlier try (an install
+    # that gave up on a slow stick). Follow that entry. Do not remove it and add
+    # again: forceRemove is async, and the new add then fails with error 12.
+    # adopt also removes every other entry for the file: an old seed or a download
+    # of another info hash.
+    ih="$(torrent_infohash "${tor}")"
+    if [ -n "${ih}" ]; then
+        gid="$(a2 adopt "${name}" "${cdir}" "${ih}" 2>/dev/null)" || gid=""
+        [ -n "${gid}" ] && say "PARTYOS-APP-DL-ADOPT name=${name} gid=${gid} (the download of an earlier try still runs)"
+    else
+        a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+    fi
+    while [ -z "${gid}" ]; do
+        out="$(a2 add "${tor}" "${cdir}" download 2>&1)" && { gid="${out}"; break; }
+        case "${out}" in
+            *"RPC unreachable"*) ;;
+            *) DL_REASON="aria2 refused the torrent: ${out}"; return 1;;
+        esac
+        # A busy aria2c can take the add and answer too late. Do NOT add again
+        # while the RPC is slow: a second add of the same torrent fails with
+        # error 12 (InfoHash already registered). Ask with find until aria2c
+        # answers: exit 0 = the add went through, exit 1 = it did not.
+        while :; do
+            [ $(( SECONDS - t_add )) -lt "${stall}" ] || { DL_REASON="aria2 did not take the torrent in ${stall}s: ${out}"; return 1; }
+            sleep "${poll}"
+            gid="$(a2 find "${name}" "${cdir}" 2>/dev/null)"; rc=$?
+            [ "${rc}" -eq 0 ] && break 2
+            [ "${rc}" -eq 1 ] && { gid=""; break; }
+        done
+    done
+    say "PARTYOS-APP-P2P name=${name} gid=${gid} (one aria2c: torrent + tracker + LPD peers)"
+    local st status completed="" total="" speed="" conns="" seeders="" code message
+    # Stall = wall-clock time without progress (SECONDS), not a count of polls:
+    # one RPC call can take up to its timeout.
+    local last=-1 t_start="${SECONDS}" t_log="${SECONDS}" rpc_bad=0
+    t_prog="${SECONDS}"
+    while :; do
+        if ! st="$(a2 status "${gid}" 2>&1)"; then
+            case "${st}" in
+                *"RPC unreachable"*)
+                    # aria2c does its disk writes in its event loop. On a slow USB
+                    # stick a write can block it past the RPC timeout. The download
+                    # goes on: wait, and let the stall timer decide.
+                    rpc_bad=$(( rpc_bad + 1 ))
+                    [ "${rpc_bad}" -eq 1 ] && say "PARTYOS-APP-DL-RPC-SLOW name=${name} (${st}) - waiting"
+                    [ -n "${t_silent}" ] || t_silent="${SECONDS}"
+                    # Without the RPC, the blocks on disk of the partial show progress.
+                    blk="$(du -k "${cdir}/${name}.squashfs" 2>/dev/null | cut -f1)"
+                    if [ "${blk:-0}" -gt "${last_blk}" ] 2>/dev/null; then last_blk="${blk}"; t_prog="${SECONDS}"; fi
+                    # The partial does not grow while the write of aria2c is blocked in
+                    # the kernel, but the stick still writes the dirty pages (bench on
+                    # real hardware: du flat for 240 s, the stick wrote 25 MB). If the RPC
+                    # timed out (aria2c is alive) and the cache device writes, the
+                    # download is disk-bound, not stalled.
+                    case "${st}" in
+                        *"timed out"*)
+                            wsec="$(awk '{print $7}' "${devstat:-/nonexistent}" 2>/dev/null)"
+                            case "${wsec}" in ''|*[!0-9]*) ;;
+                                *) [ -n "${last_wsec}" ] && [ "${wsec}" -gt "${last_wsec}" ] && t_prog="${SECONDS}"
+                                   last_wsec="${wsec}";;
+                            esac;;
+                    esac
+                    if [ $(( SECONDS - t_silent )) -ge "${silent_max}" ]; then
+                        DL_REASON="the aria2 RPC did not answer for $(( SECONDS - t_silent ))s (limit ${silent_max}s) at ${completed:-0}/${total:-?} bytes: ${st}"
+                        return 1
+                    fi
+                    if [ $(( SECONDS - t_prog )) -ge "${stall}" ]; then
+                        DL_REASON="the aria2 RPC did not answer for $(( SECONDS - t_prog ))s at ${completed:-0}/${total:-?} bytes, and the stick did not write: ${st}"
+                        return 1
+                    fi
+                    sleep "${poll}"; continue;;
+                *)
+                    # For example "GID not found": aria2c restarted and lost the entry.
+                    DL_REASON="lost the download in aria2c: ${st}"
+                    return 1;;
+            esac
+        fi
+        t_silent=""
+        status="$(printf '%s\n' "${st}" | sed -n 's/^status=//p')"
+        completed="$(printf '%s\n' "${st}" | sed -n 's/^completed=//p')"
+        total="$(printf '%s\n' "${st}" | sed -n 's/^total=//p')"
+        speed="$(printf '%s\n' "${st}" | sed -n 's/^speed=//p')"
+        conns="$(printf '%s\n' "${st}" | sed -n 's/^connections=//p')"
+        seeders="$(printf '%s\n' "${st}" | sed -n 's/^seeders=//p')"
+        code="$(printf '%s\n' "${st}" | sed -n 's/^code=//p')"
+        message="$(printf '%s\n' "${st}" | sed -n 's/^message=//p')"
+        case "${completed}" in ''|*[!0-9]*) completed=0;; esac
+        case "${total}" in ''|*[!0-9]*) total=0;; esac
+        if [ "${total}" -gt 0 ] && [ "${completed}" -ge "${total}" ]; then
+            local el=$(( SECONDS - t_start )); [ "${el}" -gt 0 ] || el=1
+            say "PARTYOS-APP-DL-DONE name=${name} bytes=${total} secs=${el} avg_kbps=$(( total / el / 1024 )) rpc_slow=${rpc_bad}"
+            DL_GID="${gid}"
+            return 0
+        fi
+        case "${status}" in
+            error)
+                # Error 12 = this torrent is already in aria2c (an earlier add went
+                # through late). Follow that live entry instead.
+                # find exit 3 = the RPC timed out: ask again. Exit 1 = no live entry.
+                # Do NOT run "a2 remove NAME" here: it also removes the live entry.
+                if [ "${code}" = "12" ]; then
+                    local live="" frc=3
+                    while :; do
+                        live="$(a2 find "${name}" "${cdir}" 2>/dev/null)"; frc=$?
+                        [ "${frc}" -eq 3 ] || break
+                        [ $(( SECONDS - t_prog )) -lt "${stall}" ] || break
+                        sleep "${poll}"
+                    done
+                    a2 forget "${gid}" >/dev/null 2>&1 || true
+                    if [ "${frc}" -eq 0 ] && [ -n "${live}" ] && [ "${live}" != "${gid}" ]; then
+                        say "PARTYOS-APP-DL-DUP name=${name} gid=${gid} -> live gid=${live}"
+                        gid="${live}"; continue
+                    fi
+                    DL_REASON="aria2 error 12: ${message:-no message} (no live entry found, find exit ${frc})"
+                    return 1
+                fi
+                DL_REASON="aria2 error ${code:-?}: ${message:-no message} (at ${completed}/${total} bytes)"
+                a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+                # The .aria2 control file belongs to another torrent (the blob was
+                # repacked). A resume can never work: drop the partial, so the
+                # next try starts clean on the current swarm.
+                case "${message}" in
+                    *"info hash mismatch"*) rm -f "${cdir}/${name}.squashfs" "${cdir}/${name}.squashfs.aria2" 2>/dev/null || true;;
+                esac
+                return 1;;
+            removed)
+                DL_REASON="the download was stopped (removed) at ${completed}/${total} bytes"
+                return 1;;
+        esac
+        if [ "${completed}" -gt "${last}" ]; then
+            last="${completed}"; t_prog="${SECONDS}"
+        fi
+        if [ $(( SECONDS - t_prog )) -ge "${stall}" ]; then
+            DL_REASON="no progress for $(( SECONDS - t_prog ))s at ${completed}/${total} bytes, connections=${conns:-0} seeders=${seeders:-0}"
+            [ "${conns:-0}" = "0" ] && DL_REASON="${DL_REASON} (no peer reached: check the tracker in the .torrent and LPD)"
+            a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+            return 1
+        fi
+        if [ $(( SECONDS - t_log )) -ge 30 ]; then
+            t_log="${SECONDS}"
+            say "PARTYOS-APP-DL-PROGRESS name=${name} bytes=${completed}/${total} speed_kbps=$(( ${speed:-0} / 1024 )) connections=${conns:-0} seeders=${seeders:-0}"
+        fi
+        sleep "${poll}"
+    done
+}
+
+# blob_fsync FILE - flush the dirty pages of FILE to the stick. It is an fsync of
+# this one file, not a global sync.
+blob_fsync() { sync -- "$1" 2>/dev/null || true; }
+
+# blob_settle NAME CDIR SHA - verify a blob that p2p_download reports complete.
+# aria2c counts a piece as complete while the piece is still in its disk cache
+# (--disk-cache=256M). On a slow stick the flush takes minutes, and a sha check
+# at once reads an incomplete file.
+# Return 0: the sha matches.
+# Return 1: the blob is bad. Two checks, PARTYOS_SETTLE_GAP seconds apart, gave the
+#   same wrong sha, and before the second check aria2c answered in time and
+#   reported the download complete. Only then may the caller delete the blob.
+# Return 2: no decision before PARTYOS_SETTLE_MAX. SETTLE_REASON has the cause.
+#   The caller must keep the blob, because aria2c can still write to it.
+# An RPC timeout is not a "complete" and not a failure: aria2c blocks its event
+# loop while it writes to the stick. Wait and ask again.
+SETTLE_REASON=""
+blob_settle() {
+    local name="$1" cdir="$2" sha="$3"
+    local f="${cdir}/${name}.squashfs" size mb
+    local gap="${PARTYOS_SETTLE_GAP:-60}" poll="${PARTYOS_DL_POLL:-2}"
+    SETTLE_REASON=""
+    size="$(wc -c < "${f}" 2>/dev/null | tr -d ' ')"
+    case "${size}" in ''|*[!0-9]*) size=0;; esac
+    mb=$(( size / 1048576 ))
+    # The time limit is 600 s plus 1 s for each MB (a stick that writes 1 MB/s).
+    local max="${PARTYOS_SETTLE_MAX:-$(( 600 + mb ))}"
+    local t0="${SECONDS}" st status seeder a2ok got prev="" n=0 slow=0
+    # settle_released: ask aria2c about the entry. Set a2ok=1 if aria2c answered
+    # in time and reports the download complete, seeding or closed. An RPC
+    # timeout means that a write blocks aria2c: set a2ok=0.
+    settle_released() {
+        a2ok=0
+        [ -n "${DL_GID}" ] || { a2ok=1; return 0; }
+        if st="$(a2 status "${DL_GID}" 2>&1)"; then
+            status="$(printf '%s\n' "${st}" | sed -n 's/^status=//p')"
+            seeder="$(printf '%s\n' "${st}" | sed -n 's/^seeder=//p')"
+            case "${status}" in
+                complete|removed|error) a2ok=1;;
+                *) [ "${seeder}" = "true" ] && a2ok=1;;
+            esac
+        else
+            case "${st}" in
+                *"RPC unreachable"*)
+                    slow=$(( slow + 1 ))
+                    [ "${slow}" -eq 1 ] && say "PARTYOS-APP-DL-RPC-SLOW name=${name} (${st}) - waiting for the flush"
+                    ;;
+                # For example "GID not found": aria2c closed the file.
+                *) a2ok=1;;
+            esac
+        fi
+        return 0
+    }
+    # 1. Wait until aria2c reports the download complete or seeding.
+    while :; do
+        settle_released
+        [ "${a2ok}" -eq 1 ] && break
+        if [ $(( SECONDS - t0 )) -ge "${max}" ]; then
+            SETTLE_REASON="aria2c did not report ${name} complete in ${max}s (last answer: ${st}); the blob is kept for a re-check"
+            return 2
+        fi
+        sleep "${poll}"
+    done
+    # 2. Flush the blob, then check the sha. On a mismatch, wait and check again.
+    while :; do
+        n=$(( n + 1 ))
+        blob_fsync "${f}"
+        got="$(sha256sum "${f}" 2>/dev/null | awk '{print $1}')"
+        [ "${got}" = "${sha}" ] && {
+            [ "${n}" -gt 1 ] && say "PARTYOS-APP-DL-SETTLE name=${name} check=${n} sha ok after $(( SECONDS - t0 ))s"
+            return 0
+        }
+        # Delete only on the same wrong sha twice, with a clear answer from aria2c
+        # before this check. Never on the first mismatch. A sha that changes
+        # between two checks means that aria2c still writes the blob.
+        if [ -n "${prev}" ] && [ "${got}" = "${prev}" ] && [ "${a2ok}" -eq 1 ]; then
+            say "PARTYOS-APP-DL-SETTLE name=${name} check=${n} the same wrong sha again and aria2c reports complete: the blob is bad"
+            return 1
+        fi
+        prev="${got}"
+        say "PARTYOS-APP-DL-SETTLE name=${name} check=${n} sha mismatch (aria2c can still flush its disk cache) - checking again in ${gap}s"
+        if [ $(( SECONDS - t0 + gap )) -ge "${max}" ]; then
+            SETTLE_REASON="the sha of ${name} did not match after ${n} checks in $(( SECONDS - t0 ))s (limit ${max}s); the blob is kept for a re-check"
+            return 2
+        fi
+        sleep "${gap}"
+        settle_released
+    done
+}
+
+# Pick the cache dir: prefer the USB stick (persistent) if mounted, else RAM.
+cache_dir() {
+    if mountpoint -q "${MNT}" 2>/dev/null && [ -w "${MNT}" ]; then
+        echo "${MNT}/.partyos-cache/games"
+    else
+        # Back the RAM cache with a tmpfs sized to most of free RAM. Without this it
+        # sits on the copytoram cow overlay (cow_spacesize, ~512M) and a single game
+        # blob (100s of MB) fills it -> curl "(23) Failure writing output". Best-effort
+        # (needs root; the install path runs as root via sudo -n). tmpfs default size
+        # is 50% RAM which a big blob can still exceed, so size it explicitly.
+        if [ "$(id -u)" -eq 0 ] && ! mountpoint -q "${RAM_CACHE}" 2>/dev/null; then
+            install -d "${RAM_CACHE}"
+            local _kb; _kb="$(awk '/MemAvailable/{print int($2*0.8)}' /proc/meminfo 2>/dev/null)"
+            [ -n "${_kb}" ] && mount -t tmpfs -o "size=${_kb}k,mode=0755" tmpfs "${RAM_CACHE}" 2>/dev/null || true
+        fi
+        echo "${RAM_CACHE}"
+    fi
+}
+
+modprobe squashfs 2>/dev/null || true
+modprobe overlay  2>/dev/null || true
+modprobe loop     2>/dev/null || true
+
+# --- catalog fetch + parse (no jq; line-oriented) ----------------------------
+# Per-user writable cache: gamer can't write /run (root-only) -> curl -o would
+# fail with "(23) error on write" and the store would look empty.
+CATALOG="${XDG_RUNTIME_DIR:-/tmp}/partyos-app-catalog.json"
+fetch_catalog() {
+    # Always pull a FRESH catalog (~20KB). Atomic replace so a half-write can't corrupt
+    # it; the existing cached copy survives ONLY when the server is unreachable. A stale
+    # cached catalog is poison: after a blob is re-deployed its sha changes, so verifying
+    # a freshly-downloaded blob against the OLD cached sha rejects the correct blob every
+    # time - the download "keeps failing" forever. Never reuse a stale catalog silently.
+    # Try each blob base in order (failover); the first that serves the catalog wins.
+    if blob_fetch "server/games/catalog.json" "${CATALOG}.new" --max-time 30 && [ -s "${CATALOG}.new" ]; then
+        mv -f "${CATALOG}.new" "${CATALOG}"
+        say "PARTYOS-APP-CATALOG-OK via=${BLOB_WON} failover=${BLOB_DID_FAILOVER}"
+    fi
+    rm -f "${CATALOG}.new" 2>/dev/null || true
+    [ -s "${CATALOG}" ]
+}
+# Parallel arrays populated by load_catalog.
+declare -a C_ID=() C_NAME=() C_TITLE=() C_BLOB=() C_SHA=() C_ENTRY=() C_MARKER=() C_CAT=() C_RMIN=() C_RMAX=() C_SRC=() C_ICON=() C_HIDDEN=() C_UNLOCK=()
+load_catalog() {
+    fetch_catalog || return 1   # always-fresh (offline -> stale fallback inside fetch_catalog)
+    C_ID=(); C_NAME=(); C_TITLE=(); C_BLOB=(); C_SHA=(); C_ENTRY=(); C_MARKER=()
+    C_CAT=(); C_RMIN=(); C_RMAX=(); C_SRC=(); C_ICON=(); C_HIDDEN=(); C_UNLOCK=()
+    # Scan one brace-balanced game object at a time and emit a 14-field record per valid
+    # object, joined by US (\x1f). A row with no "name" is skipped with a warning.
+    # PARSER NOTE: partyos-launch (the OBJ extractor) uses the SAME string/escape-aware
+    # brace walker, and its field()/field_num() grep+sed accessors mirror the ones here.
+    # partyos-ram (_block) does NOT use this walker. It uses a line-oriented scan.
+    # The tools do not share one helper. If you change the object-scan logic here,
+    # mirror it in the partyos-launch OBJ awk.
+    # Scope to the "games" array only: v3 preamble (_skipped carries a stray "name",
+    # _aur_blob_pipeline ...) sits BEFORE the rows; "games" is the last top-level key,
+    # so from it to EOF is exactly the rows.
+    # NB: PAPP is a single-quoted heredoc - the awk program below carries NO apostrophes
+    # (an apostrophe inside would break the heredoc on edit); use double-quotes in awk.
+    local rec
+    while IFS=$'\x1f' read -r -d $'\n' \
+            f_name f_id f_title f_blob f_sha f_entry f_marker f_cat f_rmin f_rmax f_src f_icon f_hidden f_unlock; do
+        [ -n "${f_name}" ] || continue
+        C_NAME+=("${f_name}");  C_ID+=("${f_id}");     C_TITLE+=("${f_title}")
+        C_BLOB+=("${f_blob}");  C_SHA+=("${f_sha}");   C_ENTRY+=("${f_entry}")
+        C_MARKER+=("${f_marker}"); C_CAT+=("${f_cat}"); C_RMIN+=("${f_rmin}")
+        C_RMAX+=("${f_rmax}");  C_SRC+=("${f_src}");   C_ICON+=("${f_icon}")
+        C_HIDDEN+=("${f_hidden}"); C_UNLOCK+=("${f_unlock}")
+    done < <(
+        awk '
+            BEGIN { US=sprintf("%c",31); games=0 }
+            # string-field value for key in obj: "key" : "value"  (first match wins)
+            function sval(obj, key,   re, s) {
+                re = "\"" key "\"[ \t]*:[ \t]*\""
+                if (obj !~ re) return ""
+                s = obj; sub(".*" re, "", s); sub("\".*", "", s); return s
+            }
+            # numeric-field value: "key" : 123   (unquoted)
+            function nval(obj, key,   re, s) {
+                re = "\"" key "\"[ \t]*:[ \t]*[0-9]+"
+                if (obj !~ re) return ""
+                s = obj; match(s, re); s = substr(s, RSTART, RLENGTH)
+                sub("[^0-9]+", "", s); return s
+            }
+            # boolean-field value: "key" : true|false
+            function bval(obj, key,   re, s) {
+                re = "\"" key "\"[ \t]*:[ \t]*(true|false)"
+                if (obj !~ re) return ""
+                s = obj; match(s, re); s = substr(s, RSTART, RLENGTH)
+                if (s ~ /true/) return "true"; return "false"
+            }
+            function emit(obj,   nm) {
+                nm = sval(obj, "name")
+                if (nm == "") {
+                    # required join key missing -> isolate to this row, keep the rest.
+                    print "PARTYOS-APP-CATALOG-SKIP name=? reason=missing-name" > "/dev/stderr"
+                    return
+                }
+                printf "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n", \
+                    nm, US, sval(obj,"id"), US, sval(obj,"title"), US, \
+                    sval(obj,"blob"), US, sval(obj,"sha256"), US, \
+                    sval(obj,"entry"), US, sval(obj,"marker"), US, \
+                    sval(obj,"category"), US, nval(obj,"ram_min"), US, \
+                    nval(obj,"ram_max"), US, sval(obj,"source"), US, \
+                    sval(obj,"icon"), US, bval(obj,"hidden"), US, \
+                    sval(obj,"unlock_code")
+                games++
+            }
+            /"games"[ \t]*:/ { ingames=1 }
+            !ingames { next }
+            {
+                line=$0; n=length(line)
+                for (i=1;i<=n;i++) {
+                    c=substr(line,i,1)
+                    if (capturing) buf=buf c
+                    if (instr) {
+                        if (esc) esc=0
+                        else if (c=="\\") esc=1
+                        else if (c=="\"") instr=0
+                        continue
+                    }
+                    if (c=="\"") { instr=1; continue }
+                    if (c=="{") {
+                        depth++
+                        if (depth==1 && !capturing) { capturing=1; buf="{" }
+                    } else if (c=="}") {
+                        if (depth==1 && capturing) { emit(buf); capturing=0; buf="" }
+                        depth--
+                    }
+                }
+                if (capturing) buf=buf "\n"
+            }
+        ' "${CATALOG}"
+    )
+    # A non-empty catalog that yielded zero valid rows = total parse failure (bad
+    # download / wrong format), distinct from a single skipped row. Refuse it.
+    [ "${#C_NAME[@]}" -ge 1 ]
+}
+# resolve_idx <id-or-name> -> echoes the catalog index, returns 1 if not found.
+resolve_idx() {
+    local key="$1" i=0
+    while [ "${i}" -lt "${#C_NAME[@]}" ]; do
+        if [ "${C_NAME[$i]}" = "${key}" ] || [ "${C_ID[$i]:-}" = "${key}" ]; then echo "${i}"; return 0; fi
+        i=$((i+1))
+    done
+    return 1
+}
+
+is_installed() { mountpoint -q "${GAMES_DIR}/$1" 2>/dev/null; }
+
+# --- hidden-blob unlock codes -------------------------------------------
+# A hidden catalog row may carry a short "unlock_code". A guest enters that code in the
+# store ("Enter a Code" -> partyos-app unlock-code); the row is then REVEALED (gets a
+# tile, becomes installable by name) and STAYS revealed across reboots because the
+# accepted code is persisted to the player's USB home (synced, not a --exclude'd cache).
+# Matching is case-INSENSITIVE and whitespace-TRIMMED: a shared code reveals a whole
+# group, a unique code reveals one blob. The set is stored one NORMALIZED code per line.
+UNLOCK_FILE="${HOME_DIR}/.config/partyos/unlocked-codes"
+# norm_code CODE -> canonical form: trim leading/trailing whitespace, then lowercase. A
+# code with no internal spaces round-trips unchanged; this is what we store AND compare.
+norm_code() {
+    local c="$1"
+    c="${c#"${c%%[![:space:]]*}"}"   # ltrim
+    c="${c%"${c##*[![:space:]]}"}"    # rtrim
+    printf '%s' "${c}" | tr '[:upper:]' '[:lower:]'
+}
+# is_code_unlocked CODE -> 0 iff CODE (normalized) is in the persisted unlocked set.
+is_code_unlocked() {
+    local nc; nc="$(norm_code "$1")"
+    [ -n "${nc}" ] || return 1
+    [ -f "${UNLOCK_FILE}" ] || return 1
+    grep -qxF "${nc}" "${UNLOCK_FILE}" 2>/dev/null
+}
+
+# --- get_blob NAME BLOBPATH SHA -> sets BLOB_PATH to a verified local blob ----
+# Cache HIT = a valid cached blob (no download). MISS = download + cache write.
+BLOB_PATH=""
+get_blob() {
+    local name="$1" blobpath="$2" sha="$3"
+    local cdir; cdir="$(cache_dir)"; install -d "${cdir}"
+    local cached="${cdir}/${name}.squashfs"
+    BLOB_PATH=""
+    # A leftover .aria2/.dl control file next to a COMPLETE, sha-correct blob (a
+    # download that finished but whose aria2 was killed before it cleaned up, or an
+    # interrupted run) must NOT force a re-download. The sha is the source of truth,
+    # not the control file: if the cached blob already verifies, drop the stale
+    # markers here so the HIT check below treats it as cached, not in-flight.
+    if [ -s "${cached}" ] && { [ -e "${cached}.aria2" ] || [ -e "${cached}.dl" ]; }; then
+        if [ -n "${sha}" ] && [ "$(sha256sum "${cached}" 2>/dev/null | awk '{print $1}')" = "${sha}" ]; then
+            rm -f "${cached}.aria2" "${cached}.dl" 2>/dev/null || true
+        fi
+    fi
+    if [ -s "${cached}" ]; then
+        if [ -z "${sha}" ]; then
+            # Empty sha on a blob row = no verification possible. The catalog is
+            # CA-authenticated, so an empty sha is an OPERATOR AUTHORING ERROR, not a
+            # trustless blob - mounting it unverified defeats the integrity model. FAIL
+            # CLOSED: refuse to mount the cached blob unless an operator explicitly forces
+            # it with PARTYOS_ALLOW_UNVERIFIED_BLOB=1 (emergency override).
+            if [ "${PARTYOS_ALLOW_UNVERIFIED_BLOB:-0}" = "1" ]; then
+                touch -a "${cached}" 2>/dev/null || true
+                say "PARTYOS-APP-CACHE-HIT name=${name} (no download, UNVERIFIED empty-sha; PARTYOS_ALLOW_UNVERIFIED_BLOB override)"
+                start_seed "${name}" "${cdir}"
+                BLOB_PATH="${cached}"; return 0
+            fi
+            say "PARTYOS-APP ERROR ${name} catalog row missing sha256, refusing unverified blob (set PARTYOS_ALLOW_UNVERIFIED_BLOB=1 to override)"
+            return 1
+        elif [ "$(sha256sum "${cached}" 2>/dev/null | awk '{print $1}')" = "${sha}" ]; then
+            touch -a "${cached}" 2>/dev/null || true
+            say "PARTYOS-APP-CACHE-HIT name=${name} (no download)"
+            # Tracker re-announce: a cache-HIT
+            # returns WITHOUT fetch_torrent, so a stick that cached this blob BEFORE the
+            # tracker announce existed keeps an announce-less .torrent and stays off the
+            # tracker (only LPD co-swarms it on-LAN). Prefer-fresh the server torrent here;
+            # safe because the info-hash is unchanged (announce lives outside the info dict)
+            # and refresh_torrent ONLY swaps a same-info-hash torrent. Runs BEFORE start_seed
+            # so this box's own seeder announces to the tracker too.
+            refresh_torrent "${name}" "${blobpath}" "${cdir}"
+            start_seed "${name}" "${cdir}"
+            BLOB_PATH="${cached}"; return 0
+        elif [ "${FORCE_REDOWNLOAD:-0}" != "1" ] && { [ -e "${cached}.aria2" ] || [ -e "${cached}.dl" ]; }; then
+            # INCOMPLETE cached blob (integrity): a sha mismatch PLUS an in-flight download
+            # marker (.aria2 resume file / .dl marker) means the cached blob was never
+            # FINISHED - e.g. aria2 wedged in D-state on a slow stick and left partial
+            # content that hashes to a THIRD value (neither old nor new). The STALE-KEPT rule
+            # below tolerates a valid-but-OLD blob after a catalog sha bump; it must NOT
+            # tolerate a partial/corrupt one - mounting a partial squashfs fails or serves
+            # garbage ("the game is broken" at a party). Do NOT keep+mount it: fall through to
+            # the download path, which RESUMES from the .aria2 control file (same content-
+            # unique swarm) and re-verifies the sha before anything is mounted. Mirrors the
+            # complete-blob marker guard at the top of get_blob (there the sha MATCHED, so the
+            # markers are just cleared; here it does not, so we finish the download instead).
+            say "PARTYOS-APP-CACHE-PARTIAL name=${name} (sha mismatch + in-flight marker, incomplete - re-downloading)"
+        elif [ "${FORCE_REDOWNLOAD:-0}" != "1" ]; then
+            # Stale-but-PRESENT cached blob (sha != catalog) - a mid-party catalog
+            # sha bump must NOT trigger a synchronized multi-GB re-download storm across
+            # every client. KEEP the good cached copy and use it: players keep playing
+            # their cached version. The blob is downstream sha-gated only at DOWNLOAD
+            # time; a present cached blob is trusted to mount, and if it is actually
+            # corrupt (not just an old version) the mount fails and cmd_install's
+            # self-heal (cmd_uncache) drops it for a clean re-download next launch. The
+            # only forced re-download is an explicit user re-install (FORCE_REDOWNLOAD=1,
+            # the reinstall command) or an actually-missing cache (handled above).
+            touch -a "${cached}" 2>/dev/null || true
+            say "PARTYOS-APP-STALE-KEPT name=${name} (sha mismatch, keeping cached blob - no re-download storm)"
+            start_seed "${name}" "${cdir}"
+            BLOB_PATH="${cached}"; return 0
+        else
+            # Explicit re-install (FORCE_REDOWNLOAD=1): the user asked for a fresh copy.
+            # Drop the dead file so a rebuilt blob self-heals and eviction accounting
+            # stays clean, then fall through to re-download.
+            # Also drop the cached .torrent. A repacked blob has a new info-hash, and the
+            # old torrent joins the old swarm.
+            say "PARTYOS-APP-CACHE-STALE name=${name} (sha mismatch, forced re-install, dropping cached blob+torrent)"
+            a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+            rm -f "${cached}" "${cached}.torrent" "${cached}.aria2" 2>/dev/null || true
+        fi
+    fi
+    say "PARTYOS-APP-CACHE-MISS name=${name} (downloading from LAN)"
+    # CONCURRENCY: serialize the blob
+    # DOWNLOAD+VERIFY host-wide so two near-simultaneous `partyos-app install` clicks don't
+    # both hammer the USB stick at once (concurrent multi-GB writes wedged the mount +
+    # writeback path). A DEDICATED lock on its OWN fd 9 (NOT the USB-mount flocks on fd 8,
+    # NOT the refcount lock) at a unique path: a second install BLOCKS here until the first
+    # blob finishes, then runs. The lock is held ONLY over download+verify - it is released
+    # (the subshell exits) BEFORE start_seed, so the long-lived (forever) detached seeder
+    # never inherits the lock fd and pins it. A subshell auto-releases the lock on ANY exit
+    # path (success OR a mid-download failure/return), so the lock can never leak. -w bounds
+    # the wait so a wedged holder can't deadlock every future install forever.
+    local blob_lock="/run/partyos-blob-install.lock"
+    { : > "${blob_lock}"; } 2>/dev/null || blob_lock="${TMPDIR:-/tmp}/partyos-blob-install.lock"
+    if ! (
+    command -v flock >/dev/null 2>&1 \
+        && { flock -w 1800 9 || say "PARTYOS-APP-INSTALL-LOCK name=${name} WARN lock wait timed out (1800s), proceeding unserialized"; }
+    local via=""
+    # p2p_download clears the old entries of THIS blob in the one aria2c (adopt):
+    # it keeps a download that still runs, and removes an old seed entry or an
+    # entry of another info hash. Safe inside the lock: a sibling install of the
+    # same blob waits on the flock.
+    # In-flight marker: while this file exists next to the blob, the blob is being
+    # written RIGHT NOW. A CONCURRENT install's cache_evict budget pass treats a blob
+    # carrying a live .dl (or an aria2 .aria2 control file) as protected, so it can't
+    # delete this partial out from under us (two fast desktop clicks raced here before).
+    # Cleared on every exit below.
+    local dlmark="${cached}.dl"; : > "${dlmark}" 2>/dev/null || true
+    # aria2 single-file torrents write DIRECTLY to the cached name (they ignore -o), and an
+    # .aria2 control file alongside = in-flight. RESUME: a .aria2 control file lets aria2
+    # pick the torrent back up where it left off (no restart-from-0), so DON'T wipe a
+    # resumable partial. Only clear a partial that has NO control file - a stale remnant
+    # aria2 would otherwise waste time hash-checking. (A truly stale/repacked blob was
+    # already dropped, with its torrent + .aria2, on the FORCE_REDOWNLOAD sha-mismatch
+    # branch above, so resume here only ever rejoins the CURRENT content-unique swarm.)
+    if [ ! -e "${cached}.aria2" ]; then
+        rm -f "${cached}" 2>/dev/null || true
+    fi
+    # P2P ONLY: the blob comes from the swarm (the persistent server seed and every
+    # client that holds it), found by the tracker in the .torrent and by LPD. There
+    # is NO web-seed and NO HTTP fallback.
+    # TORRENT CHOICE on a cache miss: the server copy is authoritative. Always fetch
+    # it when there is a server blobpath. A cached torrent can carry a tracker URL
+    # from another network, and then the install finds no tracker.
+    # fetch_torrent uses the cached copy only if the server does not answer.
+    # The load-url share-code path has NO blobpath: it stages its torrent in the
+    # cache before it calls get_blob, so use that staged torrent.
+    local tor="${cdir}/${name}.squashfs.torrent" reason=""
+    if [ -n "${blobpath}" ]; then
+        tor="$(fetch_torrent "${name}" "${blobpath}" "${cdir}")" || tor=""
+        [ -n "${tor}" ] || reason="could not get ${blobpath}.torrent from the server and no cached copy"
+    elif [ ! -s "${tor}" ]; then
+        tor=""; reason="no staged .torrent"
+    fi
+    local keepmark=0
+    if [ -n "${tor}" ]; then
+        if p2p_download "${name}" "${cdir}" "${tor}" && [ -s "${cached}" ]; then
+            # blob_settle waits for the flush of aria2c before it trusts the sha.
+            local vrc=0
+            [ -z "${sha}" ] || { blob_settle "${name}" "${cdir}" "${sha}"; vrc=$?; }
+            case "${vrc}" in
+                0)  # Success is judged by SIZE + SHA (the source of truth), not by the
+                    # absence of a control file. Clear a stale .aria2 so it cannot poison
+                    # the next run.
+                    rm -f "${cached}.aria2" 2>/dev/null || true
+                    via="p2p";;
+                1)  # aria2 finished and flushed, but the content does not match: it is
+                    # corrupt. Stop seeding it and drop it (resume from bad content cannot help).
+                    reason="sha mismatch after the download"
+                    a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+                    rm -f "${cached}" "${cached}.aria2" 2>/dev/null || true;;
+                *)  # No decision: aria2c can still write the blob. Keep the blob and
+                    # the .dl marker. The next get_blob checks the sha again.
+                    reason="${SETTLE_REASON}"; keepmark=1;;
+            esac
+        elif [ -n "${DL_REASON}" ]; then
+            reason="${DL_REASON}"
+        else
+            # aria2 reports complete but the file is missing or empty. Stop
+            # seeding it and drop it (resume from bad content cannot help).
+            reason="the downloaded file is missing or empty"
+            a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+            rm -f "${cached}" "${cached}.aria2" 2>/dev/null || true
+        fi
+    fi
+    # P2P ONLY: blob distribution is BitTorrent through and through - there is NO raw-HTTP
+    # blob download and no web-seed. The blob comes from the swarm (the persistent server
+    # seed + every client that already holds it, all reached via the tracker announce baked
+    # into the .torrent). If aria2 could not complete off the swarm above, there is nowhere
+    # else to pull the blob from: fail. (The .torrent and catalog.json still come over HTTPS
+    # via blob_fetch - that is control-plane, not a blob download.)
+    # FAILURE: report the real cause. KEEP the partial and its .aria2 control file,
+    # so the next try resumes and does not start from zero. Only the .dl marker goes.
+    if [ -z "${via}" ]; then
+        say "PARTYOS-APP ERROR download ${name} failed (${reason:-unknown})"
+        [ "${keepmark}" -eq 1 ] || rm -f "${dlmark}"
+        exit 1
+    fi
+    if [ -n "${sha}" ]; then
+        local got; got="$(sha256sum "${cached}" 2>/dev/null | awk '{print $1}')"
+        [ "${got}" = "${sha}" ] || { say "PARTYOS-APP ERROR ${name} sha mismatch"; a2 remove "${name}" "${cdir}" >/dev/null 2>&1; rm -f "${cached}" "${dlmark}"; exit 1; }
+    else
+        # Empty sha = no verification possible. The catalog is CA-authenticated, so an
+        # empty sha is an OPERATOR AUTHORING ERROR, not a trustless blob - mounting the
+        # just-downloaded blob unverified defeats the integrity model. FAIL CLOSED unless
+        # an operator explicitly forces it with PARTYOS_ALLOW_UNVERIFIED_BLOB=1.
+        if [ "${PARTYOS_ALLOW_UNVERIFIED_BLOB:-0}" = "1" ]; then
+            say "PARTYOS-APP name=${name} UNVERIFIED empty-sha download (PARTYOS_ALLOW_UNVERIFIED_BLOB override)"
+        else
+            say "PARTYOS-APP ERROR ${name} catalog row missing sha256, refusing unverified blob (set PARTYOS_ALLOW_UNVERIFIED_BLOB=1 to override)"
+            rm -f "${cached}" "${dlmark}"; exit 1
+        fi
+    fi
+    sync
+    say "PARTYOS-APP-DOWNLOADED name=${name} via=${via} bytes=$(wc -c < "${cached}" | tr -d ' ') cached=${cached}"
+    # After a fresh download to the persistent USB cache, enforce the budget -
+    # evict LRU cached blobs until the free-space reserve (and optional size cap) is
+    # met. RAM_CACHE is volatile (freed on reboot) and is the RAM-fit manager's job,
+    # so only the USB-stick cache gets the disk-budget eviction. Never touch ${name}.
+    if [ "${cdir}" != "${RAM_CACHE}" ] && [ -x /usr/local/bin/partyos-ram ]; then
+        /usr/local/bin/partyos-ram cache-evict "${cdir}" "$(cache_reserve_gb)" "$(cache_max_gb)" "${name}" >/dev/null 2>&1 || true
+    fi
+    # blob_seeding=off: stop the finished entry in aria2c.
+    seeding_enabled || a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+    # download done + verified: drop the in-flight marker (no longer a partial).
+    rm -f "${dlmark}" 2>/dev/null || true
+    exit 0
+    ) 9>"${blob_lock}"; then
+        return 1
+    fi
+    # lock released (subshell exited): now that we hold a verified blob, seed it to peers
+    # (unbounded) OUTSIDE the lock so the long-lived detached seeder never inherits fd 9.
+    start_seed "${name}" "${cdir}"
+    BLOB_PATH="${cached}"; return 0
+}
+
+# --- mount_overlay NAME BLOB -> squashfs ro lower + tmpfs overlay at games/<n> -
+mount_overlay() {
+    local name="$1" blob="$2"
+    local lower="${MNT_BASE}/${name}" scratch="${MNT_BASE}/${name}.rw" dest="${GAMES_DIR}/${name}"
+    install -d "${lower}" "${scratch}"
+    install -d -o "${APP_USER}" -g "${APP_USER}" "${dest}" 2>/dev/null || install -d "${dest}"
+    if ! mountpoint -q "${lower}"; then
+        mount -t squashfs -o ro,loop "${blob}" "${lower}" 2>/dev/null \
+          || mount -t squashfs -o ro "${blob}" "${lower}" 2>/dev/null \
+          || { say "PARTYOS-APP ERROR squashfs mount ${name} failed"; return 1; }
+    fi
+    mountpoint -q "${scratch}" || mount -t tmpfs -o size=16M tmpfs "${scratch}" || true
+    install -d "${scratch}/upper" "${scratch}/work"
+    if ! mountpoint -q "${dest}"; then
+        mount -t overlay overlay \
+          -o "lowerdir=${lower},upperdir=${scratch}/upper,workdir=${scratch}/work" \
+          "${dest}" 2>/dev/null \
+          || { say "PARTYOS-APP ERROR overlay mount ${name} failed"; return 1; }
+    fi
+    chown "${APP_USER}:${APP_USER}" "${dest}" 2>/dev/null || true
+    runcache_sync "${name}"
+    return 0
+}
+
+# --- runcache_sync NAME: drop a stale Wine registry from the stick prefix -----
+# A Proton blob runs its Wine prefix as an overlay. The lower dir is the baked
+# opt/prefix-template. The upper dir is RUNCACHE_DIR/<name>/upper on the stick.
+# Wine writes the full registry files into the upper, so they hide the registry of
+# a newer blob.
+# This function keeps a hash of the baked registry in RUNCACHE_DIR/<name>/lower-id.
+# If the hash changes, it removes the registry files from the upper. Wine then reads
+# the baked registry again. Saves and other game files in the upper stay.
+RUNCACHE_DIR="/mnt/usbhome/.partyos-runcache"
+PREFIX_REG_FILES="system.reg user.reg userdef.reg .update-timestamp"
+runcache_sync() {
+    local name="$1" f id old=""
+    local rc="${RUNCACHE_DIR}/${name}" tpl="${MNT_BASE}/${name}/opt/prefix-template"
+    [ -d "${rc}" ] && [ -d "${tpl}" ] || return 0
+    # shellcheck disable=SC2086
+    id="$(cd "${tpl}" && cat ${PREFIX_REG_FILES} 2>/dev/null | sha256sum | awk '{print $1}')"
+    [ -r "${rc}/lower-id" ] && old="$(cat "${rc}/lower-id" 2>/dev/null)"
+    [ "${id}" = "${old}" ] && return 0
+    # Do not change the upper of a live overlay. The next mount tries again.
+    if mountpoint -q "${rc}/prefix" 2>/dev/null; then
+        say "PARTYOS-APP-PREFIX-RESET-SKIP name=${name} (prefix is mounted)"
+        return 0
+    fi
+    for f in ${PREFIX_REG_FILES}; do
+        rm -f "${rc}/upper/${f}" 2>/dev/null || true
+        # Copy fallback of run.sh (no overlay): put the baked file back into the copy.
+        if [ -f "${rc}/prefix/.partyos-prefix-ready" ] && [ -f "${tpl}/${f}" ]; then
+            cp -f "${tpl}/${f}" "${rc}/prefix/${f}" 2>/dev/null || true
+            chown "${APP_USER}:${APP_USER}" "${rc}/prefix/${f}" 2>/dev/null || true
+        fi
+    done
+    # run.sh writes the player name into the registry once per user. Remove its markers
+    # so that run.sh writes the name into the new registry.
+    rm -f "${HOME_DIR}/.cache/partyos-run/${name}"/.partyos-name-* 2>/dev/null || true
+    printf '%s\n' "${id}" > "${rc}/lower-id" 2>/dev/null || true
+    chown "${APP_USER}:${APP_USER}" "${rc}/lower-id" 2>/dev/null || true
+    say "PARTYOS-APP-PREFIX-RESET name=${name} (baked registry changed, stick registry removed)"
+    return 0
+}
+
+# ============================ subcommands ====================================
+cmd_list() {
+    load_catalog || { say "PARTYOS-APP ERROR catalog unavailable (${CATALOG_URL})"; return 1; }
+    local i=0
+    printf '%-14s %-22s %-7s %-9s %s\n' "NAME" "TITLE" "CAT" "STATE" "ID"
+    while [ "${i}" -lt "${#C_NAME[@]}" ]; do
+        local st="available"; is_installed "${C_NAME[$i]}" && st="installed"
+        printf '%-14s %-22s %-7s %-9s %s\n' \
+            "${C_NAME[$i]}" "${C_TITLE[$i]:-}" "${C_CAT[$i]:-app}" "${st}" "${C_ID[$i]:-}"
+        i=$((i+1))
+    done
+    say "PARTYOS-APP-LIST n=${#C_NAME[@]} games=$(IFS=,; echo "${C_NAME[*]}")"
+    return 0
+}
+
+cmd_install() {
+    local key="$1"
+    load_catalog || { say "PARTYOS-APP ERROR catalog unavailable"; return 1; }
+    local idx; idx="$(resolve_idx "${key}")" || { say "PARTYOS-APP ERROR unknown app '${key}'"; return 2; }
+    local name="${C_NAME[$idx]}" blob="${C_BLOB[$idx]}" sha="${C_SHA[$idx]:-}"
+    # Hidden rows (kept off the server's visible roster) are an ACCESS GATE, not
+    # just cosmetic. They must NOT be installable by catalog name UNTIL revealed.
+    # Exception: a hidden row whose unlock_code has been entered + persisted
+    # (partyos-app unlock-code) is REVEALED, so its store tile (Exec=partyos-launch
+    # <name>) must install by name like any visible row. Infra rows (protonenv) carry no
+    # unlock_code and mount via ensure-baseenv, never here, so they stay blocked. The
+    # share-code / load-url path (cmd_load_url) is catalog-independent and never reaches
+    # here regardless.
+    if [ "${C_HIDDEN[$idx]:-false}" = "true" ]; then
+        if [ -n "${C_UNLOCK[$idx]:-}" ] && is_code_unlocked "${C_UNLOCK[$idx]}"; then
+            : # unlocked by code - allow the by-name install to proceed
+        else
+            say "PARTYOS-APP-HIDDEN-BLOCKED name=${name} (hidden row - unlock it with a code, not by name)"; return 2
+        fi
+    fi
+    # pkg rows have empty blob fields - they install via the LAN mirror through
+    # partyos-launch -> partyos-pkg-install, NEVER the squashfs/overlay path. Skip
+    # cleanly so a stray install of a pkg app can't try to mount an empty blob.
+    if [ "${C_SRC[$idx]:-blob}" = "pkg" ]; then
+        say "PARTYOS-APP-SKIP name=${name} src=pkg (handled by partyos-launch via mirror)"; return 0
+    fi
+    if is_installed "${name}"; then say "PARTYOS-APP-INSTALLED name=${name} (already mounted)"; return 0; fi
+    get_blob "${name}" "${blob}" "${sha}" || return 1
+    # RAM gate: project this blob's RAM need from metadata vs free RAM; if it
+    # won't fit, the RAM manager prompts/decides what to unmount to make room
+    # (idle vs in-use refcounted; in-use protected from auto-eviction).
+    if [ -x /usr/local/bin/partyos-ram ]; then
+        if ! /usr/local/bin/partyos-ram ensure-room "${CATALOG}" "${name}" "${GAMES_DIR}"; then
+            # DISTINCT exit code 3 for a RAM refusal (vs 1=download, 4=mount) so partyos-launch
+            # can show an accurate "not enough RAM" dialog (free vs needed) instead of the
+            # misleading "couldn't download". Emit the honest numbers the launcher parses.
+            local _req _free _short
+            _req="$(/usr/local/bin/partyos-ram project "${CATALOG}" "${name}" 2>/dev/null | grep -oE 'required=[0-9]+' | cut -d= -f2)"
+            _free="$(/usr/local/bin/partyos-ram free-mb 2>/dev/null | tr -dc '0-9')"
+            case "${_req}" in ''|*[!0-9]*) _req=0;; esac
+            case "${_free}" in ''|*[!0-9]*) _free=0;; esac
+            _short=0; [ "${_req}" -gt "${_free}" ] && _short=$(( _req - _free ))
+            say "PARTYOS-APP-RAM-REFUSED name=${name} required=${_req}MB free=${_free}MB short=${_short}MB"
+            return 3
+        fi
+    fi
+    # Mount failed = the squashfs is corrupt (despite the sha check, e.g. a truncated
+    # write the hash happened to miss, or fs damage). Self-heal: drop the bad cache so
+    # the NEXT launch re-downloads a fresh copy, instead of failing forever on it.
+    # Exit code 4 (distinct from 1=download / 3=RAM) so the player gets a corrupt-copy
+    # message, not "couldn't download".
+    if ! mount_overlay "${name}" "${BLOB_PATH}"; then
+        say "PARTYOS-APP ERROR ${name} mount failed (corrupt blob) - clearing cache for a fresh re-download"
+        cmd_uncache "${name}" 2>/dev/null || true
+        return 4
+    fi
+    install -d "${STATE_DIR}"; echo "${name}" >> "${STATE_DIR}/installed"
+    say "PARTYOS-APP-INSTALLED name=${name} at=${GAMES_DIR}/${name} src=squashfs+overlay"
+    return 0
+}
+
+# ensure-baseenv - fetch + mount the HIDDEN base proton-env blob (name=protonenv) so the
+# on-client wine-env engine (partyos-proton-env) can clone its pristine prefix-template
+# (opt/prefix-template) and drive bin/run.sh. cmd_install REFUSES hidden rows (they are an
+# access gate for code-gated games); the base env is hidden INFRA, not a game, so this
+# dedicated path mounts it the SAME way (get_blob + RAM gate + mount_overlay) but WITHOUT the
+# hidden-row refusal. Idempotent: a no-op if already mounted. Marker: PARTYOS-BASEENV-READY.
+cmd_ensure_baseenv() {
+    local name="protonenv"
+    load_catalog || { say "PARTYOS-APP ERROR catalog unavailable"; return 1; }
+    local idx; idx="$(resolve_idx "${name}")" || { say "PARTYOS-BASEENV ERROR no '${name}' row in catalog"; return 2; }
+    name="${C_NAME[$idx]}"
+    local blob="${C_BLOB[$idx]}" sha="${C_SHA[$idx]:-}"
+    if is_installed "${name}"; then
+        say "PARTYOS-BASEENV-READY at=${GAMES_DIR}/${name} (already mounted)"
+        return 0
+    fi
+    get_blob "${name}" "${blob}" "${sha}" || return 1
+    if [ -x /usr/local/bin/partyos-ram ]; then
+        /usr/local/bin/partyos-ram ensure-room "${CATALOG}" "${name}" "${GAMES_DIR}" \
+            || { say "PARTYOS-APP ERROR ${name} does not fit RAM and no room was freed"; return 1; }
+    fi
+    if ! mount_overlay "${name}" "${BLOB_PATH}"; then
+        say "PARTYOS-APP ERROR ${name} mount failed (corrupt blob) - clearing cache for a fresh re-download"
+        cmd_uncache "${name}" 2>/dev/null || true
+        return 1
+    fi
+    install -d "${STATE_DIR}"; echo "${name}" >> "${STATE_DIR}/installed"
+    say "PARTYOS-BASEENV-READY at=${GAMES_DIR}/${name} src=squashfs+overlay"
+    return 0
+}
+
+# gpu_env DISPLAY XAUTHORITY - read the GPU environment of a game launch into GPU_ENV,
+# one KEY=VALUE per entry (see partyos-gpu-env). On a hybrid laptop this is the PRIME
+# render offload env, or DRI_PRIME for the display iGPU. The blob run.sh does not clear
+# the env, so these values reach the game without a blob rebuild.
+gpu_env() {
+    GPU_ENV=()
+    [ -x /usr/local/bin/partyos-gpu-env ] || return 0
+    mapfile -t GPU_ENV < <(DISPLAY="$1" XAUTHORITY="$2" /usr/local/bin/partyos-gpu-env 2>/dev/null)
+}
+
+cmd_launch() {
+    local key="$1"
+    load_catalog || { say "PARTYOS-APP ERROR catalog unavailable"; return 1; }
+    local idx; idx="$(resolve_idx "${key}")" || { say "PARTYOS-APP ERROR unknown app '${key}'"; return 2; }
+    local name="${C_NAME[$idx]}" entry="${C_ENTRY[$idx]:-bin/run.sh}" marker="${C_MARKER[$idx]:-}"
+    is_installed "${name}" || { say "PARTYOS-APP ERROR ${name} not installed (install first)"; return 1; }
+    # LRU: playing a game refreshes its cached blob's atime so a frequently-played game
+    # isn't picked as the eviction victim after it's later removed. The USB home mounts
+    # noatime and cmd_launch reads from the RAM overlay (never the blob), so nothing else
+    # bumps it. Blob is root-owned -> sudo -n fallback; check both cache locations.
+    local _cd
+    for _cd in /mnt/usbhome/.partyos-cache/games /var/cache/partyos/games; do
+        if [ -f "${_cd}/${name}.squashfs" ]; then
+            touch -a "${_cd}/${name}.squashfs" 2>/dev/null \
+              || sudo -n touch -a "${_cd}/${name}.squashfs" 2>/dev/null || true
+            break
+        fi
+    done
+    local dest="${GAMES_DIR}/${name}" out=""
+    # Mark the blob in-use for the duration of the run (refcount) so the RAM
+    # manager protects it from eviction while it executes.
+    [ -x /usr/local/bin/partyos-ram ] && /usr/local/bin/partyos-ram mark-busy "${name}" >/dev/null 2>&1 || true
+    if [ -f "${dest}/${entry}" ]; then
+        # Run from a dedicated writable scratch dir, NOT the caller's CWD. When a game
+        # is launched from Thunar the CWD is the launcher folder (~/Desktop/.apps/<cat>/),
+        # so a blob that writes CWD-relative files (bundled SDL .so, save *.dat) would
+        # litter that folder. cd into a hidden per-game scratch first.
+        local run_cwd="${HOME_DIR%/}/.cache/partyos-run/${name}"
+        install -d -o "${APP_USER}" -g "${APP_USER}" "${run_cwd}" 2>/dev/null || mkdir -p "${run_cwd}"
+        gpu_env "${PARTYOS_DISPLAY:-${DISPLAY:-}}" \
+            "${PARTYOS_XAUTHORITY:-${XAUTHORITY:-/home/${APP_USER}/.Xauthority}}"
+        out="$(cd "${run_cwd}" && sudo -u "${APP_USER}" env \
+            DISPLAY="${PARTYOS_DISPLAY:-${DISPLAY:-}}" \
+            XAUTHORITY="${PARTYOS_XAUTHORITY:-${XAUTHORITY:-/home/${APP_USER}/.Xauthority}}" \
+            XDG_RUNTIME_DIR="${PARTYOS_XDG_RUNTIME_DIR:-/run/user/$(id -u "${APP_USER}" 2>/dev/null)}" \
+            "${GPU_ENV[@]}" \
+            bash "${dest}/${entry}" 2>&1 || true)"
+    else
+        out="(no entry ${entry} in ${name})"
+    fi
+    [ -x /usr/local/bin/partyos-ram ] && /usr/local/bin/partyos-ram mark-idle "${name}" >/dev/null 2>&1 || true
+    say "PARTYOS-APP launch ${name} output: ${out}"
+    if [ -n "${marker}" ] && echo "${out}" | grep -qF "${marker}"; then
+        say "PARTYOS-APP-LAUNCHED name=${name} marker=${marker}"
+        return 0
+    fi
+    say "PARTYOS-APP-LAUNCHED name=${name} (no marker matched)"
+    return 0
+}
+
+cmd_install_launch() { cmd_install "$1" && cmd_launch "$1"; }
+
+# reinstall NAME - the EXPLICIT user "repair/refresh this app" action. REPAIR-FROM-
+# CACHE FIRST: if we still hold a sha-valid cached blob, never delete a good multi-GB blob
+# just to re-download it - drop the overlay and re-mount straight from cache. Only when the
+# cache is MISSING or its sha MISMATCHES the catalog do we force a fresh/RESUMED download
+# (FORCE_REDOWNLOAD=1), and even then via cmd_remove (drop the overlay) NOT cmd_uncache
+# (which deletes the resumable partial + torrent): get_blob then decides - it drops a
+# repacked/sha-mismatched blob for a clean re-fetch but keeps a resumable partial otherwise.
+cmd_reinstall() {
+    local key="$1"
+    load_catalog 2>/dev/null || true
+    local idx name sha="" cdir cached
+    if idx="$(resolve_idx "${key}" 2>/dev/null)"; then name="${C_NAME[$idx]}"; sha="${C_SHA[$idx]:-}"; else name="${key}"; fi
+    cdir="$(cache_dir)"; cached="${cdir}/${name}.squashfs"
+    # Forget the registry hash, so that the mount below resets the stick registry.
+    rm -f "${RUNCACHE_DIR}/${name}/lower-id" 2>/dev/null || true
+    if [ -s "${cached}" ] && [ -n "${sha}" ] \
+       && [ "$(sha256sum "${cached}" 2>/dev/null | awk '{print $1}')" = "${sha}" ]; then
+        say "PARTYOS-APP-REINSTALL name=${name} (cache sha-valid: remount from cache, no re-download)"
+        cmd_remove "${name}" 2>/dev/null || true
+        cmd_install "${name}"
+        return
+    fi
+    say "PARTYOS-APP-REINSTALL name=${name} (cache missing/stale: forcing fresh/resumed download)"
+    cmd_remove "${name}" 2>/dev/null || true
+    FORCE_REDOWNLOAD=1 cmd_install "${name}"
+}
+
+cmd_installed() {
+    install -d "${GAMES_DIR}" 2>/dev/null || true
+    local n=0 names=""
+    if load_catalog; then
+        local i=0
+        while [ "${i}" -lt "${#C_NAME[@]}" ]; do
+            if is_installed "${C_NAME[$i]}"; then echo "${C_NAME[$i]}"; names="${names}${names:+,}${C_NAME[$i]}"; n=$((n+1)); fi
+            i=$((i+1))
+        done
+    fi
+    say "PARTYOS-APP-INSTALLED-LIST n=${n} apps=${names}"
+    return 0
+}
+
+cmd_remove() {
+    local key="$1"
+    local name="${key}"
+    if load_catalog; then local idx; idx="$(resolve_idx "${key}")" && name="${C_NAME[$idx]}"; fi
+    local dest="${GAMES_DIR}/${name}" lower="${MNT_BASE}/${name}" scratch="${MNT_BASE}/${name}.rw"
+    is_installed "${name}" || { say "PARTYOS-APP-REMOVED name=${name} (was not installed)"; return 0; }
+    umount "${dest}" 2>/dev/null || umount -l "${dest}" 2>/dev/null || true
+    umount "${lower}" 2>/dev/null || umount -l "${lower}" 2>/dev/null || true
+    umount "${scratch}" 2>/dev/null || umount -l "${scratch}" 2>/dev/null || true
+    [ -f "${STATE_DIR}/installed" ] && { grep -vxF "${name}" "${STATE_DIR}/installed" > "${STATE_DIR}/installed.tmp" 2>/dev/null || true; mv -f "${STATE_DIR}/installed.tmp" "${STATE_DIR}/installed" 2>/dev/null || true; }
+    if is_installed "${name}"; then say "PARTYOS-APP ERROR ${name} still mounted after remove"; return 1; fi
+    say "PARTYOS-APP-REMOVED name=${name} (overlay dropped, RAM freed; USB cache kept)"
+    return 0
+}
+
+# Map a catalog category to a freedesktop main-category (whisker menu groups by
+# this), a themed icon, and a human label for the desktop "folder".
+fd_category() {
+    case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        game|games|emu|emulator) echo "Game";;
+        net|network|internet|web) echo "Network";;
+        comms|voice|chat|im)      echo "Network";;
+        media|audio|video|av)     echo "AudioVideo";;
+        creative|graphics|art|paint) echo "Graphics";;
+        tool|tools|util|utility|system) echo "System";;
+        *)                        echo "Game";;
+    esac
+}
+cat_icon() {
+    # Pick VISUALLY distinct icons - the applications-* category icons are all
+    # near-identical folders, so use a gamepad for games and a gear for tools.
+    case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        game|games|emu|emulator) echo "input-gaming";;
+        net|network|internet|web) echo "applications-internet";;
+        comms|voice|chat|im)      echo "internet-group-chat";;
+        media|audio|video|av)     echo "applications-multimedia";;
+        creative|graphics|art|paint) echo "applications-graphics";;
+        tool|tools|util|utility|system) echo "gnome-nettool";;
+        *)                        echo "applications-other";;
+    esac
+}
+cat_label() {
+    case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        game|games|emu|emulator) echo "Games";;
+        net|network|internet|web) echo "Internet";;
+        comms|voice|chat|im)      echo "Comms";;
+        media|audio|video|av)     echo "Media";;
+        creative|graphics|art|paint) echo "Creative";;
+        tool|tools|util|utility|system) echo "Tools";;
+        *)                        echo "Apps";;
+    esac
+}
+
+# write_app_desktop FILE TITLE ID FDCAT ICON NAME - one install-on-click launcher.
+write_app_desktop() {
+    local f="$1" title="$2" id="$3" fdcat="$4" icon="$5" name="$6"
+    # title comes from the LAN catalog (untrusted). Write every dynamic value via
+    # printf '%s' as an ARGUMENT, never interpolated into shell - a title with $, `,
+    # ", ; or ${...} lands as literal text and can't be expanded or injected.
+    {
+        printf '%s\n' '[Desktop Entry]'
+        printf '%s\n' 'Type=Application'
+        printf 'Name=%s\n' "${title}"
+        printf 'Comment=partyOS app store - install + launch %s\n' "${title}"
+        printf 'Exec=/usr/local/bin/partyos-launch %s\n' "${name}"
+        printf 'Path=%s\n' "${HOME_DIR}"
+        printf '%s\n' 'Terminal=false'
+        printf 'Categories=%s;partyOS;\n' "${fdcat}"
+        printf 'Icon=%s\n' "${icon}"
+        printf 'X-PartyOS-App=%s\n' "${name}"
+        printf '%s\n' 'Actions=Share;'
+        printf '\n'
+        printf '%s\n' '[Desktop Action Share]'
+        printf '%s\n' 'Name=Share this Game'
+        printf 'Exec=/usr/local/bin/partyos-share-game %s\n' "${name}"
+        printf 'Icon=%s\n' "${icon}"
+    } > "${f}"
+    # Executable .desktop = XFCE treats it as a trusted launcher (a 644 one triggers
+    # the "untrusted application launcher" prompt on double-click).
+    chmod +x "${f}" 2>/dev/null || true
+}
+
+# write_cat_launcher FILE LABEL ICON DIR - a desktop "folder" for a category: a
+# launcher with a DISTINCT themed icon that opens the hidden per-category app dir.
+# (xfdesktop renders Icon= for a launcher; it does NOT render a custom icon for a
+# plain folder without the gvfs metadata backend, so a launcher is the reliable
+# way to get a per-category icon.)
+write_cat_launcher() {
+    local f="$1" label="$2" icon="$3" dir="$4"
+    cat > "${f}" <<DESK
+[Desktop Entry]
+Type=Application
+Name=${label}
+Comment=partyOS - open the ${label} apps
+Exec=thunar ${dir}
+Terminal=false
+Icon=${icon}
+Categories=partyOS;
+X-PartyOS-Cat=${label}
+DESK
+    chmod +x "${f}" 2>/dev/null || true
+}
+
+# gen-launchers: the app store IS the icons. One install-on-click .desktop per
+# catalog blob in the app menu (grouped by Categories), plus per-category desktop
+# "folders" - each a launcher with a distinct themed icon (Games, Tools, ...) that
+# opens a hidden dir of that category's app launchers. Click = fetch + launch.
+# Re-run at boot so the icons track whatever the LAN catalog serves.
+cmd_gen_launchers() {
+    load_catalog || { say "PARTYOS-APP ERROR catalog unavailable for launcher gen"; return 1; }
+    local appdir="${HOME_DIR}/.local/share/applications"
+    local deskroot="${HOME_DIR}/Desktop"
+    install -d "${appdir}" "${deskroot}"
+    # drop stale partyOS launchers so removed catalog entries vanish on refresh
+    rm -f "${appdir}"/partyos-app-*.desktop 2>/dev/null || true
+    grep -rlZ "X-PartyOS-Cat" "${deskroot}"/*.desktop 2>/dev/null | xargs -0 -r rm -f 2>/dev/null || true
+    # legacy per-category top-level dirs (.apps-Games, ...) + the single master tree
+    rm -rf "${deskroot}"/.apps-* "${deskroot}"/.apps 2>/dev/null || true
+    # legacy tool launcher renamed Intranet -> FAQ: drop the stale one off USB homes
+    # provisioned before the rename (the fresh faq.desktop is baked separately).
+    rm -f "${deskroot}/intranet.desktop" 2>/dev/null || true
+    # retired "Report an Issue" tile: drop the stale one off USB homes provisioned
+    # before its removal (no fresh copy is baked - the feature was retired).
+    rm -f "${deskroot}/report-an-issue.desktop" 2>/dev/null || true
+    find "${deskroot}" -maxdepth 1 -name 'partyos-app-*.desktop' -delete 2>/dev/null || true
+    local i=0 made=0 seen=" "
+    while [ "${i}" -lt "${#C_NAME[@]}" ]; do
+        local name="${C_NAME[$i]}" title="${C_TITLE[$i]:-${C_NAME[$i]}}" id="${C_ID[$i]:-${C_NAME[$i]}}"
+        # HIDE flag: a hidden blob gets NO tile anywhere by default - not the whisker-menu
+        # .desktop, not the category-folder launcher, not the browser/messenger top-level
+        # special case below. EXCEPTION: a hidden row whose unlock_code has been entered
+        # + persisted (partyos-app unlock-code) is REVEALED here - it gets a normal tile and
+        # is installable by name, exactly like a visible row. Infra rows (protonenv) carry no
+        # unlock_code so they stay invisible until an operator gates them behind a code.
+        if [ "${C_HIDDEN[$i]:-false}" = "true" ]; then
+            if [ -n "${C_UNLOCK[$i]:-}" ] && is_code_unlocked "${C_UNLOCK[$i]}"; then
+                : # unlocked by code - fall through and emit a tile
+            else
+                i=$((i+1)); continue
+            fi
+        fi
+        local cat="${C_CAT[$i]:-app}" fdcat icon label dir cicon
+        fdcat="$(fd_category "${cat}")"; icon="$(cat_icon "${cat}")"; label="$(cat_label "${cat}")"
+        # per-app icon override from the catalog (themed app icon beats the generic
+        # category icon when the row supplies one, e.g. blender/krita/obs).
+        cicon="${C_ICON[$i]:-}"; [ -n "${cicon}" ] && icon="${cicon}"
+        # Internyet Explorer + NYET Messenger are the two "this IS the internet"
+        # apps - they live as TOP-LEVEL desktop icons, never buried in the Internet
+        # category folder. Still listed in the whisker menu. (partyos-app- prefix so
+        # the top-level cleanup find at refresh removes them cleanly.)
+        case "${name}" in
+            browser|messenger)
+                write_app_desktop "${appdir}/partyos-app-${name}.desktop" "${title}" "${id}" "${fdcat}" "${icon}" "${name}"
+                write_app_desktop "${deskroot}/partyos-app-${name}.desktop" "${title}" "${id}" "${fdcat}" "${icon}" "${name}"
+                made=$((made+1)); i=$((i+1)); continue;;
+        esac
+        # SINGLE "Apps" master folder: each category is a SUBfolder of ~/Desktop/.apps
+        # (Games / Internet / Creative / Tools / ...), not its own top-level desktop
+        # folder. One Apps.desktop opener is written after the loop.
+        dir="${deskroot}/.apps/${label}"
+        install -d "${dir}"
+        # menu entry (whisker groups by Categories)
+        write_app_desktop "${appdir}/partyos-app-${name}.desktop" "${title}" "${id}" "${fdcat}" "${icon}" "${name}"
+        # app launcher inside the per-category SUBfolder. NAME THE FILE BY TITLE so the
+        # label reads right even on a stock Thunar; the patched Thunar trusts local
+        # launchers and shows Name= regardless. The whole .apps tree is wiped + rebuilt
+        # each refresh, so a title-named file needs no stale cleanup. (/ -> - so a title
+        # is always a valid filename.)
+        local fname; fname="$(printf '%s' "${title}" | tr '/' '-')"
+        write_app_desktop "${dir}/${fname}.desktop" "${title}" "${id}" "${fdcat}" "${icon}" "${name}"
+        case "${seen}" in *" ${label} "*) ;; *) seen="${seen}${label} ";; esac
+        made=$((made+1)); i=$((i+1))
+    done
+    # "Enter a Code" tile: the store front door for HIDDEN, code-gated games. A guest
+    # types a short code; partyos-unlock hands it to `partyos-app unlock-code`, which reveals
+    # every hidden blob whose unlock_code matches (persisted to the USB home so the unlock
+    # survives reboot) and regenerates these launchers so the unlocked game appears. This
+    # REPLACED the old "Load from URL" magnet-paste tile - the magnet share backend
+    # (partyos-share-game / `partyos-app load-url`) still exists for peer-to-peer sharing,
+    # it just no longer has its own store tile. Lives INSIDE the apps&games folder (the
+    # .apps/Games subfolder) alongside the real game launchers; the whole .apps tree is
+    # wiped + rebuilt each refresh (rm -rf above), so this needs no stale cleanup of its
+    # own. install -d guarantees the Games subfolder exists even if the catalog served no
+    # game-category rows this boot.
+    install -d "${deskroot}/.apps/Games"
+    cat > "${deskroot}/.apps/Games/Enter a Code.desktop" <<DESK
+[Desktop Entry]
+Type=Application
+Name=Enter a Code
+Comment=partyOS - enter a code to unlock hidden games
+Exec=/usr/local/bin/partyos-unlock
+Terminal=false
+Icon=dialog-password
+Categories=Game;partyOS;
+DESK
+    chmod +x "${deskroot}/.apps/Games/Enter a Code.desktop" 2>/dev/null || true
+    # New Windows Game tile: the zenity wizard front door for the on-client proton-env
+    # feature - create a wine env on the USB stick, run a Windows installer, pick the
+    # game's .exe, play. Lives in the Games subfolder alongside the real game launchers;
+    # the .apps tree is wiped + rebuilt each refresh (rm -rf above) so it needs no cleanup.
+    cat > "${deskroot}/.apps/Games/New Windows Game.desktop" <<DESK
+[Desktop Entry]
+Type=Application
+Name=New Windows Game
+Comment=partyOS - install + play a Windows game in a wine env on your USB stick
+Exec=/usr/local/bin/partyos-newgame
+Terminal=false
+Icon=applications-other
+Categories=Game;partyOS;
+DESK
+    chmod +x "${deskroot}/.apps/Games/New Windows Game.desktop" 2>/dev/null || true
+    # ONE master-folder launcher on the desktop: opens the .apps tree of category
+    # subfolders (Games / Internet / Tools / ... - and the Enter a Code tile above).
+    # write_cat_launcher tags X-PartyOS-Cat so the refresh above removes it.
+    [ -d "${deskroot}/.apps" ] && \
+        write_cat_launcher "${deskroot}/Apps.desktop" "Apps & Games" "folder" "${deskroot}/.apps"
+    # chown the WHOLE ~/.local tree (not just appdir): `install -d` ran as root at
+    # boot (the appstore oneshot) and created ~/.local + ~/.local/share root-owned,
+    # which then blocks the player's apps from writing there (e.g. the web browser
+    # fails with "Failed to create directory ~/.local/share/<app>"). Chowning only the leaf
+    # left the parents root-owned.
+    chown -R "${APP_USER}:${APP_USER}" "${HOME_DIR}/.local" "${deskroot}" 2>/dev/null || true
+    # Per-env "New Windows Game" PLAY tiles live in the same .apps/Games tree the wipe-and-
+    # rebuild above just recreated, so regenerate them now - as the player, AFTER the chown
+    # so the tree is user-writable. Must never fail the boot (no envs / no USB stick = no-op).
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo -u "${APP_USER}" /usr/local/bin/partyos-proton-env gen-tiles >/dev/null 2>&1 || true
+    else
+        /usr/local/bin/partyos-proton-env gen-tiles >/dev/null 2>&1 || true
+    fi
+    say "PARTYOS-APP-LAUNCHERS-GENERATED n=${made} menu=${appdir} apps-folder=Apps subfolders=[${seen# }]"
+    return 0
+}
+
+# seed-cached: add EVERY complete cached blob that has a torrent to the one
+# aria2c, so a booted client serves its whole cache to peers. Runs as the
+# ExecStartPost of partyos-seeder.service. No hash check (start_seed).
+#   Pass 1 (at once, no network): seed every blob with its cached torrent.
+#   Pass 2 (in the background): if the catalog loads, refresh each cached torrent
+#   from the server (refresh_torrent: same info-hash only). A changed torrent is
+#   taken out of aria2c and added again, so a stick cached in another network
+#   announces to the tracker of this one. No server = pass 1 stays (LPD works).
+# Pass 2 is in the background, because one fetch per blob from a slow server
+# must not hold up the service start (and so the boot target).
+# PARTYOS_SEED_REFRESH: bg (default), fg (tests) or off.
+cmd_seed_cached() {
+    local cdir; cdir="$(cache_dir)"
+    [ -d "${cdir}" ] || { say "PARTYOS-APP-SEED-CACHED no-cache-dir ${cdir}"; return 0; }
+    a2_up || { say "PARTYOS-APP-SEED-CACHED aria2-rpc-down dir=${cdir}"; return 0; }
+    local names=() n=0 f name
+    for f in "${cdir}"/*.squashfs; do
+        [ -f "${f}" ] || continue
+        name="$(basename "${f}" .squashfs)"
+        [ -s "${cdir}/${name}.squashfs.torrent" ] || continue
+        start_seed "${name}" "${cdir}"; names+=("${name}"); n=$((n+1))
+    done
+    say "PARTYOS-APP-SEED-CACHED blobs=${n} dir=${cdir}"
+    [ "${n}" -gt 0 ] || return 0
+    case "${PARTYOS_SEED_REFRESH:-bg}" in
+        off) return 0;;
+        fg)  seed_refresh "${cdir}" "${names[@]}";;
+        *)   seed_refresh "${cdir}" "${names[@]}" < /dev/null &;;
+    esac
+    return 0
+}
+# seed_refresh CDIR NAME... - pass 2 of seed-cached (see above).
+seed_refresh() {
+    local cdir="$1"; shift
+    load_catalog >/dev/null 2>&1 || { say "PARTYOS-APP-SEED-REFRESH catalog=0 (kept the cached torrents)"; return 0; }
+    local name idx r=0
+    for name in "$@"; do
+        idx="$(resolve_idx "${name}" 2>/dev/null)" || continue
+        refresh_torrent "${name}" "${C_BLOB[$idx]}" "${cdir}"
+        start_seed "${name}" "${cdir}"; r=$((r+1))
+    done
+    say "PARTYOS-APP-SEED-REFRESH checked=${r} dir=${cdir}"
+    return 0
+}
+
+# uncache NAME - the PROPER way to drop a cached game (vs a manual rm, which leaves the
+# overlay mount + seed entry dangling): unmount the overlay (frees RAM), take the blob
+# out of the aria2c, then delete the cached blob + torrent. Next launch re-downloads.
+cmd_uncache() {
+    local key="$1" name idx cdir
+    load_catalog 2>/dev/null || true
+    idx="$(resolve_idx "${key}" 2>/dev/null)" && name="${C_NAME[$idx]}" || name="${key}"
+    cdir="$(cache_dir)"
+    [ -x /usr/local/bin/partyos-ram ] && /usr/local/bin/partyos-ram evict "${name}" "${GAMES_DIR}" 1 >/dev/null 2>&1 || true
+    a2 remove "${name}" "${cdir}" >/dev/null 2>&1 || true
+    rm -f "${cdir}/${name}.squashfs" "${cdir}/${name}.squashfs.torrent" "${cdir}/${name}.squashfs.aria2" 2>/dev/null
+    # Forget the registry hash, so that the next mount resets the stick registry.
+    rm -f "${RUNCACHE_DIR}/${name}/lower-id" 2>/dev/null || true
+    say "PARTYOS-APP-UNCACHED name=${name} (unmounted + seed stopped + cache removed)"
+}
+# clear-cache - uncache EVERY cached game (free the whole stick cache).
+cmd_clear_cache() {
+    local cdir; cdir="$(cache_dir)"
+    [ -d "${cdir}" ] || { say "PARTYOS-APP-CLEAR-CACHE no-cache-dir"; return 0; }
+    local n=0 f name
+    for f in "${cdir}"/*.squashfs; do
+        [ -f "${f}" ] || continue
+        name="$(basename "${f}" .squashfs)"
+        cmd_uncache "${name}"; n=$((n+1))
+    done
+    say "PARTYOS-APP-CLEAR-CACHE cleared=${n} dir=${cdir}"
+}
+
+# --- Load-from-URL (share-code) engine ---------------------------------------
+# meta_field META KEY -> echo the value of a KEY=value line in a blob game.meta.
+# game.meta is plain KEY=value (one per line); we read it directly so the loader
+# needs no catalog row and no external parser. First match wins; empty if absent.
+meta_field() {
+    local meta="$1" key="$2"
+    [ -r "${meta}" ] || return 0
+    sed -n -E "s/^${key}=(.*)$/\1/p" "${meta}" | head -1
+}
+
+# launch_from_meta NAME - launch a mounted blob using ONLY its embedded game.meta
+# (no catalog row). This is the cmd_launch exec body with the catalog lookup stripped:
+# read entry (default bin/run.sh) + marker from game.meta, then run the entry as the
+# unprivileged desktop user with the X session forwarded, exactly like cmd_launch.
+launch_from_meta() {
+    local name="$1"
+    local meta="${GAMES_DIR}/${name}/game.meta"
+    local entry marker; entry="$(meta_field "${meta}" entry)"; entry="${entry:-bin/run.sh}"
+    marker="$(meta_field "${meta}" marker)"
+    is_installed "${name}" || { say "PARTYOS-APP ERROR ${name} not mounted (load failed)"; return 1; }
+    local _cd
+    for _cd in /mnt/usbhome/.partyos-cache/games /var/cache/partyos/games; do
+        if [ -f "${_cd}/${name}.squashfs" ]; then
+            touch -a "${_cd}/${name}.squashfs" 2>/dev/null \
+              || sudo -n touch -a "${_cd}/${name}.squashfs" 2>/dev/null || true
+            break
+        fi
+    done
+    local dest="${GAMES_DIR}/${name}" out=""
+    [ -x /usr/local/bin/partyos-ram ] && /usr/local/bin/partyos-ram mark-busy "${name}" >/dev/null 2>&1 || true
+    if [ -f "${dest}/${entry}" ]; then
+        local run_cwd="${HOME_DIR%/}/.cache/partyos-run/${name}"
+        install -d -o "${APP_USER}" -g "${APP_USER}" "${run_cwd}" 2>/dev/null || mkdir -p "${run_cwd}"
+        gpu_env "${PARTYOS_DISPLAY:-${DISPLAY:-}}" \
+            "${PARTYOS_XAUTHORITY:-${XAUTHORITY:-/home/${APP_USER}/.Xauthority}}"
+        out="$(cd "${run_cwd}" && sudo -u "${APP_USER}" env \
+            DISPLAY="${PARTYOS_DISPLAY:-${DISPLAY:-}}" \
+            XAUTHORITY="${PARTYOS_XAUTHORITY:-${XAUTHORITY:-/home/${APP_USER}/.Xauthority}}" \
+            XDG_RUNTIME_DIR="${PARTYOS_XDG_RUNTIME_DIR:-/run/user/$(id -u "${APP_USER}" 2>/dev/null)}" \
+            "${GPU_ENV[@]}" \
+            bash "${dest}/${entry}" 2>&1 || true)"
+    else
+        out="(no entry ${entry} in ${name})"
+    fi
+    [ -x /usr/local/bin/partyos-ram ] && /usr/local/bin/partyos-ram mark-idle "${name}" >/dev/null 2>&1 || true
+    say "PARTYOS-APP launch ${name} output: ${out}"
+    if [ -n "${marker}" ] && echo "${out}" | grep -qF "${marker}"; then
+        say "PARTYOS-APP-LAUNCHED name=${name} marker=${marker}"
+        return 0
+    fi
+    say "PARTYOS-APP-LAUNCHED name=${name} (no marker matched)"
+    return 0
+}
+
+# url_decode STR - decode percent-escapes from a magnet-code field (RFC3986). dn
+# (name) and ws (web-seed URL) can carry reserved bytes; decode everything
+# defensively so a copy-pasted code survives URL-encoders.
+url_decode() {
+    local s="${1//+/ }"; printf '%b' "${s//%/\\x}"
+}
+
+# cmd_load_url CODE - the catalog-free peer of install+launch. Parse a SHORT magnet:
+#   magnet:?xt=urn:btih:<infohash>&dn=<name>&x.pe=<ip>:<port>&ws=<webseed>&s=<sha256>&z=<size>
+# The magnet REPLACED an inline-base64-torrent partyos:// URI (~334KB for a 3GB blob,
+# bust the 128KB argv limit). TRUE peer-to-peer: we hand the MAGNET URI straight to
+# aria2 and let it pull the .torrent METADATA from the seeding PEER over ut_metadata
+# (BEP9), then the pieces from that peer - the central server is NEVER contacted. The
+# explicit peer (x.pe) is baked into the magnet (aria2 honours x.pe) and LPD finds the
+# seeder on a flat LAN; the web-seed (ws) is now an OPTIONAL accelerator only, NOT a
+# dependency. A server-clear blob has no web-seed and the load still succeeds peer-only.
+# The final sha256 gate against s is the source of truth. Then mount + launch straight
+# from the blob's own game.meta. NO load_catalog / resolve_idx, NO HTTP torrent fetch.
+cmd_load_url() {
+    local code="$1"
+    case "${code}" in
+        magnet:\?*) ;;
+        *) say "PARTYOS-APP-LOADURL ERROR bad scheme (expected magnet:?...)"; return 2;;
+    esac
+    local query="${code#magnet:\?}"
+    local xt="" n="" ip="" pt="" ws="" s="" z="" kv key val
+    local IFS='&'
+    for kv in ${query}; do
+        key="${kv%%=*}"; val="${kv#*=}"
+        case "${key}" in
+            xt)   xt="${val}";;
+            dn)   n="$(url_decode "${val}")";;
+            x.pe) ip="${val%%:*}"; pt="${val##*:}";;
+            ws)   ws="$(url_decode "${val}")";;
+            s)    s="${val}";;
+            z)    z="${val}";;
+        esac
+    done
+    unset IFS
+    # strip the urn:btih: prefix from xt -> the bare hex info-hash.
+    local infohash="${xt#urn:btih:}"
+    # name + sha + info-hash are mandatory; without them there is no safe, verifiable,
+    # peer-addressable pull. ws is OPTIONAL now (server-clear blobs carry none).
+    if [ -z "${n}" ] || [ -z "${s}" ] || [ -z "${infohash}" ]; then
+        say "PARTYOS-APP-LOADURL ERROR missing field (need dn, s, xt/btih)"; return 2
+    fi
+    # Reject a name that is not a plain cache key - it becomes a cache filename and a
+    # mount path, so a slash or .. would let a hostile code escape the cache dir.
+    case "${n}" in
+        ""|*/*|*..*) say "PARTYOS-APP-LOADURL ERROR unsafe name '${n}'"; return 2;;
+    esac
+    # If a web-seed IS present it must be a plain http(s) URL (defensive: a hostile code
+    # could otherwise point aria2 at file:// or a shell-meta path). Empty ws is fine.
+    if [ -n "${ws}" ]; then
+        case "${ws}" in
+            http://*|https://*) ;;
+            *) say "PARTYOS-APP-LOADURL ERROR unsafe web-seed '${ws}'"; return 2;;
+        esac
+    fi
+    say "PARTYOS-APP-LOADURL name=${n} sha=${s} size=${z:-?} btih=${infohash} peer=${ip:-?}:${pt:-?} ws=${ws:-none}"
+    local cdir; cdir="$(cache_dir)"; install -d "${cdir}"
+    local cached="${cdir}/${n}.squashfs"
+    # CACHE HIT: a sha-correct blob already on this box needs no peer pull at all.
+    if [ -s "${cached}" ] && [ "$(sha256sum "${cached}" 2>/dev/null | awk '{print $1}')" = "${s}" ]; then
+        say "PARTYOS-APP-LOADURL-CACHE-HIT name=${n} (no peer pull)"
+        BLOB_PATH="${cached}"
+    else
+        # PEER PULL: hand the FULL magnet URI to aria2. aria2 pulls the .torrent metadata
+        # from the seeding peer via ut_metadata (BEP9) - the explicit peer comes from the
+        # magnet's own x.pe (aria2 honours it) and LPD finds the seeder on a flat LAN -
+        # then the pieces from that peer. DHT is OFF (isolated LAN); LPD + PEX + the
+        # explicit peer are the discovery. The web-seed (if any, baked into the magnet's
+        # ws via aria2's BEP19 handling of the metadata's url-list) only accelerates; the
+        # load MUST succeed peer-only when there is no web-seed. NO HTTP .torrent fetch.
+        rm -f "${cached}" "${cached}.aria2" 2>/dev/null || true
+        # DYNAMIC listen port (range): if this box is already SEEDING a game it holds
+        # 51413, so this leecher must take a free ephemeral port or it dies "Address
+        # already in use". LPD + the explicit peer (x.pe) reach the seeder regardless;
+        # this box is the leecher, not an advertised seeder.
+        # --bt-metadata-only=false: we want the DATA, not just the .torrent (BEP9 still
+        # fetches the metadata from the peer first; this flag keeps the piece download on).
+        # --seed-ratio=0/--seed-time=0/--bt-detach-seed-only: finish the instant the blob
+        # is complete instead of lingering as a seeder. --bt-stop-timeout rides out slow-
+        # USB writeback stalls (a wedged folio_lock is not a dead peer). --follow-torrent
+        # keeps aria2 going from the metadata into the data download in one process.
+        say "PARTYOS-APP-LOADURL-P2P name=${n} (aria2 magnet: ut_metadata + peer pieces, server-clear)"
+        # A shared magnet's ws= web-seed may be HTTPS; pin the partyOS CA so the
+        # web-seed accelerator validates (peer-only still works when there is no web-seed).
+        if aria2c "${code}" \
+                  --ca-certificate="${PARTYOS_CA}" \
+                  --enable-dht=false --bt-enable-lpd=true --enable-peer-exchange=true \
+                  --bt-metadata-only=false --follow-torrent=true \
+                  --listen-port=6881-6999 --dht-listen-port=6881-6999 \
+                  --bt-max-peers=0 --bt-request-peer-speed-limit=0 \
+                  --seed-time=0 --seed-ratio=0.0 --bt-detach-seed-only=true \
+                  --bt-stop-timeout="${PARTYOS_BT_STOP_TIMEOUT:-600}" --file-allocation=none \
+                  --disk-cache="${PARTYOS_DISK_CACHE:-256M}" \
+                  --allow-overwrite=true --auto-file-renaming=false \
+                  --console-log-level=error --summary-interval=0 \
+                  -d "${cdir}" >/dev/null 2>&1 \
+           && [ -s "${cached}" ] \
+           && [ "$(sha256sum "${cached}" 2>/dev/null | awk '{print $1}')" = "${s}" ]; then
+            rm -f "${cached}.aria2" 2>/dev/null || true
+            say "PARTYOS-APP-LOADURL-P2P-OK name=${n} bytes=$(wc -c < "${cached}" | tr -d ' ')"
+            BLOB_PATH="${cached}"
+            # we now hold the blob: seed it so the next friend can pull.
+            start_seed "${n}" "${cdir}"
+        else
+            rm -f "${cached}" "${cached}.aria2" 2>/dev/null || true
+            say "PARTYOS-APP-LOADURL ERROR peer pull/verify failed name=${n} (no peer metadata/pieces)"; return 1
+        fi
+    fi
+    if [ -x /usr/local/bin/partyos-ram ]; then
+        /usr/local/bin/partyos-ram ensure-room "${CATALOG:-/dev/null}" "${n}" "${GAMES_DIR}" >/dev/null 2>&1 || true
+    fi
+    if ! mount_overlay "${n}" "${BLOB_PATH}"; then
+        say "PARTYOS-APP-LOADURL ERROR ${n} mount failed (corrupt blob)"; return 1
+    fi
+    install -d "${STATE_DIR}"; echo "${n}" >> "${STATE_DIR}/installed"
+    say "PARTYOS-APP-LOADURL-INSTALLED name=${n} at=${GAMES_DIR}/${n} src=squashfs+overlay"
+    launch_from_meta "${n}"
+}
+
+# cmd_unlock_code CODE - the store's "Enter a Code" action. Reveal every HIDDEN
+# row whose unlock_code matches CODE (case-insensitive, trimmed). On a match: PERSIST the
+# normalized code to the player's USB home (survives reboot) and regen the launchers so the
+# newly-unlocked blob(s) get tiles immediately. On NO match: reveal + persist NOTHING and
+# return non-zero so the GUI can toast "invalid code". Runs as the PLAYER (writes the
+# player's home + regens their launchers), NOT root - so it is deliberately absent from the
+# self-elevation list at the top of this script.
+cmd_unlock_code() {
+    local entered="${1:-}"
+    load_catalog || { say "PARTYOS-APP ERROR catalog unavailable"; return 1; }
+    local nc; nc="$(norm_code "${entered}")"
+    if [ -z "${nc}" ]; then say "PARTYOS-APP-UNLOCK-INVALID reason=empty"; return 2; fi
+    local i=0 matched=0 names=""
+    while [ "${i}" -lt "${#C_NAME[@]}" ]; do
+        if [ "${C_HIDDEN[$i]:-false}" = "true" ] && [ -n "${C_UNLOCK[$i]:-}" ] \
+           && [ "$(norm_code "${C_UNLOCK[$i]}")" = "${nc}" ]; then
+            matched=$((matched+1)); names="${names}${C_NAME[$i]} "
+        fi
+        i=$((i+1))
+    done
+    if [ "${matched}" -eq 0 ]; then
+        say "PARTYOS-APP-UNLOCK-INVALID (no hidden blob matches the entered code)"; return 3
+    fi
+    install -d "${UNLOCK_FILE%/*}"
+    touch "${UNLOCK_FILE}" 2>/dev/null || true
+    grep -qxF "${nc}" "${UNLOCK_FILE}" 2>/dev/null || printf '%s\n' "${nc}" >> "${UNLOCK_FILE}"
+    chown -R "${APP_USER}:${APP_USER}" "${UNLOCK_FILE%/*}" 2>/dev/null || true
+    say "PARTYOS-APP-UNLOCK-OK n=${matched} names=${names% }"
+    cmd_gen_launchers >/dev/null 2>&1 || true
+    return 0
+}
+
+usage() { echo "usage: partyos-app {list|install <id>|reinstall <id>|launch <id>|install-launch <id>|installed|remove <id>|gen-launchers|seed-cached|uncache <id>|clear-cache|load-url <code>|unlock-code <code>|ensure-baseenv}"; }
+
+cmd="${1:-}"; shift || true
+case "${cmd}" in
+    list)            cmd_list "$@";;
+    install)         [ $# -ge 1 ] || { usage; exit 2; }; cmd_install "$1";;
+    reinstall)       [ $# -ge 1 ] || { usage; exit 2; }; cmd_reinstall "$1";;
+    launch)          [ $# -ge 1 ] || { usage; exit 2; }; cmd_launch "$1";;
+    install-launch)  [ $# -ge 1 ] || { usage; exit 2; }; cmd_install_launch "$1";;
+    installed)       cmd_installed "$@";;
+    remove)          [ $# -ge 1 ] || { usage; exit 2; }; cmd_remove "$1";;
+    gen-launchers)   cmd_gen_launchers "$@";;
+    seed-cached)     cmd_seed_cached;;
+    uncache)         [ $# -ge 1 ] || { usage; exit 2; }; cmd_uncache "$1";;
+    clear-cache)     cmd_clear_cache;;
+    load-url)        [ $# -ge 1 ] || { usage; exit 2; }; cmd_load_url "$1";;
+    unlock-code)     [ $# -ge 1 ] || { usage; exit 2; }; cmd_unlock_code "$1";;
+    ensure-baseenv)  cmd_ensure_baseenv;;
+    *)               usage; exit 2;;
+esac

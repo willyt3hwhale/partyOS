@@ -1,0 +1,8 @@
+[Unit]
+Description=partyOS - handle home stick removal (pause sync + notify)
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30s
+ExecStart=/usr/local/bin/partyos-usb-removed

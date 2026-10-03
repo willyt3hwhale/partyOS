@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Launch the web browser (Internet Explorer) with the right env + portal homepage.
+BIN=epiphany
+PORTAL=/var/lib/partyos/portal/index.html
+# partyOS boots nomodeset (simpledrm, no DRI3) so webkit's GPU/DMABUF path crashes
+# the web process ("Web process crashed", DRI3 EGL errors). Force software
+# rendering so pages actually render.
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export LIBGL_ALWAYS_SOFTWARE=1
+# webkit needs the user session bus (xdg-desktop-portal / libportal); a normal
+# desktop click inherits it, but set it if missing so the web process never
+# crashes with "Failed to create XdpPortal instance".
+[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || \
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus"
+# only show the friendly "Internet Explorer" entry, hide the raw epiphany one
+# (best-effort; idempotent - safe to re-write each launch).
+install -d "${HOME}/.local/share/applications" 2>/dev/null || true
+printf '[Desktop Entry]\nType=Application\nNoDisplay=true\n' \
+  > "${HOME}/.local/share/applications/org.gnome.Epiphany.desktop" 2>/dev/null || true
+# suppress Epiphany's first-run "set as default browser?" prompt + point the
+# homepage/home button at the cached portal (best-effort).
+gsettings set org.gnome.Epiphany ask-for-default false 2>/dev/null || true
+[ -f "${PORTAL}" ] && gsettings set org.gnome.Epiphany.web:/org/gnome/epiphany/web/ homepage-url "file://${PORTAL}" 2>/dev/null || true
+# WebKitGTK 2.48.5 crashes the UI process (segfault in libwebkitgtk-6.0) when a
+# page loads a hidden <object type="text/html" data="about:blank"> subframe.
+# Wiki.js creates these for resize detection. Hide them with a user
+# stylesheet, so WebKit does not load the subframe. The page still renders.
+# Append the rule once and keep any existing user CSS (best-effort).
+UCSS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/epiphany"
+UCSS="${UCSS_DIR}/user-stylesheet.css"
+UCSS_RULE='object[type="text/html"]{display:none !important}'
+install -d "${UCSS_DIR}" 2>/dev/null || true
+grep -qxF "${UCSS_RULE}" "${UCSS}" 2>/dev/null || \
+  printf '%s\n' "${UCSS_RULE}" >> "${UCSS}" 2>/dev/null || true
+# org.gnome.Epiphany.web is relocatable: give the path, or gsettings fails.
+gsettings set org.gnome.Epiphany.web:/org/gnome/epiphany/web/ enable-user-css true 2>/dev/null || true
+# open the portal when launched with no URL; otherwise honor the requested URL.
+if [ "$#" -eq 0 ] && [ -f "${PORTAL}" ]; then exec "$BIN" "file://${PORTAL}"; fi
+exec "$BIN" "$@"

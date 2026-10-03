@@ -1,0 +1,4 @@
+[Default Applications]
+x-scheme-handler/http=partyos-browser.desktop
+x-scheme-handler/https=partyos-browser.desktop
+text/html=partyos-browser.desktop

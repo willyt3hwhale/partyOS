@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=partyOS desktop-ready callback
+Exec=/usr/local/bin/partyos-desktop-ready
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

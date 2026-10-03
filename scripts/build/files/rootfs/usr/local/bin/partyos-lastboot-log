@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# partyos-lastboot-log - list the per-boot journal snapshots saved on the USB and dump one
+# with journalctl. partyOS RAM-boots, so `journalctl -b -1` is wiped each boot; the snapshots
+# (partyos-journal-snapshot) live on the USB and journalctl --directory reads ANY of them
+# regardless of machine-id. Default target = the PREVIOUS boot (the second-newest snapshot;
+# the newest is the CURRENT boot still being written).
+#   partyos-lastboot-log            # dump the previous boot's journal (the usual case)
+#   partyos-lastboot-log -l|--list  # just list the saved boots, newest last
+#   partyos-lastboot-log -c|--current  # dump the CURRENT boot's snapshot
+#   partyos-lastboot-log -n N       # dump the Nth-newest snapshot (1=current, 2=previous, ...)
+#   partyos-lastboot-log <dir>      # dump a specific snapshot dir
+# Extra args after the selector are passed straight to journalctl (e.g. -p err, -g PATTERN).
+set -u
+USB_JOURNAL=/mnt/usbhome/.partyos-journal
+
+mapfile -t DIRS < <(ls -1d "${USB_JOURNAL}"/boot-* 2>/dev/null | sort)
+N=${#DIRS[@]}
+
+list() {
+    if [ "${N}" -eq 0 ]; then echo "no journal snapshots under ${USB_JOURNAL}"; return; fi
+    echo "saved per-boot journal snapshots (oldest first; newest = current boot):"
+    local i=1
+    for d in "${DIRS[@]}"; do
+        local idx=$(( N - i + 1 ))   # 1=newest/current, 2=previous, ...
+        local when=""; [ -f "${d}/.snapshot-time" ] && when="  last-snapshot ${when}$(cat "${d}/.snapshot-time" 2>/dev/null)"
+        local tag=""
+        [ "${idx}" -eq 1 ] && tag="  [current boot]"
+        [ "${idx}" -eq 2 ] && tag="  [previous boot]"
+        printf '  #%d  %s%s%s\n' "${idx}" "${d}" "${when}" "${tag}"
+        i=$(( i + 1 ))
+    done
+    echo
+    echo "dump:  partyos-lastboot-log            (previous boot, the default)"
+    echo "       partyos-lastboot-log -n <idx>   (idx as listed above; 1=current)"
+}
+
+dump() {  # $1 = snapshot dir, rest = extra journalctl args
+    local dir="$1"; shift
+    if [ ! -d "${dir}" ]; then echo "no such snapshot: ${dir}" >&2; return 1; fi
+    if ! ls "${dir}"/*.journal >/dev/null 2>&1; then
+        echo "snapshot ${dir} has no *.journal files" >&2; return 1
+    fi
+    echo "# reading ${dir}" >&2
+    journalctl --directory="${dir}" --no-pager "$@"
+}
+
+case "${1:-}" in
+    -l|--list)    list; exit 0;;
+    -c|--current) [ "${N}" -ge 1 ] && { dump "${DIRS[$(( N - 1 ))]}" "${@:2}"; exit $?; }
+                  echo "no snapshots yet" >&2; exit 1;;
+    -n)           idx="${2:-2}"; shift 2 || true
+                  [ "${N}" -ge "${idx}" ] && { dump "${DIRS[$(( N - idx ))]}" "$@"; exit $?; }
+                  echo "only ${N} snapshot(s) saved (asked for #${idx})" >&2; exit 1;;
+    /*|./*)       d="$1"; shift; dump "${d}" "$@"; exit $?;;
+    "")           # default: the PREVIOUS boot = second-newest snapshot.
+                  if [ "${N}" -ge 2 ]; then dump "${DIRS[$(( N - 2 ))]}"; exit $?; fi
+                  if [ "${N}" -eq 1 ]; then
+                      echo "only the CURRENT boot is snapshotted (no previous boot yet)." >&2
+                      echo "dumping the current boot instead:" >&2
+                      dump "${DIRS[0]}"; exit $?
+                  fi
+                  echo "no journal snapshots under ${USB_JOURNAL} yet" >&2; exit 1;;
+    *)            echo "usage: partyos-lastboot-log [-l|--list|-c|--current|-n IDX|<dir>] [journalctl args]" >&2
+                  exit 2;;
+esac

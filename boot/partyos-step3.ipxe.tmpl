@@ -1,0 +1,41 @@
+#!ipxe
+# partyOS Step 3 boot script (TEMPLATE) - custom XFCE desktop image.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1/2 (no typed iPXE command).
+#
+# Difference from Step 2: archiso_http_srv points at server/images/custom/, whose
+# arch/x86_64/airootfs.sfs is the CUSTOM squashfs (stock live system + XFCE +
+# LightDM autologin 'gamer' + browser/file-manager + graphics/network drivers).
+# The kernel + initramfs are the SAME ones Step 2 boots (they live at
+# server/images/), so the proven RAM-boot/copytoram machinery is untouched - we
+# only swap the root filesystem for the desktop one.
+
+echo ================================================
+echo partyOS Step 3 - Custom XFCE Desktop Boot
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=3&status=boot&ip=${ip} r3 || echo callback-skipped
+imgfree r3 || echo continuing
+
+echo Loading custom desktop image (XFCE) into RAM...
+# archiso_http_srv -> the custom image dir; archisobasedir=arch resolves
+# arch/x86_64/airootfs.sfs there. copytoram forces the whole sfs into RAM (HTTP
+# boot does this anyway). console=ttyS0 mirrors to the serial line the harness
+# scrapes; console=tty0 keeps the kernel tty alive for the graphical stack.
+# no_timer_check: QEMU q35+TCG timer-routing quirk (see Step 2 notes). No
+# cms_verify (expired 2025.09 codesigning cert) - integrity via checksum if ever
+# wanted. report_url= is read by the in-guest desktop-ready autostart for its
+# HTTP callback (no hardcoded IP).
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/step3-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS desktop...
+boot || goto failed
+
+:failed
+echo partyOS Step 3 boot failed

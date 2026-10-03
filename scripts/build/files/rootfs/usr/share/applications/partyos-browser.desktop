@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Internyet Explorer
+GenericName=Web Browser
+Comment=Browse the LAN (installed on first use)
+Exec=/usr/local/bin/partyos-launch browser %U
+Icon=applications-internet
+Terminal=false
+NoDisplay=true
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;

@@ -1,0 +1,9 @@
+[Unit]
+Description=partyOS - flush USB-queued player reports to the LAN server
+After=local-fs.target network-online.target partyos-usbhome.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60s
+ExecStart=/usr/local/bin/partyos-report-flush

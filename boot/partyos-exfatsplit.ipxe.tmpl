@@ -1,0 +1,35 @@
+#!ipxe
+# partyOS exFAT-split boot script (TEMPLATE) - CROSS-OS two-partition USB stick.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} -> harness
+# SERVER_URL, {{EXFATSPLIT_COMPAT}} -> split|single). Reached automatically via the
+# DHCP boot filename, same as every other partyOS boot (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-9 with the participant USB attached.
+# The fetched automated-script is exfatsplit-script.sh: it mounts the ext4
+# LANPARTY_HOME partition, reads `.partyos` from its root, mounts the exFAT
+# PARTYSHARE partition as the cross-OS share, and emits the proof.
+
+echo ================================================
+echo partyOS - cross-OS exFAT + ext4 USB split
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo Compat mode: {{EXFATSPLIT_COMPAT}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=exfatsplit&status=boot&ip=${ip} ri || echo callback-skipped
+imgfree ri || echo continuing
+
+echo Loading custom desktop image into RAM (exfatsplit)...
+# exfatsplit_compat= is read by exfatsplit-script.sh to know which stick shape to
+# expect (split = exFAT+ext4, single = legacy ext4-only). report_url= for the
+# HTTP callback (no hardcoded IP).
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/exfatsplit-script.sh report_url={{SERVER_URL}} exfatsplit_compat={{EXFATSPLIT_COMPAT}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (exfatsplit)...
+boot || goto failed
+
+:failed
+echo partyOS exfatsplit boot failed

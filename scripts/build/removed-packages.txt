@@ -1,0 +1,81 @@
+# partyOS removed-packages list
+# ------------------------------------------------------------------------------
+# partyOS is built from the stock Arch *installer* ISO (releng) profile, which is
+# a kitchen-sink recovery/install environment. This file lists packages stripped
+# from the image because partyOS netboots straight to an XFCE desktop and never
+# installs Arch, recovers disks, or runs as a VM guest.
+#
+# DOUBLES AS the undo list: `pacman -S <name>` (from a LAN Arch mirror) brings any back.
+#
+# phases/25-strip.sh reads this file and `pacman -Rns` each (best-effort: a
+# pkg still required by a keeper is left in place + logged). Lines starting with
+# '#' and blank lines are ignored.
+# ------------------------------------------------------------------------------
+
+# --- bootloaders / installers (we netboot via iPXE; never install) ---
+grub
+syslinux
+refind
+edk2-shell
+archinstall
+
+# --- disk clone / partition recovery (not a recovery OS) ---
+clonezilla
+partclone
+partimage
+testdisk
+
+# --- Wi-Fi / cellular firmware + stack (ethernet-only) ---
+linux-firmware-marvell
+linux-firmware-atheros
+broadcom-wl
+wpa_supplicant
+iwd
+modemmanager
+ppp
+linux-atm
+openvpn
+openconnect
+network-manager-applet
+
+# --- big app: full browser (host via LAN mirror / appstore instead) ---
+firefox
+lynx
+irssi
+mc
+lftp
+
+# --- network / server / diagnostic tools -> HOST ON LAN ARCH MIRROR ---
+nmap
+bind
+dnsmasq
+nfs-utils
+open-iscsi
+tcpdump
+ldns
+ethtool
+smartmontools
+nvme-cli
+sg3_utils
+sdparm
+
+# --- VM guest agents (partyOS runs on metal; qemu-guest-agent kept for VM tests) ---
+open-vm-tools
+virtualbox-guest-utils-nox
+
+# --- misc unused on a LAN-party desktop ---
+cloud-init
+sequoia-sq
+brltty
+man-pages
+man-db
+openpgp-card-tools
+
+# --- extra filesystem tools (keep dosfstools/e2fsprogs/ntfs-3g for ESP/home/disks) ---
+jfsutils
+bcachefs-tools
+xfsprogs
+f2fs-tools
+nilfs-utils
+btrfs-progs
+mdadm

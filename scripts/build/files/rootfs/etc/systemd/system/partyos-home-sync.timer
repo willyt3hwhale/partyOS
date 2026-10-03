@@ -1,0 +1,11 @@
+[Unit]
+Description=partyOS - run home->USB push periodically
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=45s
+AccuracySec=2s
+Unit=partyos-home-sync.service
+
+[Install]
+WantedBy=timers.target

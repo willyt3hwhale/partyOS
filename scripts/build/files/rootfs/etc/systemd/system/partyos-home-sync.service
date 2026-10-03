@@ -1,0 +1,14 @@
+[Unit]
+Description=partyOS - push RAM /home to the USB home partition
+After=local-fs.target partyos-home-pull.service
+ConditionPathIsMountPoint=/mnt/usbhome
+
+[Service]
+Type=oneshot
+# A push must not be killed while it writes. The old 90s killed the push on a slow stick
+# (0.5 MB/s) and on a busy one. The kill came after the stick counter write, and the sync
+# then stood down for the rest of the boot. A kill is now recoverable, but a push
+# killed on every tick never completes. rsync --timeout=20 still stops a stalled stick.
+# The timer (OnUnitActiveSec) does not start a new push while this one runs.
+TimeoutStartSec=20min
+ExecStart=/usr/local/bin/partyos-sync-home

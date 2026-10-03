@@ -1,0 +1,37 @@
+#!ipxe
+# partyOS IDENTITY boot script (TEMPLATE) - dynamic account name + hostname.
+# Rendered at serve time by scripts/vm/render-ipxe.sh ({{SERVER_URL}} ->
+# harness SERVER_URL). Reached automatically via the DHCP boot filename, same as
+# Steps 1-9 (no typed iPXE command).
+#
+# Boots the SAME custom XFCE image as Steps 3-9 (server/images/custom/), with the
+# SAME kernel/initramfs Step 2 RAM-boots, with the LANPARTY_HOME USB stick
+# attached. The fetched automated-script is identity-script.sh: it mounts the
+# stick, runs the BAKED partyos-identity-setup (parse .partyos USERNAME=/HOSTNAME=
+# -> account at uid 1000 + passwordless sudo + autologin + hostname), populates
+# the resolved user's home from the USB, and emits the proof.
+
+echo ================================================
+echo partyOS IDENTITY - dynamic account + hostname
+echo ================================================
+echo IP Address: ${ip}
+echo Server URL: {{SERVER_URL}}
+echo PARTYOS-NETBOOT-OK
+imgfetch {{SERVER_URL}}/report?step=identity&status=boot&ip=${ip} ri || echo callback-skipped
+imgfree ri || echo continuing
+
+echo Loading custom desktop image into RAM (identity)...
+# archiso_http_srv -> the custom image dir (arch/x86_64/airootfs.sfs); copytoram
+# pulls the whole sfs into RAM. console=ttyS0 mirrors to the serial line the
+# harness scrapes. no_timer_check: QEMU q35+TCG timer-routing quirk. report_url=
+# is read by identity-script.sh for its HTTP callback (no hardcoded IP).
+kernel {{SERVER_URL}}/server/images/vmlinuz-linux initrd=initramfs-linux.img archisobasedir=arch archiso_http_srv={{SERVER_URL}}/server/images/custom/ ip=dhcp copytoram cow_spacesize=4G no_timer_check console=tty0 console=ttyS0,115200 script={{SERVER_URL}}/boot/identity-script.sh report_url={{SERVER_URL}} || goto failed
+
+echo Downloading initramfs...
+initrd {{SERVER_URL}}/server/images/initramfs-linux.img || goto failed
+
+echo Starting partyOS (identity)...
+boot || goto failed
+
+:failed
+echo partyOS identity boot failed

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# partyos-usb-poll - reconcile /mnt/usbhome against the real home device (a home label).
+# Cheap + idempotent; defers all real work to the udev-path oneshots (they flock).
+# LONG-LIVED loop: this used to be a Type=oneshot fired by an ~8s timer, but every tick
+# logged a SERVICE_START/STOP pair + a kernel audit record, flooding the journal (~1/3 of
+# it on a quiet box). One process with an
+# internal sleep runs the SAME reconcile at the SAME cadence with ZERO per-tick start/stop
+# churn: a steady state (nothing to reconcile) now emits no log lines at all.
+set -u
+SER=/dev/ttyS0; case "$(systemd-detect-virt 2>/dev/null)" in none|"") SER=/dev/null;; esac
+# The journal gets each decision too (stdout). A steady state logs nothing.
+log() { echo "[usb-poll] $*" > "${SER}" 2>/dev/null; echo "[usb-poll] $*"; }
+. /usr/local/lib/partyos-sync-common.sh
+. /usr/local/lib/partyos-usb-labels.sh
+INTERVAL="${PARTYOS_USB_POLL_INTERVAL:-8}"
+# GONE_TICKS: the number of reconciles in a row that found the home device gone.
+# The removed handler starts only at 2, so one odd result cannot unmount the home.
+GONE_TICKS=0
+
+reconcile() {
+    # Stand down until the boot pull has run, so we never race the boot-time mount/pull.
+    [ -e "${PULL_DONE}" ] || return 0
+
+    # Resolve the labelled device (empty if absent).
+    local dev src
+    dev="$(partyos_resolve_label_dev home 2>/dev/null)"
+
+    if mountpoint -q "${MNT}"; then
+        # Mounted but the backing device is gone -> a remove event was missed.
+        # Test the MAJ:MIN of each mount layer in sysfs, not the findmnt SOURCE text.
+        # A stacked mount gives two SOURCE lines, and that text is not a block device
+        # although the stick is present.
+        if mounted_dev_present "${MNT}"; then
+            GONE_TICKS=0
+        elif [ "$?" -eq 1 ]; then
+            GONE_TICKS=$((GONE_TICKS + 1))
+            src="$(mount_majmins "${MNT}" | tr '\n' ' ')"
+            if [ "${GONE_TICKS}" -ge 2 ]; then
+                log "mount at ${MNT} but backing device ${src% } gone (${GONE_TICKS} checks); kicking removed handler"
+                systemctl --no-block start partyos-usb-removed.service 2>/dev/null || true
+                GONE_TICKS=0
+            else
+                log "mount at ${MNT} but backing device ${src% } gone; confirming on the next check"
+            fi
+        fi
+    else
+        GONE_TICKS=0
+        # Not mounted but a labelled device is present -> a reinsert event was missed.
+        # Respect a deliberate safe-eject: PAUSE_FLAG means the player ejected on purpose,
+        # so do NOT auto-remount (they want the stick out).
+        if [ -n "${dev}" ] && [ -b "${dev}" ] && [ ! -e "${PAUSE_FLAG}" ]; then
+            log "device ${dev} present but ${MNT} unmounted (no pause); kicking reinsert handler"
+            systemctl --no-block start partyos-usb-reinserted.service 2>/dev/null || true
+        fi
+    fi
+}
+
+# Reconcile once immediately (catch an event missed before we started), then every INTERVAL
+# seconds for the life of the boot. systemd's SIGTERM interrupts the sleep and ends us cleanly.
+while :; do
+    reconcile
+    sleep "${INTERVAL}"
+done
