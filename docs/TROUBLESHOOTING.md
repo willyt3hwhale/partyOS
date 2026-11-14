@@ -21,6 +21,18 @@ flow see [HOSTING.md](HOSTING.md).
 
 ## Real-hardware boot / netboot
 
+### iPXE reports "Permission denied" (0216eb8f) during HTTPS boot
+
+Check the client's BIOS/UEFI date and time first. A clock outside the server
+certificate's validity window can make certificate validation fail even when
+the server is reachable. Correct the clock, save the firmware settings and retry.
+If the clock is correct, check the server certificate's validity dates, its SAN
+against the boot URL, and whether the stick contains the current party CA.
+Do not disable certificate validation to hide the failure. Record the failing
+URL and complete iPXE error if it persists; the error alone does not prove a
+clock problem.
+
+
 ### iPXE loops "Waiting for link-up" and DHCP never succeeds (unsupported NIC)
 
 **Symptom.** On some laptops the embedded iPXE loops `Waiting for link-up on net0` and then
