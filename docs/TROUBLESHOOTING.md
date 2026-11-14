@@ -16,7 +16,7 @@ flow see [HOSTING.md](HOSTING.md).
   with the right IP so the SAN matches the address clients dial.
 - **`verify-ipxe-efi` refuses a stale EFI** - the CA was rotated without rebuilding the EFI.
   Run `make ipxe` (or re-run `setup.sh`) to rebuild it against the current CA, then re-flash.
-- **`make servers` refuses to start** - the served initramfs is stale or lacks the bundled
+- **`make servers` warns that boot artifacts failed validation** - the served initramfs may be stale or lack the bundled
   CA. Run `make boot-artifacts` (rebuilds the image then the initramfs in order).
 
 ## Real-hardware boot / netboot

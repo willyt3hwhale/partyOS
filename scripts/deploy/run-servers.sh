@@ -32,24 +32,12 @@ HTTPD="${REPO_ROOT}/server/http_server.py"
 [ -f "${CONF}" ]  || { echo "run-servers: deploy.conf not found: ${CONF}" >&2; exit 1; }
 [ -f "${HTTPD}" ] || { echo "run-servers: http_server.py not found: ${HTTPD}" >&2; exit 1; }
 
-# Boot-artifact guard: a clean rebuild
-# that ran `make image` but not `make initramfs` serves a STALE initramfs - no
-# bundled CA, no --cacert - and the all-HTTPS copytoram boot fails CLOSED. Refuse
-# to start the party server on a stale/insecure served initramfs. HARD-fail by
-# default; ALLOW_STALE_INITRAMFS=1 overrides (escape hatch for an intentional
-# HTTP-only / dev run). This never touches an already-running server.
+# Report broken boot artifacts without taking the tracker and portal offline.
+# Operators can still run make verify-boot-artifacts as a strict deployment gate.
 CHECK_IR="${SELF_DIR}/check-initramfs.sh"
-if [ -f "${CHECK_IR}" ]; then
-    if ! bash "${CHECK_IR}"; then
-        if [ "${ALLOW_STALE_INITRAMFS:-0}" = "1" ]; then
-            echo "[run-servers] WARNING: boot-artifact guard FAILED but ALLOW_STALE_INITRAMFS=1 - starting anyway" >&2
-        else
-            echo "[run-servers] refusing to start: served boot artifacts failed the guard above." >&2
-            echo "[run-servers] fix: \`make image && make initramfs\` (or \`make boot-artifacts\`)." >&2
-            echo "[run-servers] override (HTTP-only/dev): ALLOW_STALE_INITRAMFS=1 make servers" >&2
-            exit 1
-        fi
-    fi
+if [ -f "${CHECK_IR}" ] && ! bash "${CHECK_IR}"; then
+    echo "[run-servers] WARNING: boot artifacts failed validation; clients may not boot. Keeping services available." >&2
+    echo "[run-servers] fix: make boot-artifacts, then make verify-boot-artifacts." >&2
 fi
 
 # HTTPS dual-serve: http_server.py also opens a TLS listener (default

@@ -174,6 +174,9 @@ def _log(*parts):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Bound idle socket operations, not the total duration of a large transfer.
+    timeout = 30
+
     protocol_version = "HTTP/1.1"
     server_version = "partyos-tracker/1.0"
 

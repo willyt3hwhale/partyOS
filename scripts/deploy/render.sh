@@ -164,11 +164,23 @@ done
 # Self-guard: log the ABSOLUTE path we are about to overwrite so an accidental LIVE
 # clobber (a test/dry-run render that escaped its redirect) is unmistakable in the output.
 echo "render: writing $(cd "$(dirname "${OUT}")" && pwd)/$(basename "${OUT}")" >&2
+# Stage beside each destination so rename stays on the same filesystem.
+BOOT_TMP="$(mktemp "${OUT}.tmp.XXXXXX")"
+PORTAL_TMP=""
+cleanup_render() {
+    [ -z "${BOOT_TMP}" ] || rm -f "${BOOT_TMP}"
+    [ -z "${PORTAL_TMP}" ] || rm -f "${PORTAL_TMP}"
+    return 0
+}
+trap cleanup_render EXIT
 sed -e "s|{{PXE_HTTPS}}|${PXE_HTTPS}|g" \
     -e "s|{{PXE_URL}}|${PXE_URL}|g" \
     -e "s|{{SFS_URL}}|${SFS_URL}|g" \
     -e "s|{{EXTRA_PARAMS}}|${EXTRA}|g" \
-    "${TMPL}" > "${OUT}"
+    "${TMPL}" > "${BOOT_TMP}"
+chmod 0644 "${BOOT_TMP}"
+mv -f "${BOOT_TMP}" "${OUT}"
+BOOT_TMP=""
 
 # Render the portal/homepage too (served at ${PXE_HTTPS}${PORTAL_PATH}). PORTAL_OUT can be
 # overridden to a temp path (a redirected boot render points it off the live portal too).
@@ -181,11 +193,15 @@ if [ -f "${PORTAL_TMPL}" ]; then
     # through the system trust store. {{PXE_URL}} gets the HTTPS base too, because
     # run-servers.sh disables the plaintext :8080 listener by default. A plaintext
     # link on the portal is a dead link.
+    PORTAL_TMP="$(mktemp "${PORTAL_OUT}.tmp.XXXXXX")"
     sed -e "s|{{PXE_URL}}|${PXE_HTTPS}|g" \
         -e "s|{{IRC_SERVER}}|${IRC_SERVER:-<unset>}|g" \
         -e "s|{{MIRROR_URL}}|$(https_base "${MIRROR_SERVER:-$PXE_SERVER}")|g" \
         -e "s|{{BLOB_URL}}|${BLOB_FIRST:-$PXE_HTTPS}|g" \
-        "${PORTAL_TMPL}" > "${PORTAL_OUT}"
+        "${PORTAL_TMPL}" > "${PORTAL_TMP}"
+    chmod 0644 "${PORTAL_TMP}"
+    mv -f "${PORTAL_TMP}" "${PORTAL_OUT}"
+    PORTAL_TMP=""
     echo "render: wrote ${PORTAL_OUT}"
 fi
 
