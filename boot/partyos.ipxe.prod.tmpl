@@ -61,3 +61,16 @@ boot || goto failed
 
 :failed
 echo partyOS boot failed - check the server is reachable at {{PXE_HTTPS}}
+echo Rebooting to retry in 5 seconds...
+sleep 1 ||
+echo 4...
+sleep 1 ||
+echo 3...
+sleep 1 ||
+echo 2...
+sleep 1 ||
+echo 1...
+sleep 1 ||
+reboot ||
+echo reboot unsupported by firmware - dropping to iPXE shell
+shell ||
