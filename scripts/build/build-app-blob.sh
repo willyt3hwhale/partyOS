@@ -333,11 +333,13 @@ RUNSH="${RUNSH//__EXEC__/${EXEC}}"
 # --- build the rootfs in an amd64 container, squash it ------------------------
 RUNSH_B64="$(printf '%s' "${RUNSH}" | base64 | tr -d '\n')"
 docker run --rm --platform linux/amd64 --privileged \
+  -e ARCH_MIRROR="${ARCH_MIRROR:-}" -e ARCH_RUNTIME_MIRROR="${ARCH_RUNTIME_MIRROR:-}" \
   -e SNAPSHOT="${SNAPSHOT}" -e NAME="${NAME}" -e SOURCE="${SOURCE}" \
   -e PKGS="${PKGS}" -e RUNSH_B64="${RUNSH_B64}" -e EXTRA="${EXTRA_PKGS:-}" \
   -e TITLE="${TITLE}" -e RAM_MIN="${RAM_MIN}" -e RAM_MAX="${RAM_MAX}" -e EXEC="${EXEC}" \
   -v "${OUT_DIR}":/out "${IMAGE}" /bin/bash -euo pipefail -c '
-  printf "Server=https://archive.archlinux.org/repos/%s/\$repo/os/\$arch\n" "${SNAPSHOT}" > /etc/pacman.d/mirrorlist
+  BUILD_MIRROR="${ARCH_MIRROR:-https://archive.archlinux.org/repos/${SNAPSHOT}/\$repo/os/\$arch}"
+  printf "Server=%s\n" "${BUILD_MIRROR}" > /etc/pacman.d/mirrorlist
   # DisableSandbox in options so makepkg NESTED pacman also skips the seccomp
   # sandbox - it fails under amd64 emulation on an arm64 docker host with
   # error restricting syscalls via seccomp 22.
@@ -524,7 +526,8 @@ QREADME
   # glibc; the reverse breaks). Only the AUR path has this skew: the repo path builds
   # the game against the same snapshot it bundles, so leave it untouched.
   if [ "${SOURCE}" = aur ]; then
-    printf "Server=https://geo.mirror.pkgbuild.com/\$repo/os/\$arch\n" > /etc/pacman.d/mirrorlist
+    RUNTIME_MIRROR="${ARCH_RUNTIME_MIRROR:-${ARCH_MIRROR:-https://geo.mirror.pkgbuild.com/\$repo/os/\$arch}}"
+    printf "Server=%s\n" "${RUNTIME_MIRROR}" > /etc/pacman.d/mirrorlist
     pacman --root "${ROOT}" --dbpath "${ROOT}/var/lib/pacman" -Sy --noconfirm --disable-sandbox glibc gcc-libs
   fi
   # LIBRARY GATE: the entry binary must find every library it needs inside the

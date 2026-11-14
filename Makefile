@@ -619,7 +619,8 @@ initramfs:
 # The full boot-artifact rebuild in the correct order: the sfs THEN the served
 # initramfs (so the initramfs can never go stale relative to the sfs). FORCE=1
 # forwards to the image build.
-boot-artifacts: image initramfs
+boot-artifacts: image
+	@$(MAKE) initramfs
 	@echo "boot-artifacts: sfs + served initramfs rebuilt and guard-verified"
 
 # Run ONLY the boot-artifact guard against the currently-served initramfs + sfs.

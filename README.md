@@ -14,7 +14,7 @@ partyOS boots player PCs from a USB stick over the LAN, straight into RAM. Nothi
 
 ## Quick start
 
-You need a Linux or macOS host with Docker, openssl 3.3+ and exfatprogs, plus a USB stick for each player.
+You need a Linux or macOS build host with Docker and openssl 3.3+, plus a USB stick for each player. Physical stick creation currently requires Linux with exfatprogs and ext4 tools.
 
 ```bash
 git clone https://github.com/willyt3hwhale/partyOS.git && cd partyOS

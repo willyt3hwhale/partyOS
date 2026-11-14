@@ -134,7 +134,7 @@ esac
 # Derive it the same way render.sh does: the first blob server in deploy.conf, port
 # stripped, at the fixed tracker port 6969. Blobs are BitTorrent-only, so a torrent
 # without this announce URL is undiscoverable on a switch that drops LSD multicast.
-get() { grep -E "^${1}=" "${CONF}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]'; }
+get() { grep -E "^${1}=" "${CONF}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]' || true; }
 if [ -f "${CONF}" ]; then
     BLOB_SET="$(get BLOB_SERVERS)"; BLOB_SET="${BLOB_SET:-$(get BLOB_SERVER)}"
     BLOB_SET="${BLOB_SET:-$(get PXE_SERVER)}"

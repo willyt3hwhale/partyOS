@@ -162,7 +162,7 @@ else
     # FORCE=1 -> no second prompt. Its args are positional (device efi esp_mb share_mb);
     # --share-mb needs esp_mb populated to reach the 4th slot, so default it to 512.
     [ -n "${SHARE_MB}" ] && [ -z "${ESP_MB}" ] && ESP_MB=512
-    FORCE=1 "${SCRIPT_DIR}/create_usb.sh" "${DEVICE}" ${EFI:+"${EFI}"} ${ESP_MB:+"${ESP_MB}"} ${SHARE_MB:+"${SHARE_MB}"}
+    FORCE=1 "${SCRIPT_DIR}/create_usb.sh" "${DEVICE}" "${EFI}" "${ESP_MB:-512}" "${SHARE_MB:-4096}"
     case "${DEVICE}" in *[0-9]) P="${DEVICE}p";; *) P="${DEVICE}";; esac
     PART2="${P}2"
 fi

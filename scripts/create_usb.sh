@@ -201,6 +201,12 @@ if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "  Example: sudo $0 /dev/sdb"
     exit 1
 fi
+# The physical path uses Linux ext4, mount and partition tools. Fail before
+# touching a device on macOS; the image-building modes above remain available.
+[ "$(uname -s)" = Linux ] || {
+    echo "Physical USB creation requires Linux. Build artifacts on macOS, then flash on Linux." >&2
+    exit 1
+}
 DEVICE="$1"
 # Default to the https, CA-baked, server-IP-baked iPXE EFI (built by setup.sh). The
 # 2nd positional is an explicit EFI-path override only (e.g. the plain-http EFI).
