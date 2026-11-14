@@ -157,6 +157,9 @@ def _persist_report(fields):
 
 
 class PartyOSHTTPHandler(http.server.SimpleHTTPRequestHandler):
+    # Bound idle socket operations, not the total duration of a large transfer.
+    timeout = 30
+
     def __init__(self, *args, **kwargs):
         # Serve from the project root, not just the server directory.
         project_root = str(Path(__file__).parent.parent)
