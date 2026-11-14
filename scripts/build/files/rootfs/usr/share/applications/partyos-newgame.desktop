@@ -6,3 +6,4 @@ Icon=applications-other
 Exec=/usr/local/bin/partyos-newgame
 Terminal=false
 Categories=Game;partyOS;
+NoDisplay=true
