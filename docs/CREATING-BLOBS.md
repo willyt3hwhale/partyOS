@@ -513,3 +513,19 @@ appeared, and the launch log shows the catalog `marker`. Per-app verdict is
 - Sequential only (two concurrent blob installs can freeze the box). `--include-hidden` adds
   hidden rows (`wc3`, `protonenv`). Warning: `--concurrent-test a,b` is off by default. It
   races two installs to reproduce the freeze, and it can wedge the box.
+
+### Building native blobs with a LAN package mirror
+
+Set `ARCH_MIRROR` to the complete pacman mirror template, preserving the literal
+`$repo` and `$arch` placeholders:
+
+```bash
+export ARCH_MIRROR='http://partyos.lan:8080/mirror/$repo/os/$arch'
+```
+
+`build-app-blob.sh` uses this mirror for its container tools and blob packages.
+`ARCH_RUNTIME_MIRROR` optionally overrides the runtime-package mirror separately.
+Without overrides, the existing archive and rolling-mirror defaults remain.
+The mirror must contain the packages and database for the selected blob; this
+alone does not make AUR sources, game content downloads or the Docker image
+available offline. Pre-cache those separately.

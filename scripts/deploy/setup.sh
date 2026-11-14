@@ -286,14 +286,15 @@ check_prereqs() {
     fi
 
     # mkfs.exfat (exfatprogs) - create_usb.sh formats the PARTYSHARE partition with it.
-    if command -v mkfs.exfat >/dev/null 2>&1; then
+    if [ "$(uname -s)" = Darwin ]; then
+        say "macOS: build artifacts here; physical USB formatting requires a Linux host"
+    elif command -v mkfs.exfat >/dev/null 2>&1; then
         say "OK  mkfs.exfat present (exfatprogs)"
     else
         echo "[setup] MISSING: mkfs.exfat (exfatprogs) - create_usb.sh formats PARTYSHARE with it." >&2
         echo "        Install exfatprogs, then re-run. See docs/HOSTING.md (Prerequisites)." >&2
         echo "          Debian/Ubuntu: apt install exfatprogs" >&2
         echo "          Arch:          pacman -S exfatprogs" >&2
-        echo "          macOS:         brew install exfatprogs   (exFAT formatting is done at flash time)" >&2
         # A name change (--skip-build) does not flash, so it does not need mkfs.exfat.
         if [ "${SKIP_BUILD}" = 1 ]; then echo "[setup] (--skip-build: not required now, only at flash time)" >&2; else fail=1; fi
     fi

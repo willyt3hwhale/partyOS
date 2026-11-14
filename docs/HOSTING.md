@@ -48,9 +48,12 @@ You need a Linux or macOS host with:
 |---|---|---|---|
 | **Debian/Ubuntu** | `apt install docker.io && systemctl start docker` | `apt install openssl` (trixie+ ships 3.3+) | `apt install exfatprogs` |
 | **Arch** | `pacman -S docker && systemctl start docker` | `pacman -S openssl` (rolling, already 3.3+) | `pacman -S exfatprogs` |
-| **macOS** | `brew install --cask docker` then launch Docker Desktop | `brew install openssl@3` | `brew install exfatprogs` |
+| **macOS** | `brew install --cask docker` then launch Docker Desktop | `brew install openssl@3` | Not required for builds; format physical sticks on Linux |
 
-`setup.sh` checks all three up front and tells you exactly what is missing.
+`setup.sh` checks build prerequisites up front. Physical USB creation currently
+requires Linux (ext4 formatting and mounting); macOS can build the artifacts but
+cannot run the physical flash/registration path. Copy the artifacts to a Linux
+host for that step.
 
 ## Quick start
 
