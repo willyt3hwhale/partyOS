@@ -62,7 +62,7 @@ for _ in $(seq 1 15); do
 done
 [ -n "${status}" ] || exit 0
 # optional override from the USB user.conf (AUDIO_SINK=<substr>), best-effort.
-AUDIO_SINK="$(grep -E '^AUDIO_SINK=' /mnt/usbhome/user.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+AUDIO_SINK="$(grep -E '^AUDIO_SINK=' /mnt/usbhome/user.conf 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 sink_id="$(printf '%s' "${status}" | pick_sink "${AUDIO_SINK}")"
 [ -n "${sink_id}" ] || exit 0
 wpctl set-default "${sink_id}" 2>/dev/null || true

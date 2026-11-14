@@ -15,6 +15,9 @@ xfconf-query -c xsettings -p /Net/IconThemeName -n -t string -s Chicago95 2>/dev
   || xfconf-query -c xsettings -p /Net/IconThemeName -s Chicago95 2>/dev/null || true
 xfconf-query -c xsettings -p /Gtk/CursorThemeName -n -t string -s Chicago95_Standard_Cursors 2>/dev/null \
   || xfconf-query -c xsettings -p /Gtk/CursorThemeName -s Chicago95_Standard_Cursors 2>/dev/null || true
+# A persisted home can restore multiple workspaces; enforce the event default live.
+xfconf-query -c xfwm4 -p /general/workspace_count -s 1 2>/dev/null \
+  || xfconf-query -c xfwm4 -p /general/workspace_count -n -t int -s 1 2>/dev/null || true
 IMG=/usr/share/backgrounds/partyos.png; [ -f "$IMG" ] || IMG=/usr/share/backgrounds/partyos.ppm
 for m in $(xrandr --listmonitors 2>/dev/null | awk 'NR>1{print $NF}'); do
   for ws in 0 1 2 3; do b="/backdrop/screen0/monitor${m}/workspace${ws}"

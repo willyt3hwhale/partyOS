@@ -17,7 +17,7 @@ partyos_cfg() {
         | grep -v '^[[:space:]]*#' \
         | tail -1 \
         | cut -d= -f2- \
-        | tr -d '[:space:]'
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 # When executed (not sourced), act as a CLI: partyos-cfg KEY [FILE].
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

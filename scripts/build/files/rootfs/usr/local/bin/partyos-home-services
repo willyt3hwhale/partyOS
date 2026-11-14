@@ -8,9 +8,9 @@
 #   ~/.partyos-services/<name>.service   systemd USER unit (best-effort)
 #   ~/.partyos-services/disabled/...     ignored (opt-out)
 #
-# State (in the home, USB-synced -> survives reboot):
-#   ~/.partyos-services/.run/<name>.pid  pid of the launched service
-#   ~/.partyos-services/.run/<name>.log  its stdout/stderr
+# State:
+#   /run/partyos-home-services/<user>/<name>.pid  current-boot PID only
+#   ~/.partyos-services/.run/<name>.log          persistent stdout/stderr
 #
 # The target user is the dynamic account resolved by partyos-identity (read from
 # /run/partyos-username, fallback gamer). With NO services declared this is a
@@ -27,7 +27,8 @@ id "${USER_NAME}" >/dev/null 2>&1 || { log "user ${USER_NAME} missing - nothing 
 HOME_DIR="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
 [ -n "${HOME_DIR}" ] || HOME_DIR="/home/${USER_NAME}"
 SVC_DIR="${HOME_DIR}/.partyos-services"
-RUN_DIR="${SVC_DIR}/.run"
+RUN_DIR="/run/partyos-home-services/${USER_NAME}"
+LOG_DIR="${SVC_DIR}/.run"
 
 if [ ! -d "${SVC_DIR}" ]; then
     log "no ${SVC_DIR} -> no home services (clean no-op)"
@@ -35,7 +36,8 @@ if [ ! -d "${SVC_DIR}" ]; then
     exit 0
 fi
 
-install -d "${RUN_DIR}"
+install -d -m 0755 /run/partyos-home-services
+install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "${RUN_DIR}" "${LOG_DIR}"
 chown "${USER_NAME}:${USER_NAME}" "${RUN_DIR}" 2>/dev/null || true
 
 # runas: execute a command as the target user with a proper environment + home.
@@ -53,7 +55,7 @@ for f in "${SVC_DIR}"/*.sh; do
     name="$(basename "${f}" .sh)"
     [ -f "${SVC_DIR}/disabled/$(basename "${f}")" ] && { log "skip ${name} (disabled)"; continue; }
     pidf="${RUN_DIR}/${name}.pid"
-    logf="${RUN_DIR}/${name}.log"
+    logf="${LOG_DIR}/${name}.log"
     # Already running? leave it (idempotent).
     if [ -r "${pidf}" ]; then
         oldpid="$(cat "${pidf}" 2>/dev/null)"

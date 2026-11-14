@@ -1453,21 +1453,6 @@ Icon=dialog-password
 Categories=Game;partyOS;
 DESK
     chmod +x "${deskroot}/.apps/Games/Enter a Code.desktop" 2>/dev/null || true
-    # New Windows Game tile: the zenity wizard front door for the on-client proton-env
-    # feature - create a wine env on the USB stick, run a Windows installer, pick the
-    # game's .exe, play. Lives in the Games subfolder alongside the real game launchers;
-    # the .apps tree is wiped + rebuilt each refresh (rm -rf above) so it needs no cleanup.
-    cat > "${deskroot}/.apps/Games/New Windows Game.desktop" <<DESK
-[Desktop Entry]
-Type=Application
-Name=New Windows Game
-Comment=partyOS - install + play a Windows game in a wine env on your USB stick
-Exec=/usr/local/bin/partyos-newgame
-Terminal=false
-Icon=applications-other
-Categories=Game;partyOS;
-DESK
-    chmod +x "${deskroot}/.apps/Games/New Windows Game.desktop" 2>/dev/null || true
     # ONE master-folder launcher on the desktop: opens the .apps tree of category
     # subfolders (Games / Internet / Tools / ... - and the Enter a Code tile above).
     # write_cat_launcher tags X-PartyOS-Cat so the refresh above removes it.
