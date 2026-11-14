@@ -22,17 +22,13 @@
 #   make-blob.sh proton <name> <game-src> <exe-rel> [title] [ram_min] [ram_max]
 #
 # Options (before or after the positional args):
-#   --webseed <url>   contributor self-host base URL for the torrent web-seed (BEP19).
-#                     Advertise HTTP (not HTTPS): the sha256 in the operator catalog is
-#                     the trust root, and the client's pinned-CA aria2 check would fail
-#                     an HTTPS contributor web-seed. The bytes are integrity-checked
-#                     regardless of transport.
+#   Distribution is BitTorrent-only; publish with scripts/deploy/publish-blob.sh.
 #   --out <dir>       output dir (default ./blob-out/<name>).
 #
 # Output (the deliverable to hand to the operator), in <out>/:
 #   <name>.squashfs            the blob
 #   <name>.squashfs.sha256     its sha256 (the trust root the operator vouches in)
-#   <name>.squashfs.torrent    BEP19 torrent (+ web-seed if --webseed)
+#   <name>.squashfs.torrent    BitTorrent metadata
 #   <name>.catalog-fragment.json   ONE rectangular catalog row (real sha/size/ram/...)
 #   HANDOFF.txt                what to send + sha + size + hosting note
 #
@@ -60,13 +56,12 @@ usage() {
 }
 
 # --- parse options + mode ----------------------------------------------------
-WEBSEED=""; OUT_DIR=""
+OUT_DIR=""
 POS=()
 MODE=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --webseed) WEBSEED="${2:?--webseed needs a url}"; shift 2;;
-        --webseed=*) WEBSEED="${1#*=}"; shift;;
+        --webseed|--webseed=*) echo "[make-blob] ERROR HTTP web-seeds are unsupported; publish with scripts/deploy/publish-blob.sh" >&2; exit 1;;
         --out) OUT_DIR="${2:?--out needs a dir}"; shift 2;;
         --out=*) OUT_DIR="${1#*=}"; shift;;
         -h|--help) usage 0;;
@@ -107,7 +102,6 @@ trap cleanup EXIT
 
 echo "[make-blob] mode=${MODE} name=${NAME} snapshot=${SNAPSHOT}" >&2
 echo "[make-blob] staging=${STAGE}  out=${OUT_DIR}" >&2
-[ -n "${WEBSEED}" ] && echo "[make-blob] webseed=${WEBSEED} (advertise HTTP; sha256 is the trust root)" >&2
 
 # --- run the right builder (SKIP_CATALOG=1 + temp CATALOG_V2 -> no operator catalog) --
 HEART_LOG="${STAGE}/build.log"
@@ -172,13 +166,8 @@ fi
 # --- torrent (reuse gen-blob-torrents.sh verbatim) ---------------------------
 # It globs *.squashfs in the dir it is given, so point it at the staging dir.
 echo "[make-blob] generating torrent..." >&2
-if [ -n "${WEBSEED}" ]; then
-    WEBSEED="${WEBSEED}" bash "${BUILD_DIR}/gen-blob-torrents.sh" "${STAGE}" || \
-        echo "[make-blob] WARN torrent generation failed (non-fatal)" >&2
-else
-    bash "${BUILD_DIR}/gen-blob-torrents.sh" "${STAGE}" || \
-        echo "[make-blob] WARN torrent generation failed (non-fatal)" >&2
-fi
+bash "${BUILD_DIR}/gen-blob-torrents.sh" "${STAGE}" || \
+    echo "[make-blob] WARN torrent generation failed (non-fatal; publish-blob.sh will generate it)" >&2
 
 # --- emit the rectangular catalog fragment -----------------------------------
 # One row, the EXACT rectangular field set the builders write (build-app-blob.sh
@@ -189,7 +178,7 @@ fi
 FRAG="${STAGE}/${NAME}.catalog-fragment.json"
 MODE="${MODE}" NAME="${NAME}" TITLE="${TITLE}" CAT="${CATEGORY}" \
 SHA="${SHA}" SIZE="${SIZE}" RMIN="${RAM_MIN}" RMAX="${RAM_MAX}" \
-EXECV="${EXEC}" SHM="${SHM_MB}" WEBSEED="${WEBSEED}" python3 - "${FRAG}" <<'PY'
+EXECV="${EXEC}" SHM="${SHM_MB}" python3 - "${FRAG}" <<'PY'
 import json, os, sys
 out = sys.argv[1]
 mode = os.environ["MODE"]; name = os.environ["NAME"]
@@ -215,10 +204,7 @@ else:
         icon="applications-games", exec=os.environ.get("EXECV", ""),
         pkg="", pkgs="", marker="",
     )
-ws = os.environ.get("WEBSEED", "")
 frag = {"_partyos_blob_fragment": 1, "name": name, "row": row}
-if ws:
-    frag["webseed"] = ws.rstrip("/")
 json.dump(frag, open(out, "w"), indent=2)
 print("[make-blob] fragment written for %s (sha %s)" % (name, os.environ["SHA"][:12]), file=sys.stderr)
 PY
@@ -239,27 +225,16 @@ HUMAN_SIZE="$(du -h "${OUT_DIR}/${NAME}.squashfs" | cut -f1)"
     echo "Files to send to the operator (everything in this directory):"
     echo "  ${NAME}.squashfs                 the blob (${HUMAN_SIZE})"
     echo "  ${NAME}.squashfs.sha256          its sha256 - THIS is what the operator vouches in"
-    [ -f "${OUT_DIR}/${NAME}.squashfs.torrent" ] && echo "  ${NAME}.squashfs.torrent         BEP19 torrent for P2P/web-seed distribution"
+    [ -f "${OUT_DIR}/${NAME}.squashfs.torrent" ] && echo "  ${NAME}.squashfs.torrent         BitTorrent metadata"
     echo "  ${NAME}.catalog-fragment.json    one catalog row the operator merges with add-blob.sh"
     echo
     echo "sha256: ${SHA}"
     echo "size:   ${SIZE} bytes (${HUMAN_SIZE})"
     echo
-    echo "Hosting - two models (the operator chooses; either is fine):"
-    echo "  A. Operator hosts (default): send ALL files above. The operator runs"
-    echo "       scripts/blob/add-blob.sh ${NAME}.catalog-fragment.json --host ${NAME}.squashfs"
-    echo "     which copies the blob into their server/games/ and re-bakes the torrent web-seed."
-    if [ -n "${WEBSEED}" ]; then
-        echo "  B. You self-host (--webseed was set): host the blob at"
-        echo "       ${WEBSEED%/}/${NAME}.squashfs   (over HTTP - the sha256 is the trust root)"
-        echo "     and send ONLY the fragment + sha256. The operator runs"
-        echo "       scripts/blob/add-blob.sh ${NAME}.catalog-fragment.json --webseed ${WEBSEED%/}"
-        echo "     The catalog sha256 verifies your bytes regardless of where they come from."
-    else
-        echo "  B. You self-host: re-run make-blob.sh with --webseed <your-http-base-url> so the"
-        echo "     torrent carries your web-seed, then send the fragment + sha256 and host the blob"
-        echo "     at <your-http-base-url>/${NAME}.squashfs over HTTP."
-    fi
+    echo "Publishing: send the blob to the operator, who runs:"
+    echo "  scripts/deploy/publish-blob.sh ${NAME}.squashfs"
+    echo "This registers the tracker torrent and live seed before publishing the catalog."
+    echo "Players download only from BitTorrent peers, with no HTTP fallback."
     echo
     echo "Trust: the operator's catalog sha256 is the integrity root. WHOEVER serves the"
     echo "bytes is irrelevant - a client verifies the downloaded blob against the catalog"

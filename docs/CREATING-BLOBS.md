@@ -233,7 +233,6 @@ scripts/blob/make-blob.sh native <name> <repo|aur> <pkgs> <exec> [title] [catego
 scripts/blob/make-blob.sh proton <name> <game-src> <exe-rel> [title] [ram_min] [ram_max]
 
 # options
-#   --webseed <http-url>   your self-host base URL (baked into the torrent web-seed)
 #   --out <dir>            output dir (default ./blob-out/<name>)
 ```
 
@@ -243,9 +242,8 @@ Examples:
 # package an AUR game, hand it to the operator to host
 scripts/blob/make-blob.sh native mindustry aur mindustry mindustry "Mindustry" game
 
-# package a Windows game and advertise your own HTTP self-host as the web-seed
-scripts/blob/make-blob.sh proton flatout2 ~/games/FlatOut2 FlatOut2.exe "FlatOut 2" \
-    --webseed http://blobs.mybox.lan/partyos
+# package a Windows game for the operator to publish
+scripts/blob/make-blob.sh proton flatout2 ~/games/FlatOut2 FlatOut2.exe "FlatOut 2"
 ```
 
 It produces a **deliverable directory** (`blob-out/<name>/`) containing:
@@ -254,7 +252,7 @@ It produces a **deliverable directory** (`blob-out/<name>/`) containing:
 |------|------------|
 | `<name>.squashfs` | the blob |
 | `<name>.squashfs.sha256` | its sha256 - **this is what the operator vouches in** |
-| `<name>.squashfs.torrent` | BEP19 torrent (with your web-seed if `--webseed`) |
+| `<name>.squashfs.torrent` | BitTorrent metadata; the publisher adds the event tracker |
 | `<name>.catalog-fragment.json` | one rectangular catalog row (real sha/size/ram/entry/marker) |
 | `HANDOFF.txt` | exactly what to send + the sha/size + the hosting note |
 
@@ -264,55 +262,22 @@ Under the hood it calls `build-app-blob.sh` / `build-proton-blob.sh` with
 2025/09/01** and cannot be overridden - a blob built against another snapshot
 carries libs whose ABI may not match the client base image.
 
-### Two hosting models
+### Publish over BitTorrent
 
-1. **Operator hosts (default).** Send the whole `blob-out/<name>/` directory. The
-   operator runs `add-blob.sh ... --host <blob>` (below), which copies the blob
-   into `server/games/` and re-bakes the torrent with the operator's web-seeds.
-2. **You self-host.** Build with `--webseed http://<your-host>/<base>`, host the
-   blob at `<your-host>/<base>/<name>.squashfs` **over HTTP**, and send only the
-   fragment + sha256. The operator runs `add-blob.sh ... --webseed http://<your-host>/<base>`
-   and points the catalog at your host. The sha256 in the catalog verifies your
-   bytes regardless of where they come from.
-
-> **Why HTTP for self-host web-seeds?** Clients reject HTTPS hosts not signed by the
-> private CA, and the catalog sha256 checks the blob integrity.
-
-### For the operator: add-blob.sh (vouch a contributor blob in)
-
-The operator accepts a fragment with `scripts/blob/add-blob.sh`:
+Send the blob and its checksum to the operator. On the running party server:
 
 ```bash
-# A. host the contributor's bytes yourself
-scripts/blob/add-blob.sh <name>.catalog-fragment.json --host <name>.squashfs
-
-# B. point the catalog at the contributor's HTTP self-host
-scripts/blob/add-blob.sh <name>.catalog-fragment.json --webseed http://<their-host>/<base>
-
-# register the row only (you'll host the bytes out-of-band)
-scripts/blob/add-blob.sh <name>.catalog-fragment.json
+scripts/deploy/publish-blob.sh <name>.squashfs --title "Display name"
 ```
 
-`add-blob.sh`:
+The publisher generates tracker metadata, registers the blob with the running
+seeder, waits for seeding, then updates the catalog. Clients fetch game bytes
+only through BitTorrent; there is no HTTP web-seed fallback. Keep a seed online.
+Use `--category tool` or `--category app` for non-game entries.
 
-1. **Validates** the fragment: the row must be rectangular **and** carry a
-   **non-empty 64-hex sha256**. It fails on an empty sha, mirroring the
-   client's fail-closed `get_blob` (an empty sha would mount an unverified blob).
-2. **Upserts** the row into `catalog.v2.json` by name - idempotent, and it
-   preserves any operator-tuned fields (`config_*`, `server_pkg`, `version`,
-   `icon`, ...) on a re-add, only updating the build-derived `sha256`/`size`/blob
-   facts.
-3. With `--host`, verifies the supplied blob hashes to the fragment sha **before**
-   copying it into `server/games/`, then re-bakes the torrent. With `--webseed`,
-   records the contributor's HTTP self-host on the row and bakes it into the
-   torrent web-seed.
-4. Re-runs `build-game-blobs.sh` to render `catalog.json` (the file clients fetch).
-
-These blobs are added to the operator's catalog **at event time** - they are
-**not** baked into the shipped image. `gen-launchers` rebuilds the desktop/start
--menu icons from `catalog.json` on every boot, so a vouched-in row becomes a
-clickable icon on the next client boot with no image rebuild and no app-store
-change.
+`add-blob.sh <fragment.json> [--host <blob.squashfs>]` remains a legacy catalog
+registration helper. It does not register a live seed; prefer `publish-blob.sh`
+for a live event. Both authoring helpers reject `--webseed` explicitly.
 
 ## Windows games via Proton (operator side)
 

@@ -7,6 +7,7 @@
 #
 # Needs mktorrent; macOS host has none, so it re-execs in an archlinux container.
 set -euo pipefail
+[ -z "${WEBSEED:-}" ] || { echo "[torrents] ERROR HTTP web-seeds are unsupported; use ANNOUNCE for the tracker" >&2; exit 1; }
 
 SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GDIR="${1:-$(cd "${SD}/../../server/games" && pwd)}"
@@ -20,8 +21,8 @@ fi
 if ! command -v mktorrent >/dev/null 2>&1; then
     echo "[torrents] no mktorrent -> running in archlinux container..."
     exec docker run --rm --platform linux/amd64 \
-        -e WEBSEED="${WEBSEED:-}" -e ANNOUNCE="${ANNOUNCE:-}" \
-        -v "$(cd "${SD}/../../server/games" && pwd):/g" -v "${SD}:/s:ro" archlinux:latest \
+        -e ANNOUNCE="${ANNOUNCE:-}" \
+        -v "$(cd "${GDIR}" && pwd):/g" -v "${SD}:/s:ro" archlinux:latest \
         bash /s/gen-blob-torrents.sh /g
 fi
 
@@ -44,18 +45,12 @@ made=0
 for sq in "${GDIR}"/*.squashfs; do
     [ -f "${sq}" ] || continue
     tor="${sq}.torrent"
-    # Skip only when there's no web-seed / tracker to (re)bake and the torrent is
-    # already fresh (blob not newer). With WEBSEED or ANNOUNCE set (deploy), always
-    # regen - those deploy-specific URLs can change (both are top-level siblings of
-    # `info`, so re-baking them does NOT change the info-hash).
-    if [ -z "${WEBSEED:-}" ] && [ -z "${ANNOUNCE:-}" ] && [ -f "${tor}" ] && [ "${tor}" -nt "${sq}" ]; then
+    # With a tracker override, regenerate its top-level announce metadata.
+    if [ -z "${ANNOUNCE:-}" ] && [ -f "${tor}" ] && [ "${tor}" -nt "${sq}" ]; then
         continue
     fi
     # piece size scales with blob size; the announce URL comes from ANNOUNCE.
     # Overwrite any stale torrent.
-    # WEBSEED is optional; make-blob.sh and add-blob.sh set it from --webseed. render.sh does not.
-    # WEBSEED may be a COMMA-SEPARATED list (one per blob server in the failover set);
-    # each becomes its own BEP19 -w entry so a client can web-seed from ANY blob host.
     # ATOMIC regen: never rm the live torrent before its replacement exists. A
     # destroy-before-create left a P2P-only blob unfetchable if mktorrent failed mid-hash
     # (no web-seed fallback), and opened a 404/partial window even on success. Hash into a
@@ -64,15 +59,6 @@ for sq in "${GDIR}"/*.squashfs; do
     # clears a prior crash's leftover, NOT the live torrent.
     tmp="${tor}.tmp"
     rm -f "${tmp}"
-    ws=()
-    if [ -n "${WEBSEED:-}" ]; then
-        _oldifs="${IFS}"; IFS=','
-        for _w in ${WEBSEED}; do
-            _w="$(printf '%s' "${_w}" | tr -d '[:space:]')"
-            [ -n "${_w}" ] && ws+=(-w "${_w%/}/$(basename "${sq}")")
-        done
-        IFS="${_oldifs}"
-    fi
     # ANNOUNCE (BEP3 tracker): when set, embed the partyOS tracker as the announce URL
     # so clients discover peers over UNICAST (switch-independent, unlike LSD multicast).
     # The announce key is a top-level sibling of `info`, so it does NOT change the
@@ -82,7 +68,7 @@ for sq in "${GDIR}"/*.squashfs; do
     L="$(piece_l "$(wc -c < "${sq}" | tr -d ' ')")"
     mktorrent -l "${L}" -n "$(basename "${sq}")" \
         -c "partyOS blob $(basename "${sq}" .squashfs)" \
-        "${an[@]}" "${ws[@]}" -o "${tmp}" "${sq}" >/dev/null 2>&1 || { echo "[torrents] FAILED ${sq}"; rm -f "${tmp}"; continue; }
+        "${an[@]}" -o "${tmp}" "${sq}" >/dev/null 2>&1 || { echo "[torrents] FAILED ${sq}"; rm -f "${tmp}"; continue; }
     mv -f "${tmp}" "${tor}"
     made=$((made+1))
     echo "[torrents] $(basename "${tor}")  ($(wc -c < "${tor}" | tr -d ' ') bytes)"
