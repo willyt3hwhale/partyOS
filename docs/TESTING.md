@@ -150,3 +150,49 @@ You can edit a script on a running RAM client over ssh to find a cause or try a 
 A live-patched client is not the image. The file layout, the service order and the boot
 state are different. Put the fix in the image source, rebuild, and test it from a clean
 PXE boot.
+
+## Manual acceptance: setup wizard and physical stick removal
+
+These are procedures to run on a disposable participant stick and a test client.
+They are not evidence that the checks have passed. Record the image commit/build,
+client model, RAM, GPU, stick model, date, observed result and relevant report/log
+paths for each run. Use two distinct test identities for the replacement-stick check.
+
+### Setup wizard
+
+1. Boot with a fresh participant home. Confirm the wizard appears in the desktop
+   session, the text is readable, and dismissing an optional step leaves a usable
+   desktop. Repeat with an existing home to check the intended first-run behavior.
+2. Select a keyboard layout and type punctuation and layout-specific characters
+   in a text editor. If testing #15, confirm `se`, `us`, `de` appear first without
+   duplicates and that the current layout is selected. Also choose a layout from
+   later in the list to confirm the complete list remains available.
+3. Exercise each optional setting offered by the wizard, including cancelling
+   dialogs. Confirm settings take effect and are recorded in the participant's
+   config, without losing unrelated keys or spaces inside values.
+4. Reboot with the same stick. Confirm the selected settings and saved home data
+   return. Save the step3/desktop-ready reports and relevant journal entries.
+
+### Physical stick pull and reinsert
+
+1. With identity A loaded, create a small marker file in the home and let home
+   sync finish. Record the marker content and the mounted home device/identity.
+2. Launch a game from a cached blob. Record its backing file, loop mount and
+   process. Use a disposable save; pulling a stick deliberately interrupts I/O.
+3. Pull the stick during the running session. Record the persistence warning,
+   desktop responsiveness and whether the game continues or fails. Check its
+   logs and mounts; a surviving mount entry alone does not prove readable data.
+4. Reinsert the same stick. Confirm identity A remains active, home sync resumes
+   and the marker persists. Check the game mount points at the reinserted device
+   and that game data can actually be read. Record failures rather than assuming
+   the current implementation guarantees uninterrupted games.
+5. Pull A and insert a stick for identity B. Confirm B is not adopted as this
+   session's home and no A data or sync output is written to B. Reinsert A and
+   confirm recovery. Inspect B independently afterwards for unintended writes.
+6. Shut down normally, boot again with A and confirm the last completed sync,
+   persisted journal and report delivery. Repeat the removal scenario using safe
+   eject, recording its notifications and any differences from a physical pull.
+
+For slow-stick hangs, record when the stall starts and collect the journal and
+process states from a separate administrative session if available. Keep these
+results separate from RAM-pressure eviction tests and the production VM boot test.
