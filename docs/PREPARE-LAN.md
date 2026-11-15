@@ -414,8 +414,9 @@ scripts/deploy/announce.sh "test broadcast" --level info
 
 - TLS breaks the boot chain: `PARTYOS_HTTP_ENABLE=1 make servers` re-enables the
   plaintext listener on 8080.
-- `make servers` refuses to start on a stale initramfs: run `make boot-artifacts`.
-  Use `ALLOW_STALE_INITRAMFS=1` only as a last resort.
+- `make servers` warns about invalid boot artifacts but keeps services available.
+  Run `make boot-artifacts`, then `make verify-boot-artifacts` as a strict
+  deployment gate before booting clients. The warning does not repair the image.
 - Client behaviour must change with no rebuild: edit `server/boot-config.sh`, or
   push a notice with `scripts/deploy/announce.sh`. The hook is on by default. Confirm
   `BOOT_CONFIG_URL=` in deploy.conf is not empty, then re-run render.sh.
@@ -441,8 +442,8 @@ The classes of setting that are not decisions, and where each lives in the repo:
   screensaver whitelist, desktop names and XFCE defaults. See `phases/*` and
   `files/rootfs/`.
 - **Server internals.** The HTTP server docroot and denylist, the tracker constants,
-  the aria2 seeder flags, the report directory, the resolver helpers, the escape
-  hatches `PARTYOS_HTTP_ENABLE` and `ALLOW_STALE_INITRAMFS`. See
+  the aria2 seeder flags, the report directory, the resolver helpers, the plaintext-listener
+  escape hatch `PARTYOS_HTTP_ENABLE`. See
   `scripts/deploy/run-servers.sh`, `server/http_server.py`, `server/bt_tracker.py`.
 - **Client network behaviour at boot.** `partyos_dns=`, `netwait=`, `report_url=`, the
   LPD multicast route, the QEMU fallback address. See `boot/partyos.ipxe.prod.tmpl`
