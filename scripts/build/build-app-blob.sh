@@ -526,7 +526,7 @@ QREADME
   # glibc; the reverse breaks). Only the AUR path has this skew: the repo path builds
   # the game against the same snapshot it bundles, so leave it untouched.
   if [ "${SOURCE}" = aur ]; then
-    RUNTIME_MIRROR="${ARCH_RUNTIME_MIRROR:-${ARCH_MIRROR:-https://geo.mirror.pkgbuild.com/\$repo/os/\$arch}}"
+    RUNTIME_MIRROR="${ARCH_RUNTIME_MIRROR:-https://geo.mirror.pkgbuild.com/\$repo/os/\$arch}"
     printf "Server=%s\n" "${RUNTIME_MIRROR}" > /etc/pacman.d/mirrorlist
     pacman --root "${ROOT}" --dbpath "${ROOT}/var/lib/pacman" -Sy --noconfirm --disable-sandbox glibc gcc-libs
   fi

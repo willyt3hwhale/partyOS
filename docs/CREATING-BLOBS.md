@@ -524,8 +524,11 @@ export ARCH_MIRROR='http://partyos.lan:8080/mirror/$repo/os/$arch'
 ```
 
 `build-app-blob.sh` uses this mirror for its container tools and blob packages.
-`ARCH_RUNTIME_MIRROR` optionally overrides the runtime-package mirror separately.
-Without overrides, the existing archive and rolling-mirror defaults remain.
+`ARCH_RUNTIME_MIRROR` separately overrides the rolling runtime-library mirror used
+for AUR blobs. It never inherits `ARCH_MIRROR`: an older snapshot may lack the
+GLIBC symbols required by the current container toolchain. For offline AUR builds,
+provide a runtime mirror with libraries compatible with that toolchain. Without
+that override, the AUR runtime-library step still uses the public rolling mirror.
 The mirror must contain the packages and database for the selected blob; this
 alone does not make AUR sources, game content downloads or the Docker image
 available offline. Pre-cache those separately.
