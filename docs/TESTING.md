@@ -169,7 +169,8 @@ paths for each run. Use two distinct test identities for the replacement-stick c
    later in the list to confirm the complete list remains available.
 3. Exercise each optional setting offered by the wizard, including cancelling
    dialogs. Confirm settings take effect and are recorded in the participant's
-   config, without losing unrelated keys or spaces inside values.
+   persistent settings store, without losing unrelated keys or spaces inside values.
+   Audio settings persist through WirePlumber in the home rather than `user.conf`.
 4. Reboot with the same stick. Confirm the selected settings and saved home data
    return. Save the step3/desktop-ready reports and relevant journal entries.
 
