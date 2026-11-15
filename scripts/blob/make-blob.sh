@@ -215,6 +215,12 @@ cp -f "${BLOB}.sha256" "${OUT_DIR}/${NAME}.squashfs.sha256"
 [ -f "${STAGE}/${NAME}.squashfs.torrent" ] && cp -f "${STAGE}/${NAME}.squashfs.torrent" "${OUT_DIR}/"
 cp -f "${FRAG}" "${OUT_DIR}/${NAME}.catalog-fragment.json"
 
+# Preserve authored metadata; the publisher does not read the catalog fragment.
+PUBLISH_CMD=(scripts/deploy/publish-blob.sh "${NAME}.squashfs"
+    --title "${TITLE}" --category "${CATEGORY}"
+    --ram-min "${RAM_MIN}" --ram-max "${RAM_MAX}")
+# Proton derives its executable from the blob; native blobs need the authored command.
+[ "${MODE}" != native ] || PUBLISH_CMD+=(--exec "${EXEC}")
 HUMAN_SIZE="$(du -h "${OUT_DIR}/${NAME}.squashfs" | cut -f1)"
 {
     echo "partyOS blob deliverable: ${NAME}"
@@ -231,8 +237,10 @@ HUMAN_SIZE="$(du -h "${OUT_DIR}/${NAME}.squashfs" | cut -f1)"
     echo "sha256: ${SHA}"
     echo "size:   ${SIZE} bytes (${HUMAN_SIZE})"
     echo
-    echo "Publishing: send the blob to the operator, who runs:"
-    echo "  scripts/deploy/publish-blob.sh ${NAME}.squashfs"
+    echo "Publishing: place the blob in the partyOS repo root and run in Bash:"
+    printf '  '
+    printf '%q ' "${PUBLISH_CMD[@]}"
+    printf '\n'
     echo "This registers the tracker torrent and live seed before publishing the catalog."
     echo "Players download only from BitTorrent peers, with no HTTP fallback."
     echo

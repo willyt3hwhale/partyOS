@@ -264,11 +264,21 @@ carries libs whose ABI may not match the client base image.
 
 ### Publish over BitTorrent
 
-Send the blob and its checksum to the operator. On the running party server:
+Send the deliverable directory to the operator. On the running party server,
+run the Bash command from `HANDOFF.txt` from the partyOS repository root. Place
+the blob there, or adjust the blob path in the command to its actual location.
+The generated command preserves the author's title, category, RAM limits and
+native executable command, quoting each argument for Bash.
+
+For a manually authored native blob, supply the same metadata explicitly:
 
 ```bash
-scripts/deploy/publish-blob.sh <name>.squashfs --title "Display name"
+scripts/deploy/publish-blob.sh mytool.squashfs --title "My Tool" \
+    --category tool --exec mytool --ram-min 4096 --ram-max 8192
 ```
+
+The publisher does not read the catalog fragment automatically. For Proton
+blobs, omit `--exec`; the publisher reads the executable from the blob.
 
 The publisher generates tracker metadata, registers the blob with the running
 seeder, waits for seeding, then updates the catalog. Clients fetch game bytes
