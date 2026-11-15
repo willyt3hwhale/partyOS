@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # partyos-home-services - discover + start a participant's own services from
 # their HOME folder, running AS THE USER. Idempotent: a service already running
-# (live pid in .run/<name>.pid) is left alone, so re-running does not double-start.
+# (live pid in /run/partyos-home-services/<user>/<name>.pid) is left alone,
+# so re-running does not double-start.
 #
 # Convention (all under the user's home, so it travels with the USB stick):
 #   ~/.partyos-services/<name>.sh        executable launcher, run as the user
@@ -66,7 +67,7 @@ for f in "${SVC_DIR}"/*.sh; do
     fi
     chmod +x "${f}" 2>/dev/null || true
     log "starting home service '${name}' as ${USER_NAME}: ${f}"
-    # Launch as the user, cwd=home, detached, recording pid + log in the home.
+    # Launch as the user, cwd=home, detached; PID stays in /run, log in the home.
     # nohup + background; the launcher `exec`s the long-running service so the
     # recorded pid (the bash that execs it) IS the service process, owned by the
     # user. No setsid (its fork-or-not behaviour makes the pid unreliable).

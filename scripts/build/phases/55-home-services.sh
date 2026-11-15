@@ -14,9 +14,9 @@
 #                                        is the always-reliable headless path.
 #     disabled/                          anything here is IGNORED (opt-out).
 #
-# State lives in the home: each service's stdout/stderr -> ~/.partyos-services/
-# .run/<name>.log, its pid -> .run/<name>.pid. Because the home is USB-synced
-# (Steps 4-6), the declarations + state persist across reboots.
+# Logs live at ~/.partyos-services/.run/<name>.log and persist with the home.
+# PIDs live at /run/partyos-home-services/<user>/<name>.pid for this boot only.
+# The declarations and logs travel with the USB-synced home (Steps 4-6).
 #
 # Discovery/DNS for the resulting services is provided by the EVENT LAN, not us.
 #

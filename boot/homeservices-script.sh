@@ -121,7 +121,7 @@ else
 # listening on its port, and its state landed in the home owned by the user.
 # =============================================================================
     RUNDIR="${HOME_DIR}/.partyos-services/.run"
-    pidf="${RUNDIR}/${SVC_NAME}.pid"
+    pidf="/run/partyos-home-services/${USER_NAME}/${SVC_NAME}.pid"
     markf="${RUNDIR}/${SVC_NAME}.marker"
 
     # (b1) started as the user: a live pid owned by USER_NAME.
