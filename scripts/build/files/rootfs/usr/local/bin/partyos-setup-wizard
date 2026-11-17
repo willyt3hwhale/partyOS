@@ -45,7 +45,17 @@ LSTF=/usr/share/X11/xkb/rules/base.lst
 rows="$(awk -v cur="${cur_kb}" '
   /^! layout/{f=1;next} /^!/{f=0}
   f && NF { code=$1; $1=""; sub(/^ +/,"");
-            print (code==cur ? "TRUE" : "FALSE"); print code; print $0 }' \
+            codes[++count]=code; descriptions[code]=$0 }
+  function emit(code) {
+    print (code==cur ? "TRUE" : "FALSE"); print code; print descriptions[code]
+  }
+  END {
+    split("se us de", preferred, " ")
+    for (i=1; i<=3; i++)
+      if (preferred[i] in descriptions) emit(preferred[i])
+    for (i=1; i<=count; i++)
+      if (codes[i]!="se" && codes[i]!="us" && codes[i]!="de") emit(codes[i])
+  }' \
   "${LSTF}" 2>/dev/null)"
 if [ -n "${rows}" ]; then
   sel="$(printf '%s\n' "${rows}" | zenity --list --radiolist \
@@ -56,7 +66,9 @@ else
   # xkb DB missing -> fall back to a small curated list (newline-fed, spaces ok)
   sel="$(printf '%s\n' \
       "$([ "${cur_kb}" = se ] && echo TRUE || echo FALSE)" se "Swedish" \
-      FALSE us "English (US)"  FALSE gb "English (UK)"  FALSE de "German" \
+      "$([ "${cur_kb}" = us ] && echo TRUE || echo FALSE)" us "English (US)" \
+      "$([ "${cur_kb}" = de ] && echo TRUE || echo FALSE)" de "German" \
+      "$([ "${cur_kb}" = gb ] && echo TRUE || echo FALSE)" gb "English (UK)" \
       FALSE fi "Finnish"  FALSE no "Norwegian"  FALSE dk "Danish" \
       FALSE fr "French"  FALSE es "Spanish"  FALSE it "Italian" \
     | zenity --list --radiolist --title "partyOS - Keyboard" \
